@@ -142,6 +142,13 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.account, "family@example.com")
         self.assertEqual(args.country, "CH")
 
+        args = parser.parse_args(["share", "add", "family@example.com", "--country", "CH", "--home-id", "98765432"])
+        self.assertEqual(args.subcommand, "share")
+        self.assertEqual(args.action, "add")
+        self.assertEqual(args.account, "family@example.com")
+        self.assertEqual(args.country, "CH")
+        self.assertEqual(args.home_id, 98765432)
+
         args = parser.parse_args(["share", "remove", "mem123"])
         self.assertEqual(args.subcommand, "share")
         self.assertEqual(args.action, "remove")
@@ -196,11 +203,155 @@ class TestMomcozyDeviceShare(unittest.TestCase):
                 mock.json.return_value = {"code": "200", "result": {}}
             return mock
 
-        with patch("requests.request", side_effect=mock_req):
+        with patch("requests.request", side_effect=mock_req), \
+             patch.object(self.api, "add_tuya_device_share", return_value={"home_id": 12345, "success": True}) as mock_tuya_share:
             res = self.api.add_device_share("partner@example.com", tuya_dev_id="test_camera")
             self.assertEqual(res["account"], "partner@example.com")
             self.assertEqual(res["member_code"], "MEM1")
             self.assertEqual(res["device_id"], "test_camera")
+            self.assertEqual(res["tuya_share"], {"home_id": 12345, "success": True})
+            mock_tuya_share.assert_called_once_with(
+                tuya_dev_id="test_camera",
+                target_member_code="MEM1",
+                target_region="EU",
+                home_id=None,
+            )
+
+
+class TestTuyaCloudGateway(unittest.TestCase):
+    def test_md5_and_swap_sign_string(self):
+        from momcozy.tuya_cloud import md5_hex, swap_sign_string, post_data_sign_field
+
+        raw = "test_string"
+        h = md5_hex(raw)
+        self.assertEqual(len(h), 32)
+        swapped = swap_sign_string(h)
+        self.assertEqual(len(swapped), 32)
+        self.assertEqual(swapped, h[8:16] + h[0:8] + h[24:32] + h[16:24])
+        self.assertEqual(post_data_sign_field(raw), swapped)
+
+    def test_build_sign_string(self):
+        from momcozy.tuya_cloud import build_sign_string
+
+        params = {
+            "a": "smartlife.m.sharing.device.account.add",
+            "v": "3.0",
+            "time": "1700000000",
+            "ignore_this": "value",
+            "empty_param": "",
+        }
+        sign_str = build_sign_string(params)
+        self.assertEqual(sign_str, "a=smartlife.m.sharing.device.account.add||time=1700000000||v=3.0")
+
+    def test_sign_params(self):
+        from momcozy.tuya_cloud import sign_params
+
+        sig = sign_params("a=test||v=1.0", key="my_secret_key")
+        self.assertIsInstance(sig, str)
+        self.assertEqual(len(sig), 64)
+
+    def test_body_keys(self):
+        from momcozy.tuya_cloud import pre_login_body_key, session_body_key
+
+        k1 = pre_login_body_key("req123", key="comp_key")
+        self.assertEqual(len(k1), 16)
+
+        k2 = session_body_key("req123", "ecode456", key="comp_key")
+        self.assertEqual(len(k2), 16)
+        self.assertNotEqual(k1, k2)
+
+    def test_encrypt_decrypt_post_data(self):
+        from momcozy.tuya_cloud import encrypt_post_data, decrypt_post_data
+
+        key = "0123456789abcdef"
+        msg = b'{"hello": "world", "number": 42}'
+        encrypted = encrypt_post_data(key, msg)
+        self.assertIsInstance(encrypted, str)
+        decrypted = decrypt_post_data(key, encrypted)
+        self.assertEqual(decrypted, msg)
+
+    def test_encrypt_password_rsa(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa, padding
+        from momcozy.tuya_cloud import encrypt_password_rsa
+
+        # Generate a test RSA private/public key
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pub_numbers = priv_key.public_key().public_numbers()
+
+        test_pw_md5 = "e10adc3949ba59abbe56e057f20f883e"
+        encrypted_hex = encrypt_password_rsa(
+            modulus_decimal=str(pub_numbers.n),
+            exponent_decimal=str(pub_numbers.e),
+            password_md5=test_pw_md5,
+        )
+
+        decrypted = priv_key.decrypt(bytes.fromhex(encrypted_hex), padding.PKCS1v15()).decode("ascii")
+        self.assertEqual(decrypted, test_pw_md5)
+
+    def test_login_with_uid(self):
+        from unittest.mock import patch, MagicMock
+        from momcozy.tuya_cloud import TuyaGatewayClient
+
+        client = TuyaGatewayClient(region="eu")
+
+        def mock_call_api(api, version, post_data, session=None, extra_params=None):
+            if api == "smartlife.m.user.username.token.get":
+                return {
+                    "publicKey": "123456789",
+                    "exponent": "65537",
+                    "token": "rsa_token_abc",
+                }
+            elif "smartlife.m.user.uid.password.login" in api:
+                return {
+                    "sid": "session_id_12345",
+                    "ecode": "session_ecode_67890",
+                    "uid": "test_uid",
+                }
+            raise ValueError(f"Unexpected API: {api}")
+
+        with patch.object(client, "call_api", side_effect=mock_call_api), \
+             patch("momcozy.tuya_cloud.encrypt_password_rsa", return_value="encrypted_hex"):
+            session = client.login_with_uid(country_code="33", uid="test_uid", token="cloud_token")
+            self.assertEqual(session.sid, "session_id_12345")
+            self.assertEqual(session.ecode, "session_ecode_67890")
+            self.assertEqual(session.uid, "test_uid")
+
+    def test_get_home_id(self):
+        from unittest.mock import patch
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        session = TuyaSession(sid="sid1", ecode="eco1", uid="uid1")
+
+        with patch.object(client, "call_api", return_value=[{"gid": 998877, "name": "My Home"}]):
+            home_id = client.get_home_id(session)
+            self.assertEqual(home_id, 998877)
+
+    def test_share_device_to_user(self):
+        from unittest.mock import patch
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        session = TuyaSession(sid="sid1", ecode="eco1", uid="uid1")
+
+        with patch.object(client, "call_api", return_value={"relationId": 54321}) as mock_api:
+            res = client.share_device_to_user(
+                session=session,
+                home_id=998877,
+                tuya_dev_id="dev_camera_123",
+                target_region="33",
+                target_member_code="mem_code_abc",
+            )
+            self.assertEqual(res["home_id"], 998877)
+            self.assertEqual(res["relationId"], 54321)
+            mock_api.assert_called_once()
+            call_args = mock_api.call_args
+            self.assertEqual(call_args[0][0], "smartlife.m.sharing.device.account.add")
+            self.assertEqual(call_args[0][1], "3.0")
+            self.assertEqual(call_args[0][2]["groupId"], 998877)
+            self.assertEqual(call_args[0][2]["devIds"], ["dev_camera_123"])
+            self.assertEqual(call_args[0][2]["userAccount"], "mem_code_abc")
+            self.assertEqual(call_args[0][2]["countryCode"], "33")
 
 
 if __name__ == "__main__":

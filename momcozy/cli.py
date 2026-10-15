@@ -163,6 +163,8 @@ def cmd_whoami(args: argparse.Namespace) -> None:
         print(f"Tuya Cloud:")
         print(f"  • Tuya UID:     {api.tuya_creds.uid}")
         print(f"  • Tuya Region:  {api.tuya_creds.region} (Data Center Region)")
+        if api.tuya_home_id:
+            print(f"  • Tuya Home ID: {api.tuya_home_id}")
 
 
 def cmd_devices(args: argparse.Namespace) -> None:
@@ -403,11 +405,20 @@ def cmd_share(args: argparse.Namespace) -> None:
     if args.action == "add":
         print(f"Sharing device {dev_id} with {args.account}...")
         try:
-            res = api.add_device_share(args.account, tuya_dev_id=dev_id, country_code=args.country)
+            home_id = getattr(args, "home_id", None)
+            res = api.add_device_share(args.account, tuya_dev_id=dev_id, country_code=args.country, home_id=home_id)
             print(f"✓ Successfully shared device with {args.account}!")
             print(f"  • Member Code: {res.get('member_code')}")
             print(f"  • Tuya UID:    {res.get('uid')}")
             print(f"  • Region:      {res.get('region')}")
+            tuya_share = res.get("tuya_share") or {}
+            if tuya_share:
+                home_val = tuya_share.get("home_id")
+                rel_val = tuya_share.get("relationId")
+                detail = f"Home ID: {home_val}" if home_val else "active"
+                if rel_val:
+                    detail += f", Relation ID: {rel_val}"
+                print(f"  • Tuya Share:  {detail}")
         except Exception as e:
             print(f"Error sharing device: {e}", file=sys.stderr)
             sys.exit(1)
@@ -542,6 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sadd = share_sub.add_parser("add", help="Share device with a user by email")
     p_sadd.add_argument("account", help="Recipient email or Momcozy account")
     p_sadd.add_argument("--country", "-c", help="Recipient country code (default: account country)")
+    p_sadd.add_argument("--home-id", type=int, help="Optional Tuya Home/Group ID (auto-detected if omitted)")
 
     # share remove <member_code>
     p_srem = share_sub.add_parser("remove", help="Revoke device access for a member code")

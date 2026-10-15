@@ -97,6 +97,8 @@ class MomcozyCloudApi:
         self.user_uid: Optional[str] = None
         self.email: Optional[str] = None
         self.tuya_creds: Optional[TuyaCredentials] = None
+        self.tuya_home_id: Optional[int] = None
+        self._tuya_client: Optional[Any] = None
 
     def _headers(self, need_auth: bool = True) -> Dict[str, str]:
         headers = {
@@ -331,13 +333,89 @@ class MomcozyCloudApi:
             raise RuntimeError(f"Revoke device share failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
 
-    def add_device_share(self, account: str, tuya_dev_id: Optional[str] = None, country_code: Optional[str] = None) -> Dict[str, Any]:
+    def get_tuya_client(self) -> Any:
+        """Get or initialize a TuyaGatewayClient configured for this account's region."""
+        if self._tuya_client is not None:
+            return self._tuya_client
+        from .tuya_cloud import TuyaGatewayClient
+
+        # Map Tuya numeric region code ("33" -> "eu", "1" -> "us", "86" -> "cn") or account region
+        reg = "eu"
+        if self.tuya_creds and self.tuya_creds.region:
+            r = str(self.tuya_creds.region).lower()
+            if r in ("33", "eu"):
+                reg = "eu"
+            elif r in ("86", "cn"):
+                reg = "cn"
+            elif r in ("1", "us", "na"):
+                reg = "us"
+        elif self.region == "EU":
+            reg = "eu"
+        elif self.region in ("US", "NA"):
+            reg = "us"
+
+        self._tuya_client = TuyaGatewayClient(region=reg)
+        return self._tuya_client
+
+    def add_tuya_device_share(
+        self,
+        tuya_dev_id: str,
+        target_member_code: str,
+        target_region: str,
+        home_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create device share invite on Tuya Cloud Home SDK gateway.
+
+        This calls Tuya's thing.m.sharing.device.account.add (v 3.0) API.
+        Without this step, the destination user cannot accept the device share
+        in Tuya / Momcozy apps because no Tuya share relationship exists.
+        """
+        if not self.tuya_creds or not self.tuya_creds.token:
+            self.get_tuya_credentials()
+
+        if not self.tuya_creds or not self.tuya_creds.token:
+            raise RuntimeError("No Tuya credentials available for Tuya Home sharing")
+
+        tuya_client = self.get_tuya_client()
+        session = tuya_client.login_with_uid(
+            country_code=self.tuya_creds.region,
+            uid=self.tuya_creds.uid,
+            token=self.tuya_creds.token,
+        )
+
+        active_home_id = home_id or self.tuya_home_id
+        if not active_home_id:
+            active_home_id = tuya_client.get_home_id(session)
+            self.tuya_home_id = active_home_id
+            # Cache the discovered home ID in session if path known
+            if hasattr(self, "_config_path") and self._config_path:
+                try:
+                    self.save_session(self._config_path)
+                except Exception:
+                    pass
+
+        return tuya_client.share_device_to_user(
+            session=session,
+            home_id=active_home_id,
+            tuya_dev_id=tuya_dev_id,
+            target_region=target_region,
+            target_member_code=target_member_code,
+        )
+
+    def add_device_share(
+        self,
+        account: str,
+        tuya_dev_id: Optional[str] = None,
+        country_code: Optional[str] = None,
+        home_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """High-level helper to share a device with a user by email/account.
 
-        Executes the full 3-step Momcozy sharing flow:
-          1. Searches user by account -> gets memberCode, region, uid.
-          2. Grants device share on Tuya cloud -> binds device.
-          3. Sends push notification to recipient -> confirms share.
+        Executes the full sharing flow matching the official Momcozy Android app:
+          1. Searches user by account on Momcozy Cloud -> gets memberCode, region, uid.
+          2. Creates Tuya Home device share invite via Tuya Gateway -> binds device permissions.
+          3. Grants device share on Momcozy Cloud -> registers Momcozy metadata.
+          4. Sends push notification to recipient -> confirms share.
         """
         dev_id = tuya_dev_id or self.device_id
         if not dev_id:
@@ -348,8 +426,26 @@ class MomcozyCloudApi:
         if not member_code:
             raise RuntimeError(f"No memberCode returned for user {account}: {user_info}")
 
-        logger.info("Found target user %s (memberCode=%s, region=%s)", account, member_code, user_info.get("region"))
+        target_region = user_info.get("region") or "33"
+        logger.info("Found target user %s (memberCode=%s, region=%s)", account, member_code, target_region)
+
+        # Step 2: Create Tuya Home device share invite in Tuya Cloud
+        tuya_share_res: Dict[str, Any] = {}
+        try:
+            tuya_share_res = self.add_tuya_device_share(
+                tuya_dev_id=dev_id,
+                target_member_code=member_code,
+                target_region=target_region,
+                home_id=home_id,
+            )
+            logger.info("Tuya Home Cloud device share registered successfully: %s", tuya_share_res)
+        except Exception as exc:
+            logger.warning("Tuya Home Cloud device share warning: %s", exc)
+
+        # Step 3: Register device share metadata on Momcozy Cloud
         self.share_device(dev_id, member_code)
+
+        # Step 4: Notify recipient
         try:
             self.share_device_notify(dev_id, member_code)
         except Exception as exc:
@@ -359,13 +455,24 @@ class MomcozyCloudApi:
             "account": account,
             "member_code": member_code,
             "device_id": dev_id,
-            "region": user_info.get("region"),
+            "region": target_region,
             "uid": user_info.get("uid"),
+            "tuya_share": tuya_share_res,
         }
 
     def save_session(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
         """Save credentials to disk."""
         path = Path(path).expanduser()
+        tuya_payload = None
+        if self.tuya_creds:
+            tuya_payload = {
+                "region": self.tuya_creds.region,
+                "uid": self.tuya_creds.uid,
+                "token": self.tuya_creds.token,
+            }
+            if self.tuya_home_id:
+                tuya_payload["home_id"] = self.tuya_home_id
+
         payload = {
             "email": self.email,
             "token": self.token,
@@ -375,11 +482,7 @@ class MomcozyCloudApi:
             "country_code": self.country_code,
             "country_name": self.country_name,
             "region": self.region,
-            "tuya": {
-                "region": self.tuya_creds.region if self.tuya_creds else "NA",
-                "uid": self.tuya_creds.uid if self.tuya_creds else "",
-                "token": self.tuya_creds.token if self.tuya_creds else "",
-            } if self.tuya_creds else None,
+            "tuya": tuya_payload,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2))
@@ -412,6 +515,7 @@ class MomcozyCloudApi:
                     uid=tuya_data.get("uid", ""),
                     token=tuya_data.get("token", ""),
                 )
+                client.tuya_home_id = tuya_data.get("home_id")
             return client
         except Exception as e:
             logger.warning("Failed to load session from %s: %s", path, e)
