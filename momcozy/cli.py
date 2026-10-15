@@ -351,6 +351,67 @@ def cmd_serve(args: argparse.Namespace) -> None:
         print("\nServer stopped.")
 
 
+def cmd_share(args: argparse.Namespace) -> None:
+    """Handle device sharing subcommands."""
+    api = MomcozyCloudApi.load_session(args.config or DEFAULT_CONFIG_PATH)
+    if not api or not api.token:
+        print("Error: You must run './momcozy.py login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    dev_id = args.device_id
+    if not dev_id:
+        cfg = _load_config(args.config)
+        dev_id = cfg.get("device_id")
+    if not dev_id:
+        print("Error: No target device ID specified or found in config.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.action == "add":
+        print(f"Sharing device {dev_id} with {args.account}...")
+        try:
+            res = api.add_device_share(args.account, tuya_dev_id=dev_id, country_code=args.country)
+            print(f"✓ Successfully shared device with {args.account}!")
+            print(f"  • Member Code: {res.get('member_code')}")
+            print(f"  • Tuya UID:    {res.get('uid')}")
+            print(f"  • Region:      {res.get('region')}")
+        except Exception as e:
+            print(f"Error sharing device: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.action == "remove":
+        print(f"Revoking share for member {args.member_code} on device {dev_id}...")
+        try:
+            api.delete_device_share(dev_id, args.member_code)
+            print(f"✓ Successfully revoked share for {args.member_code}!")
+        except Exception as e:
+            print(f"Error revoking share: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.action == "search":
+        print(f"Searching user {args.account}...")
+        try:
+            info = api.search_tuya_user(args.account, country_code=args.country)
+            print("✓ Found user:")
+            print(f"  • Member Code: {info.get('memberCode')}")
+            print(f"  • Tuya UID:    {info.get('uid')}")
+            print(f"  • Region:      {info.get('region')}")
+        except Exception as e:
+            print(f"Error searching user: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.action == "query":
+        print(f"Querying emails for member codes: {args.member_codes}...")
+        try:
+            users = api.query_shared_emails(args.member_codes)
+            if not users:
+                print("No user details returned.")
+            for u in users:
+                print(f"  • Email: {u.get('email', 'N/A')}, Member: {u.get('memberCode')}, Phone: {u.get('phone', 'N/A')}")
+        except Exception as e:
+            print(f"Error querying users: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="momcozy",
@@ -434,6 +495,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", "-p", type=int, default=8080)
     p_serve.set_defaults(func=cmd_serve)
+
+    # share
+    p_share = sub.add_parser("share", help="Share camera access with another Momcozy account")
+    share_sub = p_share.add_subparsers(dest="action", required=True)
+
+    # share add <account>
+    p_sadd = share_sub.add_parser("add", help="Share device with a user by email")
+    p_sadd.add_argument("account", help="Recipient email or Momcozy account")
+    p_sadd.add_argument("--country", "-c", help="Recipient country code (default: account country)")
+
+    # share remove <member_code>
+    p_srem = share_sub.add_parser("remove", help="Revoke device access for a member code")
+    p_srem.add_argument("member_code", help="Recipient member code to remove")
+
+    # share search <account>
+    p_ssearch = share_sub.add_parser("search", help="Search for a Momcozy user to get their member code")
+    p_ssearch.add_argument("account", help="Email or account to look up")
+    p_ssearch.add_argument("--country", "-c", help="Country code")
+
+    # share query <member_code...>
+    p_squery = share_sub.add_parser("query", help="Look up email addresses for member codes")
+    p_squery.add_argument("member_codes", nargs="+", help="Member codes to look up")
+
+    p_share.set_defaults(func=cmd_share)
 
     return parser
 

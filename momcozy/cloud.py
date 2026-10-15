@@ -224,6 +224,126 @@ class MomcozyCloudApi:
         )
         return self.tuya_creds
 
+    def search_tuya_user(self, account: str, country_code: Optional[str] = None, account_type: int = 1) -> Dict[str, Any]:
+        """Search for a target Momcozy/Tuya user by email or account to prepare for device sharing.
+
+        Calls /api/app/third/tuya/user/search.
+        Returns dict containing 'memberCode', 'uid', and 'region'.
+        """
+        if not self.token:
+            raise RuntimeError("Must be logged in to search users")
+        url = f"{self.base_url}/api/app/third/tuya/user/search"
+        params = {
+            "account": account,
+            "type": account_type,
+            "countryCode": country_code or self.country_code,
+        }
+        resp = requests.get(url, params=params, headers=self._headers(need_auth=True), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "200":
+            raise RuntimeError(f"User search failed: {data.get('message', 'Unknown error')}")
+        return data.get("result", {})
+
+    def share_device(self, tuya_dev_id: str, member_code: str) -> Dict[str, Any]:
+        """Grant device access to a target memberCode on Tuya/Momcozy cloud.
+
+        Calls POST /api/app/third/tuya/device/{tuyaDevId}/share.
+        """
+        if not self.token:
+            raise RuntimeError("Must be logged in to share device")
+        url = f"{self.base_url}/api/app/third/tuya/device/{tuya_dev_id}/share"
+        payload = {"memberCode": member_code}
+        resp = requests.post(url, json=payload, headers=self._headers(need_auth=True), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "200":
+            raise RuntimeError(f"Device share failed: {data.get('message', 'Unknown error')}")
+        return data.get("result", {})
+
+    def share_device_notify(self, tuya_dev_id: str, member_code: str) -> Dict[str, Any]:
+        """Send a notification to the target user about the shared device.
+
+        Calls POST /api/app/third/tuya/device/share/notice.
+        """
+        if not self.token:
+            raise RuntimeError("Must be logged in to send share notification")
+        url = f"{self.base_url}/api/app/third/tuya/device/share/notice"
+        payload = {
+            "tuyaDevId": tuya_dev_id,
+            "memberCode": member_code,
+        }
+        resp = requests.post(url, json=payload, headers=self._headers(need_auth=True), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "200":
+            raise RuntimeError(f"Share notification failed: {data.get('message', 'Unknown error')}")
+        return data.get("result", {})
+
+    def query_shared_emails(self, member_codes: list[str]) -> list[Dict[str, Any]]:
+        """Query email / account details for a list of shared member codes.
+
+        Calls POST /api/app/third/tuya/user/queryEmail.
+        """
+        if not self.token:
+            raise RuntimeError("Must be logged in to query shared user info")
+        url = f"{self.base_url}/api/app/third/tuya/user/queryEmail"
+        payload = {"memberCodeList": member_codes}
+        resp = requests.post(url, json=payload, headers=self._headers(need_auth=True), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "200":
+            raise RuntimeError(f"Query shared emails failed: {data.get('message', 'Unknown error')}")
+        res = data.get("result", {})
+        return res.get("tuyaUserInfoBeanList", [])
+
+    def delete_device_share(self, tuya_dev_id: str, member_code: str) -> Dict[str, Any]:
+        """Revoke a user's shared access to the device.
+
+        Calls DELETE /api/app/third/tuya/device/{tuyaDevId}/share/{memberCode}.
+        """
+        if not self.token:
+            raise RuntimeError("Must be logged in to revoke device share")
+        url = f"{self.base_url}/api/app/third/tuya/device/{tuya_dev_id}/share/{member_code}"
+        resp = requests.delete(url, headers=self._headers(need_auth=True), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "200":
+            raise RuntimeError(f"Revoke device share failed: {data.get('message', 'Unknown error')}")
+        return data.get("result", {})
+
+    def add_device_share(self, account: str, tuya_dev_id: Optional[str] = None, country_code: Optional[str] = None) -> Dict[str, Any]:
+        """High-level helper to share a device with a user by email/account.
+
+        Executes the full 3-step Momcozy sharing flow:
+          1. Searches user by account -> gets memberCode, region, uid.
+          2. Grants device share on Tuya cloud -> binds device.
+          3. Sends push notification to recipient -> confirms share.
+        """
+        dev_id = tuya_dev_id or self.device_id
+        if not dev_id:
+            raise ValueError("tuya_dev_id or configured device_id required")
+
+        user_info = self.search_tuya_user(account, country_code=country_code)
+        member_code = user_info.get("memberCode")
+        if not member_code:
+            raise RuntimeError(f"No memberCode returned for user {account}: {user_info}")
+
+        logger.info("Found target user %s (memberCode=%s, region=%s)", account, member_code, user_info.get("region"))
+        self.share_device(dev_id, member_code)
+        try:
+            self.share_device_notify(dev_id, member_code)
+        except Exception as exc:
+            logger.warning("Share notice notification warning: %s", exc)
+
+        return {
+            "account": account,
+            "member_code": member_code,
+            "device_id": dev_id,
+            "region": user_info.get("region"),
+            "uid": user_info.get("uid"),
+        }
+
     def save_session(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
         """Save credentials to disk."""
         path = Path(path)

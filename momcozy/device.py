@@ -195,8 +195,8 @@ class MomcozyMonitor:
             raise RuntimeError(
                 f"Failed to communicate with device at {self.ip} (device ID: {self.device_id}): {err}.\n"
                 f"  • {self.ip} did not return any Momcozy/Tuya monitor telemetry on port 6668.\n"
-                f"  • Verify that {self.ip} is the actual IP address of your BM04 camera on your Wi-Fi (MAC: CA:AA:28:77:78:1F).\n"
-                f"  • If the device is behind a different IP or requires a local encryption key, pass --ip and --local-key."
+                f"  • Verify that {self.ip} is the IP address of your BM04 camera on your Wi-Fi (Sigmastar MAC: 50:7B:91:xx:xx:xx).\n"
+                f"  • If the device requires a local encryption key, pass --local-key."
             )
 
         status = BM04Status(raw_dps=dps)

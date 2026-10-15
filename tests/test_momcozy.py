@@ -136,6 +136,72 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.track, "3")
         self.assertEqual(args.volume, 70)
 
+        args = parser.parse_args(["share", "add", "family@example.com", "--country", "CH"])
+        self.assertEqual(args.subcommand, "share")
+        self.assertEqual(args.action, "add")
+        self.assertEqual(args.account, "family@example.com")
+        self.assertEqual(args.country, "CH")
+
+        args = parser.parse_args(["share", "remove", "mem123"])
+        self.assertEqual(args.subcommand, "share")
+        self.assertEqual(args.action, "remove")
+        self.assertEqual(args.member_code, "mem123")
+
+        args = parser.parse_args(["share", "search", "partner@example.com"])
+        self.assertEqual(args.subcommand, "share")
+        self.assertEqual(args.action, "search")
+        self.assertEqual(args.account, "partner@example.com")
+
+
+class TestMomcozyDeviceShare(unittest.TestCase):
+    def setUp(self):
+        self.api = MomcozyCloudApi(region="EU", device_id="test_dev_123")
+        self.api.token = "mock_token"
+
+    def test_search_tuya_user(self):
+        from unittest.mock import patch, MagicMock
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "code": "200",
+            "result": {
+                "memberCode": "MEM999",
+                "uid": "UID999",
+                "region": "33"
+            }
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_resp) as mock_get:
+            res = self.api.search_tuya_user("friend@example.com", country_code="CH")
+            self.assertEqual(res["memberCode"], "MEM999")
+            self.assertEqual(res["region"], "33")
+            mock_get.assert_called_once()
+            args, kwargs = mock_get.call_args
+            self.assertIn("/api/app/third/tuya/user/search", args[0])
+            self.assertEqual(kwargs["params"]["account"], "friend@example.com")
+
+    def test_add_device_share_flow(self):
+        from unittest.mock import patch, MagicMock
+
+        def mock_req(url, *args, **kwargs):
+            mock = MagicMock()
+            mock.raise_for_status = MagicMock()
+            if "/search" in url:
+                mock.json.return_value = {"code": "200", "result": {"memberCode": "MEM1", "uid": "U1", "region": "EU"}}
+            elif "/share/notice" in url:
+                mock.json.return_value = {"code": "200", "result": {}}
+            elif "/share" in url:
+                mock.json.return_value = {"code": "200", "result": {}}
+            return mock
+
+        with patch("requests.get", side_effect=mock_req), patch("requests.post", side_effect=mock_req):
+            res = self.api.add_device_share("partner@example.com", tuya_dev_id="test_camera")
+            self.assertEqual(res["account"], "partner@example.com")
+            self.assertEqual(res["member_code"], "MEM1")
+            self.assertEqual(res["device_id"], "test_camera")
+
 
 if __name__ == "__main__":
     unittest.main()
+
