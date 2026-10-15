@@ -215,31 +215,34 @@ class MomcozyCloudApi:
         data = resp.json()
         code = str(data.get("code", ""))
 
-        # If signed out on another device or expired, and we have password, re-login and retry
-        if code in ("10004030", "10001002") and self.email and getattr(self, "_password", None):
-            logger.info("Momcozy session was logged out by another device. Automatically re-logging in...")
-            self.login(self.email, self._password)
-            if getattr(self, "_config_path", None):
-                try:
-                    cfg = json.loads(Path(self._config_path).read_text())
-                    cfg["token"] = self.token
-                    cfg["refresh_token"] = self.refresh_token
-                    cfg["user_uid"] = self.user_uid
-                    if self.tuya_creds:
-                        cfg["tuya"] = {
-                            "region": self.tuya_creds.region,
-                            "uid": self.tuya_creds.uid,
-                            "token": self.tuya_creds.token,
-                        }
-                    Path(self._config_path).write_text(json.dumps(cfg, indent=2))
-                except Exception as e:
-                    logger.debug("Failed updating config on auto re-login: %s", e)
+        # If signed out on another device or expired, and we have password in memory, re-login and retry
+        if code in ("10004030", "10001002", "10001003"):
+            if self.email and getattr(self, "_password", None):
+                logger.info("Momcozy session was logged out by another device. Automatically re-logging in...")
+                self.login(self.email, self._password)
+                if getattr(self, "_config_path", None):
+                    try:
+                        cfg = json.loads(Path(self._config_path).read_text())
+                        cfg["token"] = self.token
+                        cfg["refresh_token"] = self.refresh_token
+                        cfg["user_uid"] = self.user_uid
+                        if self.tuya_creds:
+                            cfg["tuya"] = {
+                                "region": self.tuya_creds.region,
+                                "uid": self.tuya_creds.uid,
+                                "token": self.tuya_creds.token,
+                            }
+                        Path(self._config_path).write_text(json.dumps(cfg, indent=2))
+                    except Exception as e:
+                        logger.debug("Failed updating config on auto re-login: %s", e)
 
-            # Retry request with new token
-            headers = self._headers(need_auth=need_auth)
-            resp = requests.request(method, url, headers=headers, **kwargs)
-            resp.raise_for_status()
-            data = resp.json()
+                # Retry request with new token
+                headers = self._headers(need_auth=need_auth)
+                resp = requests.request(method, url, headers=headers, **kwargs)
+                resp.raise_for_status()
+                data = resp.json()
+            else:
+                raise RuntimeError("Login session has expired. Please run './momcozy.py login' to re-authenticate.")
 
         return data
 
@@ -302,13 +305,12 @@ class MomcozyCloudApi:
     def share_device(self, tuya_dev_id: str, member_code: str) -> Dict[str, Any]:
         """Grant device access to a target memberCode on Tuya/Momcozy cloud.
 
-        Calls POST /api/app/third/tuya/device/{tuyaDevId}/share.
+        Calls POST /api/app/third/tuya/device/{tuyaDevId}/share/{memberCode}.
         """
         if not self.token:
             raise RuntimeError("Must be logged in to share device")
-        url = f"{self.base_url}/api/app/third/tuya/device/{tuya_dev_id}/share"
-        payload = {"memberCode": member_code}
-        data = self._api_request("POST", url, need_auth=True, json=payload, timeout=15)
+        url = f"{self.base_url}/api/app/third/tuya/device/{tuya_dev_id}/share/{member_code}"
+        data = self._api_request("POST", url, need_auth=True, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"Device share failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
@@ -397,7 +399,6 @@ class MomcozyCloudApi:
             "email": self.email,
             "token": self.token,
             "refresh_token": self.refresh_token,
-            "stream_password": self._password,
             "user_uid": self.user_uid,
             "device_id": self.device_id,
             "country_code": self.country_code,
@@ -432,7 +433,6 @@ class MomcozyCloudApi:
             client.token = data.get("token")
             client.refresh_token = data.get("refresh_token")
             client.user_uid = data.get("user_uid")
-            client._password = data.get("stream_password")
             client._config_path = str(path)
             tuya_data = data.get("tuya")
             if tuya_data:

@@ -104,9 +104,6 @@ def cmd_login(args: argparse.Namespace) -> None:
         config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
         api.save_session(config_path)
 
-        data = json.loads(config_path.read_text())
-        data["stream_password"] = password
-
         # Automatically discover user's baby monitor
         try:
             dev_info = api.query_devices()
