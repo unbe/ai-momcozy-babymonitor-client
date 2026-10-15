@@ -136,6 +136,37 @@ def cmd_login(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_whoami(args: argparse.Namespace) -> None:
+    """Show details about the currently logged-in Momcozy account."""
+    config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+    api = MomcozyCloudApi.load_session(config_path)
+    if not api or not api.token:
+        print("Not logged in. Run './momcozy.py login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Momcozy Account: {api.email}")
+    print(f"  • User UID:     {api.user_uid}")
+    print(f"  • Cloud Region: {api.region or 'Auto'} ({api.base_url})")
+    print(f"  • Country:      {api.country_code} ({api.country_name})")
+
+    try:
+        info = api.get_user_info()
+        name = f"{info.get('firstName', '')} {info.get('lastName', '')}".strip()
+        if name:
+            print(f"  • Name:         {name}")
+        c_code = info.get("countryCode")
+        c_name = info.get("countryName")
+        if c_code or c_name:
+            print(f"  • Profile:      {c_code} ({c_name})")
+    except Exception as exc:
+        logger.debug("Could not query live user profile: %s", exc)
+
+    if api.tuya_creds:
+        print(f"Tuya Cloud:")
+        print(f"  • Tuya UID:     {api.tuya_creds.uid}")
+        print(f"  • Tuya Region:  {api.tuya_creds.region} (Data Center Region)")
+
+
 def cmd_devices(args: argparse.Namespace) -> None:
     """Dump the raw device list from the cloud (use to find device_id / local key)."""
     config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
@@ -437,6 +468,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_login.add_argument("--region", "-r", choices=["NA", "EU", "AP", "CN"], default=None,
                          help="Account region (default: auto-detect; Switzerland/Germany = EU)")
     p_login.set_defaults(func=cmd_login)
+
+    # whoami
+    p_whoami = sub.add_parser("whoami", help="Show logged-in account, region, and profile info")
+    p_whoami.set_defaults(func=cmd_whoami)
 
     # devices
     p_devices = sub.add_parser("devices", help="List devices bound to your account (raw JSON)")

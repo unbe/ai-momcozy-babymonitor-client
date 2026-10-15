@@ -97,6 +97,8 @@ class MomcozyCloudApi:
         self.user_uid: Optional[str] = None
         self.email: Optional[str] = None
         self.tuya_creds: Optional[TuyaCredentials] = None
+        self._password: Optional[str] = None
+        self._config_path: Optional[str] = None
 
     def _headers(self, need_auth: bool = True) -> Dict[str, str]:
         headers = {
@@ -137,6 +139,7 @@ class MomcozyCloudApi:
         If no region was given, try every regional gateway (EU, NA, AP) until one
         accepts the account; the account's home region is then remembered.
         """
+        self._password = password
         if self.region:
             return self._login_once(email, password)
         errors = []
@@ -179,12 +182,22 @@ class MomcozyCloudApi:
                     self.refresh_token = res.get("refreshToken")
                     self.user_uid = res.get("uid")
                     self.email = res.get("email", email)
-                    logger.info("Successfully logged in to Momcozy Cloud as %s", self.email)
-                    # Automatically fetch linked Tuya user
+                    # Automatically fetch linked Tuya user and user profile info
                     try:
                         self.get_tuya_credentials()
                     except Exception as exc:
                         logger.warning("Could not auto-fetch Tuya credentials: %s", exc)
+                    try:
+                        info = self.get_user_info()
+                        if info.get("countryCode"):
+                            self.country_code = info["countryCode"]
+                        if info.get("countryName"):
+                            self.country_name = info["countryName"]
+                        reg = (info.get("userMemberInfo") or {}).get("regionCode")
+                        if reg and not self.region:
+                            self.region = reg
+                    except Exception as exc:
+                        logger.warning("Could not auto-fetch user profile info: %s", exc)
                     return res
                 last_error = data.get("message", "Authentication failed")
             except Exception as e:
@@ -254,6 +267,16 @@ class MomcozyCloudApi:
             token=result.get("token", ""),
         )
         return self.tuya_creds
+
+    def get_user_info(self) -> Dict[str, Any]:
+        """Fetch user profile information (/api/app/user/getUserInfo/v2)."""
+        if not self.token:
+            raise RuntimeError("Must be logged in to fetch user info")
+        url = f"{self.base_url}/api/app/user/getUserInfo/v2"
+        data = self._api_request("GET", url, need_auth=True, timeout=15)
+        if data.get("code") != "200":
+            raise RuntimeError(f"Failed to get user info: {data.get('message')}")
+        return data.get("result", {})
 
     def search_tuya_user(self, account: str, country_code: Optional[str] = None, account_type: Optional[int] = None) -> Dict[str, Any]:
         """Search for a target Momcozy/Tuya user by email or phone to prepare for device sharing.
