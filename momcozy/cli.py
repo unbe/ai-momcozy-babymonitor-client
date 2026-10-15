@@ -65,6 +65,26 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         except Exception:
             pass
 
+    # Auto-resolve local_key from Tuya Cloud if missing
+    if not local_key and config_path.exists():
+        try:
+            api = MomcozyCloudApi.load_session(config_path)
+            if api and api.tuya_creds and api.tuya_creds.token:
+                logger.debug("Attempting to auto-resolve local_key for device %s from Tuya Cloud...", dev_id)
+                keys = api.get_tuya_device_keys()
+                if dev_id in keys:
+                    local_key = keys[dev_id]
+                    saved["local_key"] = local_key
+                    config_path.write_text(json.dumps(saved, indent=2))
+                    logger.info("✓ Auto-discovered and saved local_key to %s", config_path)
+                elif keys:
+                    local_key = next(iter(keys.values()))
+                    saved["local_key"] = local_key
+                    config_path.write_text(json.dumps(saved, indent=2))
+                    logger.info("✓ Auto-discovered and saved local_key to %s", config_path)
+        except Exception as e:
+            logger.debug("Could not auto-resolve local_key from Tuya Cloud: %s", e)
+
     if not dev_id:
         print(
             "Error: Device ID required. Run 'momcozy login' first or pass --device-id and --local-key.",

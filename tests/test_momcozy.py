@@ -353,6 +353,79 @@ class TestTuyaCloudGateway(unittest.TestCase):
             self.assertEqual(call_args[0][2]["userAccount"], "mem_code_abc")
             self.assertEqual(call_args[0][2]["countryCode"], "33")
 
+    def test_get_home_devices(self):
+        from unittest.mock import patch
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        session = TuyaSession(sid="sid1", ecode="eco1", uid="uid1")
+
+        mock_devs = [
+            {"devId": "bfb3260f33c5cdc22arfhh", "name": "BM04", "localKey": "0123456789abcdef"}
+        ]
+        with patch.object(client, "call_api", return_value={"devices": mock_devs}):
+            devs = client.get_home_devices(session, 998877)
+            self.assertEqual(len(devs), 1)
+            self.assertEqual(devs[0]["localKey"], "0123456789abcdef")
+
+
+class TestWebServer(unittest.IsolatedAsyncioTestCase):
+    async def test_handle_api_status_success(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+        from momcozy.device import BM04Status
+
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = BM04Status(temperature_c=22.5, temperature_f=72.5)
+
+        server = WebServer(monitor=mock_monitor)
+        req = make_mocked_request("GET", "/api/status")
+        resp = await server.handle_api_status(req)
+
+        self.assertEqual(resp.status, 200)
+        import json
+        body = json.loads(resp.text)
+        self.assertTrue(body["online"])
+        self.assertEqual(body["temperature_c"], 22.5)
+
+    async def test_handle_api_status_error_resilience(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.side_effect = RuntimeError("Failed to communicate with device at 10.11.2.12: Check device key")
+
+        server = WebServer(monitor=mock_monitor)
+        req = make_mocked_request("GET", "/api/status")
+        resp = await server.handle_api_status(req)
+
+        self.assertEqual(resp.status, 200)
+        import json
+        body = json.loads(resp.text)
+        self.assertFalse(body["online"])
+        self.assertIn("Check device key", body["error"])
+
+    async def test_handle_api_control_error_resilience(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        mock_monitor.ptz_move.side_effect = RuntimeError("Socket timeout")
+
+        server = WebServer(monitor=mock_monitor)
+        req = make_mocked_request("POST", "/api/control")
+        req._read_bytes = b'{"action": "ptz_move", "direction": "0"}'
+
+        resp = await server.handle_api_control(req)
+        self.assertEqual(resp.status, 502)
+        import json
+        body = json.loads(resp.text)
+        self.assertEqual(body["status"], "error")
+        self.assertIn("Socket timeout", body["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

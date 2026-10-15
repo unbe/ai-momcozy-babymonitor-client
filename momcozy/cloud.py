@@ -402,6 +402,40 @@ class MomcozyCloudApi:
             target_member_code=target_member_code,
         )
 
+    def get_tuya_device_keys(self) -> Dict[str, str]:
+        """Fetch local encryption keys for devices in user's Tuya home."""
+        if not self.tuya_creds or not self.tuya_creds.token:
+            try:
+                self.get_tuya_credentials()
+            except Exception:
+                pass
+        if not self.tuya_creds or not self.tuya_creds.token:
+            return {}
+
+        tuya_client = self.get_tuya_client()
+        session = tuya_client.login_with_uid(
+            country_code=self.tuya_creds.region,
+            uid=self.tuya_creds.uid,
+            token=self.tuya_creds.token,
+        )
+        home_id = self.tuya_home_id
+        if not home_id:
+            try:
+                home_id = tuya_client.get_home_id(session)
+                self.tuya_home_id = home_id
+            except Exception:
+                return {}
+
+        devs = tuya_client.get_home_devices(session, home_id)
+        keys: Dict[str, str] = {}
+        for d in devs:
+            if isinstance(d, dict):
+                dev_id = d.get("devId") or d.get("id") or d.get("gwId")
+                key = d.get("localKey") or d.get("devKey") or d.get("key")
+                if dev_id and key:
+                    keys[str(dev_id)] = str(key)
+        return keys
+
     def add_device_share(
         self,
         account: str,

@@ -340,6 +340,41 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const res = await fetch('/api/status');
         if (!res.ok) return;
         const d = await res.json();
+        const badge = document.getElementById('conn-badge');
+        let banner = document.getElementById('status-error-banner');
+
+        if (d.online === false) {
+          if (badge) {
+            badge.className = 'badge';
+            badge.style.background = '#FED7D7';
+            badge.style.color = '#C53030';
+            badge.innerText = 'Offline / Key Needed';
+          }
+          if (d.error && !banner) {
+            banner = document.createElement('div');
+            banner.id = 'status-error-banner';
+            banner.style.cssText = 'background:#FFF5F5; border:1px solid #FEB2B2; color:#9B2C2C; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:0.88rem; line-height:1.4;';
+            const grid = document.querySelector('.grid');
+            if (grid && grid.parentNode) {
+              grid.parentNode.insertBefore(banner, grid);
+            }
+          }
+          if (banner) {
+            banner.innerHTML = `⚠️ <strong>Device Connection Notice:</strong> ${d.error}<br><span style="color:#742A2A; font-size:0.82rem;">Note: If the camera is at this IP but not responding, provide its Tuya local encryption key via <code>--local-key &lt;KEY&gt;</code>.</span>`;
+          }
+          return;
+        }
+
+        if (badge) {
+          badge.className = 'badge active';
+          badge.style.background = '#C6F6D5';
+          badge.style.color = '#22543D';
+          badge.innerText = 'Connected';
+        }
+        if (banner) {
+          banner.remove();
+        }
+
         if (d.temperature_c !== null) {
           document.getElementById('temp-val').innerHTML = `${d.temperature_c.toFixed(1)}°C <span>(${d.temperature_f.toFixed(1)}°F)</span>`;
         }
@@ -403,7 +438,11 @@ class WebServer:
             return response
 
         if not self.streamer.is_running:
-            await self.streamer.start()
+            try:
+                await self.streamer.start()
+            except Exception as e:
+                logger.warning("Could not start live video streamer: %s", e)
+                return response
 
         try:
             async for frame in self.streamer.subscribe():
@@ -415,6 +454,8 @@ class WebServer:
                 await response.write(header + frame + b"\r\n")
         except (asyncio.CancelledError, ConnectionResetError):
             pass
+        except Exception as e:
+            logger.debug("Video stream subscription error: %s", e)
 
         return response
 
@@ -430,60 +471,89 @@ class WebServer:
 
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
-        status = await asyncio.to_thread(self.monitor.get_status)
-        return web.json_response({
-            "temperature_c": status.temperature_c,
-            "temperature_f": status.temperature_f,
-            "temp_alert_enabled": status.temp_alert_enabled,
-            "temp_min_c": status.temp_min_c,
-            "temp_max_c": status.temp_max_c,
-            "motion_switch": status.motion_switch,
-            "motion_sensitivity": status.motion_sensitivity,
-            "sound_switch": status.sound_switch,
-            "cry_detection_switch": status.cry_detection_switch,
-            "privacy_mode": status.privacy_mode,
-            "night_vision": status.night_vision,
-            "lullaby_playing": status.lullaby_playing,
-            "lullaby_track": status.lullaby_track,
-            "master_volume": status.master_volume,
-            "sd_card_status": status.sd_card_status,
-        })
+        try:
+            status = await asyncio.to_thread(self.monitor.get_status)
+            return web.json_response({
+                "online": True,
+                "temperature_c": status.temperature_c,
+                "temperature_f": status.temperature_f,
+                "temp_alert_enabled": status.temp_alert_enabled,
+                "temp_min_c": status.temp_min_c,
+                "temp_max_c": status.temp_max_c,
+                "motion_switch": status.motion_switch,
+                "motion_sensitivity": status.motion_sensitivity,
+                "sound_switch": status.sound_switch,
+                "cry_detection_switch": status.cry_detection_switch,
+                "privacy_mode": status.privacy_mode,
+                "night_vision": status.night_vision,
+                "lullaby_playing": status.lullaby_playing,
+                "lullaby_track": status.lullaby_track,
+                "master_volume": status.master_volume,
+                "sd_card_status": status.sd_card_status,
+            })
+        except Exception as e:
+            logger.debug("Could not read device status: %s", e)
+            return web.json_response({
+                "online": False,
+                "error": str(e),
+                "temperature_c": None,
+                "temperature_f": None,
+                "temp_alert_enabled": False,
+                "temp_min_c": None,
+                "temp_max_c": None,
+                "motion_switch": False,
+                "motion_sensitivity": "1",
+                "sound_switch": False,
+                "cry_detection_switch": False,
+                "privacy_mode": False,
+                "night_vision": "0",
+                "lullaby_playing": False,
+                "lullaby_track": "0",
+                "master_volume": 50,
+                "sd_card_status": 1,
+            })
 
     async def handle_api_control(self, request: web.Request) -> web.Response:
         """Handle control actions from web UI."""
-        data = await request.json()
-        action = data.get("action")
+        data = {}
+        try:
+            data = await request.json()
+            action = data.get("action")
 
-        if action == "ptz_move":
-            direction = data.get("direction", "0")
-            await asyncio.to_thread(self.monitor.ptz_move, direction)
-        elif action == "ptz_stop":
-            await asyncio.to_thread(self.monitor.ptz_stop)
-        elif action == "night_vision":
-            mode = data.get("mode", "0")
-            await asyncio.to_thread(self.monitor.set_night_vision, mode)
-        elif action == "toggle_privacy":
-            st = await asyncio.to_thread(self.monitor.get_status)
-            await asyncio.to_thread(self.monitor.set_privacy_mode, not st.privacy_mode)
-        elif action == "toggle_led":
-            st = await asyncio.to_thread(self.monitor.get_status)
-            await asyncio.to_thread(self.monitor.set_indicator_light, not st.indicator_light)
-        elif action == "toggle_flip":
-            st = await asyncio.to_thread(self.monitor.get_status)
-            await asyncio.to_thread(self.monitor.set_flip, not st.image_flipped)
-        elif action == "lullaby":
-            play = data.get("play", True)
-            if play:
-                track = data.get("track", "0")
+            if action == "ptz_move":
+                direction = data.get("direction", "0")
+                await asyncio.to_thread(self.monitor.ptz_move, direction)
+            elif action == "ptz_stop":
+                await asyncio.to_thread(self.monitor.ptz_stop)
+            elif action == "night_vision":
+                mode = data.get("mode", "0")
+                await asyncio.to_thread(self.monitor.set_night_vision, mode)
+            elif action == "toggle_privacy":
+                st = await asyncio.to_thread(self.monitor.get_status)
+                await asyncio.to_thread(self.monitor.set_privacy_mode, not st.privacy_mode)
+            elif action == "toggle_led":
+                st = await asyncio.to_thread(self.monitor.get_status)
+                await asyncio.to_thread(self.monitor.set_indicator_light, not st.indicator_light)
+            elif action == "toggle_flip":
+                st = await asyncio.to_thread(self.monitor.get_status)
+                await asyncio.to_thread(self.monitor.set_flip, not st.image_flipped)
+            elif action == "lullaby":
+                play = data.get("play", True)
+                if play:
+                    track = data.get("track", "0")
+                    vol = data.get("volume", 50)
+                    await asyncio.to_thread(self.monitor.play_lullaby, track, vol)
+                else:
+                    await asyncio.to_thread(self.monitor.stop_lullaby)
+            elif action == "lullaby_volume":
                 vol = data.get("volume", 50)
-                await asyncio.to_thread(self.monitor.play_lullaby, track, vol)
-            else:
-                await asyncio.to_thread(self.monitor.stop_lullaby)
-        elif action == "lullaby_volume":
-            vol = data.get("volume", 50)
-            await asyncio.to_thread(self.monitor.set_lullaby_volume, vol)
+                await asyncio.to_thread(self.monitor.set_lullaby_volume, vol)
 
-        return web.json_response({"status": "ok"})
+            return web.json_response({"status": "ok"})
+        except Exception as e:
+            action_name = data.get("action", "unknown") if isinstance(data, dict) else "unknown"
+            logger.warning("Device action '%s' failed: %s", action_name, e)
+            return web.json_response({"status": "error", "error": str(e)}, status=502)
 
     async def run(self) -> None:
         """Run the server until interrupted."""

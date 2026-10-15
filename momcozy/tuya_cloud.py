@@ -381,3 +381,34 @@ class TuyaGatewayClient:
             session=session,
         )
         return bool(res)
+
+    def get_home_devices(self, session: TuyaSession, home_id: int) -> List[Dict[str, Any]]:
+        """Query all devices in Tuya Home including their local encryption keys (localKey)."""
+        logger.debug("Querying Tuya home %s devices...", home_id)
+        try:
+            res = self.call_api(
+                "smartlife.m.my.group.device.list",
+                "2.2",
+                {"gid": home_id},
+                session=session,
+                extra_params={"gid": str(home_id)},
+            )
+            if isinstance(res, list):
+                return res
+            if isinstance(res, dict):
+                return res.get("devices") or res.get("deviceList") or []
+        except Exception as exc:
+            logger.debug("smartlife.m.my.group.device.list failed: %s; trying location.dashboard.list", exc)
+            try:
+                res = self.call_api(
+                    "smartlife.m.location.dashboard.list",
+                    "1.0",
+                    {"gid": home_id},
+                    session=session,
+                    extra_params={"gid": str(home_id)},
+                )
+                if isinstance(res, dict):
+                    return res.get("devices") or res.get("deviceList") or []
+            except Exception:
+                pass
+        return []
