@@ -97,8 +97,6 @@ class MomcozyCloudApi:
         self.user_uid: Optional[str] = None
         self.email: Optional[str] = None
         self.tuya_creds: Optional[TuyaCredentials] = None
-        self._password: Optional[str] = None
-        self._config_path: Optional[str] = None
 
     def _headers(self, need_auth: bool = True) -> Dict[str, str]:
         headers = {
@@ -139,7 +137,6 @@ class MomcozyCloudApi:
         If no region was given, try every regional gateway (EU, NA, AP) until one
         accepts the account; the account's home region is then remembered.
         """
-        self._password = password
         if self.region:
             return self._login_once(email, password)
         errors = []
@@ -206,7 +203,7 @@ class MomcozyCloudApi:
         raise RuntimeError(f"Momcozy login failed: {last_error}")
 
     def _api_request(self, method: str, url: str, need_auth: bool = True, **kwargs) -> Dict[str, Any]:
-        """Perform HTTP request to Momcozy Cloud with automatic re-authentication if signed out."""
+        """Perform HTTP request to Momcozy Cloud."""
         headers = self._headers(need_auth=need_auth)
         if "headers" in kwargs:
             headers.update(kwargs.pop("headers"))
@@ -215,34 +212,8 @@ class MomcozyCloudApi:
         data = resp.json()
         code = str(data.get("code", ""))
 
-        # If signed out on another device or expired, and we have password in memory, re-login and retry
         if code in ("10004030", "10001002", "10001003"):
-            if self.email and getattr(self, "_password", None):
-                logger.info("Momcozy session was logged out by another device. Automatically re-logging in...")
-                self.login(self.email, self._password)
-                if getattr(self, "_config_path", None):
-                    try:
-                        cfg = json.loads(Path(self._config_path).read_text())
-                        cfg["token"] = self.token
-                        cfg["refresh_token"] = self.refresh_token
-                        cfg["user_uid"] = self.user_uid
-                        if self.tuya_creds:
-                            cfg["tuya"] = {
-                                "region": self.tuya_creds.region,
-                                "uid": self.tuya_creds.uid,
-                                "token": self.tuya_creds.token,
-                            }
-                        Path(self._config_path).write_text(json.dumps(cfg, indent=2))
-                    except Exception as e:
-                        logger.debug("Failed updating config on auto re-login: %s", e)
-
-                # Retry request with new token
-                headers = self._headers(need_auth=need_auth)
-                resp = requests.request(method, url, headers=headers, **kwargs)
-                resp.raise_for_status()
-                data = resp.json()
-            else:
-                raise RuntimeError("Login session has expired. Please run './momcozy.py login' to re-authenticate.")
+            raise RuntimeError("Login session has expired or was signed out. Please run './momcozy.py login' to re-authenticate.")
 
         return data
 

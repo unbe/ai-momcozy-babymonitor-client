@@ -84,7 +84,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         local_key=local_key or "",
         ip=ip,
         stream_account_email=saved.get("email"),
-        stream_account_password=saved.get("stream_password"),
+        stream_account_password=os.environ.get("MOMCOZY_PASSWORD"),
         stream_country_code=stream_cc,
         stream_region=stream_reg,
     )
