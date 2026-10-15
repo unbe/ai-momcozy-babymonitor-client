@@ -101,7 +101,7 @@ def cmd_login(args: argparse.Namespace) -> None:
     try:
         api.login(email, password)
         # Store stream password in config file to enable P2P video stream
-        config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+        config_path = (Path(args.config) if args.config else DEFAULT_CONFIG_PATH).expanduser()
         api.save_session(config_path)
 
         # Automatically discover user's baby monitor
@@ -109,6 +109,7 @@ def cmd_login(args: argparse.Namespace) -> None:
             dev_info = api.query_devices()
             dev_list = dev_info.get("deviceList") if isinstance(dev_info, dict) else []
             if dev_list:
+                data = json.loads(config_path.read_text())
                 first = dev_list[0]
                 ext_id = (first.get("metadata") or {}).get("extDeviceId") or first.get("sn", "").replace("BM04-", "")
                 dev_name = first.get("deviceName", "BM04")
@@ -118,11 +119,10 @@ def cmd_login(args: argparse.Namespace) -> None:
                 data["camera_name"] = dev_name
                 if mac:
                     data["mac"] = mac
+                config_path.write_text(json.dumps(data, indent=2))
                 print(f"  • Discovered Monitor: {dev_name} (ID: {ext_id}, MAC: {mac})")
         except Exception as exc:
             logger.debug("Device discovery during login: %s", exc)
-
-        config_path.write_text(json.dumps(data, indent=2))
 
         print(f"✓ Login successful! Saved session to {config_path}")
         if api.tuya_creds:
