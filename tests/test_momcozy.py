@@ -452,6 +452,35 @@ class TestTuyaCloudGateway(unittest.TestCase):
             if tmp_path.exists():
                 tmp_path.unlink()
 
+    def test_get_all_devices_propagates_error_when_all_fail(self):
+        from unittest.mock import patch
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        session = TuyaSession(sid="sid1", ecode="eco1", uid="uid1")
+
+        with patch.object(client, "get_home_id", side_effect=RuntimeError("Home service down")), \
+             patch.object(client, "get_shared_devices", side_effect=RuntimeError("Shared service down")):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.get_all_devices(session)
+            self.assertIn("Failed to fetch Tuya devices", str(ctx.exception))
+            self.assertIn("Home service down", str(ctx.exception))
+            self.assertIn("Shared service down", str(ctx.exception))
+
+    def test_sync_devices_and_keys_propagates_cloud_errors(self):
+        from unittest.mock import patch
+        from momcozy.cloud import MomcozyCloudApi
+
+        api = MomcozyCloudApi()
+        api.token = "fake_token"
+
+        with patch.object(api, "query_devices", side_effect=RuntimeError("Momcozy 500 error")), \
+             patch.object(api, "get_tuya_devices", side_effect=RuntimeError("Tuya gateway timeout")):
+            with self.assertRaises(RuntimeError) as ctx:
+                api.sync_devices_and_keys(raise_on_error=True)
+            self.assertIn("Momcozy 500 error", str(ctx.exception))
+            self.assertIn("Tuya gateway timeout", str(ctx.exception))
+
 
 class TestWebServer(unittest.IsolatedAsyncioTestCase):
     async def test_handle_api_status_success(self):

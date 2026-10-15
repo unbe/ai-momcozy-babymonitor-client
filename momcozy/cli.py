@@ -71,7 +71,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             api = MomcozyCloudApi.load_session(config_path)
             if api and api.tuya_creds and api.tuya_creds.token:
                 logger.info("Retrieving Tuya encryption key for device %s from Tuya Cloud...", dev_id)
-                synced = api.sync_devices_and_keys(config_path)
+                synced = api.sync_devices_and_keys(config_path, raise_on_error=True)
                 if dev_id and dev_id in synced and synced[dev_id].get("local_key"):
                     local_key = synced[dev_id]["local_key"]
                     logger.info("✓ Retrieved and saved Tuya local encryption key for %s", dev_id)
@@ -80,8 +80,20 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     if found_key:
                         local_key = found_key
                         logger.info("✓ Retrieved and saved Tuya local encryption key")
+                    else:
+                        logger.warning(
+                            "Tuya Cloud did not return an encryption key for device %s. "
+                            "If your camera requires a local key, pass --local-key <KEY>.",
+                            dev_id,
+                        )
+            elif api and (not api.tuya_creds or not api.tuya_creds.token):
+                logger.warning(
+                    "No Tuya cloud credentials found in session (%s). "
+                    "Run './momcozy.py login' to link your Tuya credentials.",
+                    config_path,
+                )
         except Exception as e:
-            logger.debug("Could not auto-resolve local_key from Tuya Cloud: %s", e)
+            logger.warning("Failed to auto-resolve Tuya local key from cloud: %s", e)
 
     if not dev_id:
         print(
@@ -151,12 +163,13 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
     print("Connecting to Momcozy & Tuya Cloud to synchronize devices and local keys...")
     try:
-        synced = api.sync_devices_and_keys(config_path)
+        synced = api.sync_devices_and_keys(config_path, raise_on_error=True)
         if not synced:
-            print("No devices found on your account.")
+            print("No devices found on your account.", file=sys.stderr)
             return
 
         print(f"\n✓ Successfully synchronized {len(synced)} device(s) (saved to {config_path}):\n")
+        missing_keys = []
         for dev_id, info in synced.items():
             name = info.get("name", "BM04")
             key = info.get("local_key")
@@ -167,6 +180,15 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print(f"    • MAC:        {mac}")
             print(f"    • Network IP: {ip}")
             print()
+            if not key:
+                missing_keys.append(dev_id)
+
+        if missing_keys:
+            print(
+                f"Warning: Cloud did not provide encryption keys for: {', '.join(missing_keys)}. "
+                f"Pass --local-key if local encryption is required.",
+                file=sys.stderr,
+            )
     except Exception as e:
         print(f"Sync failed: {e}", file=sys.stderr)
         sys.exit(1)

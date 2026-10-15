@@ -385,6 +385,7 @@ class TuyaGatewayClient:
     def get_shared_devices(self, session: TuyaSession) -> List[Dict[str, Any]]:
         """Query devices shared with the user from other accounts."""
         logger.debug("Querying Tuya shared devices...")
+        errors: List[str] = []
         for api_name in ("thing.m.my.shared.device.list", "smartlife.m.my.shared.device.list"):
             try:
                 res = self.call_api(api_name, "3.2", {}, session=session)
@@ -395,12 +396,16 @@ class TuyaGatewayClient:
                     if isinstance(devs, list):
                         return devs
             except Exception as exc:
+                errors.append(f"{api_name}: {exc}")
                 logger.debug("Tuya shared devices API %s failed: %s", api_name, exc)
+        if errors:
+            logger.warning("Tuya shared devices query failed across endpoints: %s", "; ".join(errors))
         return []
 
     def get_home_devices(self, session: TuyaSession, home_id: int) -> List[Dict[str, Any]]:
         """Query all devices in Tuya Home including their local encryption keys (localKey)."""
         logger.debug("Querying Tuya home %s devices...", home_id)
+        errors: List[str] = []
         for api_name, ver in (
             ("smartlife.m.my.group.device.list", "2.2"),
             ("thing.m.my.group.device.list", "2.2"),
@@ -421,7 +426,10 @@ class TuyaGatewayClient:
                     if isinstance(devs, list):
                         return devs
             except Exception as exc:
+                errors.append(f"{api_name} (v{ver}): {exc}")
                 logger.debug("Tuya home devices API %s failed: %s", api_name, exc)
+        if errors:
+            logger.warning("Tuya home devices query for home %s failed across endpoints: %s", home_id, "; ".join(errors))
         return []
 
     def get_all_devices(
@@ -430,6 +438,7 @@ class TuyaGatewayClient:
         """Query all accessible devices (both owned home devices and shared devices)."""
         all_devs: List[Dict[str, Any]] = []
         seen_ids = set()
+        errors: List[str] = []
 
         # 1. Fetch owned home devices if home_id is provided or discoverable
         target_home_id = home_id
@@ -437,7 +446,8 @@ class TuyaGatewayClient:
             try:
                 target_home_id = self.get_home_id(session)
             except Exception as exc:
-                logger.debug("Could not resolve Tuya home ID: %s", exc)
+                logger.warning("Could not resolve Tuya home ID: %s", exc)
+                errors.append(f"get_home_id: {exc}")
 
         if target_home_id:
             try:
@@ -449,7 +459,8 @@ class TuyaGatewayClient:
                     elif not dev_id and isinstance(dev, dict):
                         all_devs.append(dev)
             except Exception as exc:
-                logger.debug("Error fetching home devices: %s", exc)
+                logger.warning("Error fetching home devices: %s", exc)
+                errors.append(f"get_home_devices: {exc}")
 
         # 2. Fetch shared devices
         try:
@@ -461,6 +472,10 @@ class TuyaGatewayClient:
                 elif not dev_id and isinstance(dev, dict):
                     all_devs.append(dev)
         except Exception as exc:
-            logger.debug("Error fetching shared devices: %s", exc)
+            logger.warning("Error fetching shared devices: %s", exc)
+            errors.append(f"get_shared_devices: {exc}")
+
+        if not all_devs and errors:
+            raise RuntimeError(f"Failed to fetch Tuya devices from cloud: {'; '.join(errors)}")
 
         return all_devs

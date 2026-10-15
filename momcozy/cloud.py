@@ -407,10 +407,11 @@ class MomcozyCloudApi:
         if not self.tuya_creds or not self.tuya_creds.token:
             try:
                 self.get_tuya_credentials()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not auto-fetch Tuya credentials: %s", exc)
+                raise
         if not self.tuya_creds or not self.tuya_creds.token:
-            return []
+            raise RuntimeError("No Tuya credentials available (UID or token missing). Please run './momcozy.py login'.")
 
         tuya_client = self.get_tuya_client()
         session = tuya_client.login_with_uid(
@@ -424,7 +425,7 @@ class MomcozyCloudApi:
                 home_id = tuya_client.get_home_id(session)
                 self.tuya_home_id = home_id
             except Exception as exc:
-                logger.debug("Could not determine home ID during device query: %s", exc)
+                logger.warning("Could not determine Tuya home ID (checking shared devices): %s", exc)
 
         return tuya_client.get_all_devices(session, home_id=home_id)
 
@@ -440,13 +441,16 @@ class MomcozyCloudApi:
                     keys[str(dev_id)] = str(key)
         return keys
 
-    def sync_devices_and_keys(self, config_path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    def sync_devices_and_keys(
+        self, config_path: Optional[Path] = None, raise_on_error: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
         """Discover devices and their Tuya localKeys, updating config_path if provided.
 
         Queries Momcozy Cloud and Tuya Cloud (owned and shared devices) to build a unified
         map of devices and their local encryption keys.
         """
         results: Dict[str, Dict[str, Any]] = {}
+        errors: List[str] = []
 
         # 1. Query Momcozy devices
         momcozy_devs: List[Dict[str, Any]] = []
@@ -457,7 +461,8 @@ class MomcozyCloudApi:
             elif isinstance(res, list):
                 momcozy_devs = res
         except Exception as exc:
-            logger.debug("queryDevices failed during sync: %s", exc)
+            logger.warning("Momcozy queryDevices failed during sync: %s", exc)
+            errors.append(f"Momcozy queryDevices: {exc}")
 
         for d in momcozy_devs:
             meta = d.get("metadata") or {}
@@ -499,7 +504,13 @@ class MomcozyCloudApi:
                         if ip and not results[dev_id].get("ip"):
                             results[dev_id]["ip"] = ip
         except Exception as exc:
-            logger.debug("Failed querying Tuya devices during sync: %s", exc)
+            logger.warning("Failed querying Tuya devices during sync: %s", exc)
+            errors.append(f"Tuya devices: {exc}")
+
+        if not results and errors:
+            err_msg = "; ".join(errors)
+            if raise_on_error:
+                raise RuntimeError(f"Cloud device synchronization failed: {err_msg}")
 
         # 3. Update config file if path is specified
         if config_path and Path(config_path).exists() and results:
@@ -534,7 +545,7 @@ class MomcozyCloudApi:
                 cfg_p.write_text(json.dumps(saved, indent=2))
                 logger.debug("Saved synchronized device info to %s", cfg_p)
             except Exception as exc:
-                logger.debug("Could not write synced device info to config: %s", exc)
+                logger.warning("Could not write synced device info to config: %s", exc)
 
         return results
 
