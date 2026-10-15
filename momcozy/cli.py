@@ -1,0 +1,372 @@
+"""Command-Line Interface for Momcozy BM04 Baby Monitor."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import getpass
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+
+from .cloud import DEFAULT_CONFIG_PATH, MomcozyCloudApi
+from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection, Sensitivity
+from .device import MomcozyMonitor
+from .stream import VideoStreamer
+from .web import WebServer
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("momcozy-cli")
+
+
+def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
+    """Resolve device credentials from CLI arguments or saved config file."""
+    config_path = Path(args.config) if hasattr(args, "config") and args.config else DEFAULT_CONFIG_PATH
+    saved = {}
+    if config_path.exists():
+        try:
+            saved = json.loads(config_path.read_text())
+        except Exception:
+            pass
+
+    dev_id = getattr(args, "device_id", None) or saved.get("device_id")
+    local_key = getattr(args, "local_key", None) or saved.get("local_key")
+    ip = getattr(args, "ip", None) or saved.get("ip")
+
+    if not dev_id:
+        print(
+            "Error: Device ID required. Run 'momcozy login' first or pass --device-id and --local-key.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return MomcozyMonitor(
+        device_id=dev_id,
+        local_key=local_key or "",
+        ip=ip,
+        stream_account_email=saved.get("email"),
+        stream_account_password=saved.get("stream_password"),
+        stream_country_code=saved.get("country_code", "1"),
+        stream_region=saved.get("tuya", {}).get("region", "us") if saved.get("tuya") else "us",
+    )
+
+
+def cmd_login(args: argparse.Namespace) -> None:
+    """Log in to Momcozy Cloud and save credentials."""
+    email = args.email or input("Momcozy account email: ").strip()
+    password = args.password or getpass.getpass("Password: ")
+    country = args.country or "US"
+
+    api = MomcozyCloudApi(country_code=country)
+    print(f"Connecting to Momcozy Cloud ({api.base_url})...")
+    try:
+        api.login(email, password)
+        # Store stream password in config file to enable P2P video stream
+        config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+        api.save_session(config_path)
+
+        data = json.loads(config_path.read_text())
+        data["stream_password"] = password
+        config_path.write_text(json.dumps(data, indent=2))
+
+        print(f"✓ Login successful! Saved session to {config_path}")
+        if api.tuya_creds:
+            print(f"  • Tuya Region: {api.tuya_creds.region}")
+            print(f"  • Tuya UID:    {api.tuya_creds.uid}")
+    except Exception as e:
+        print(f"Login failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """Print current monitor telemetry and settings."""
+    monitor = _get_configured_device(args)
+    if args.ip:
+        monitor.set_ip(args.ip)
+
+    try:
+        status = monitor.get_status()
+        if args.json:
+            print(json.dumps(status.__dict__, indent=2, default=str))
+        else:
+            print(status.summary())
+    except Exception as e:
+        print(f"Error reading status: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_temperature(args: argparse.Namespace) -> None:
+    """Quick command to print current room temperature."""
+    monitor = _get_configured_device(args)
+    c, f = monitor.get_temperature()
+    if c is not None:
+        if args.fahrenheit:
+            print(f"{f:.1f}")
+        else:
+            print(f"{c:.1f}")
+    else:
+        print("N/A", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_set(args: argparse.Namespace) -> None:
+    """Change settings on the BM04 monitor."""
+    monitor = _get_configured_device(args)
+
+    if args.night_vision is not None:
+        nv_map = {"auto": NightVisionMode.AUTO, "off": NightVisionMode.OFF, "on": NightVisionMode.ON}
+        monitor.set_night_vision(nv_map[args.night_vision.lower()])
+        print(f"✓ Night vision set to {args.night_vision}")
+
+    if args.privacy is not None:
+        enabled = args.privacy.lower() in ["on", "true", "1"]
+        monitor.set_privacy_mode(enabled)
+        print(f"✓ Privacy mode {'enabled' if enabled else 'disabled'}")
+
+    if args.led is not None:
+        enabled = args.led.lower() in ["on", "true", "1"]
+        monitor.set_indicator_light(enabled)
+        print(f"✓ Status LED {'enabled' if enabled else 'disabled'}")
+
+    if args.flip is not None:
+        enabled = args.flip.lower() in ["on", "true", "1"]
+        monitor.set_flip(enabled)
+        print(f"✓ 180° Video flip {'enabled' if enabled else 'disabled'}")
+
+    if args.motion is not None:
+        enabled = args.motion.lower() in ["on", "true", "1"]
+        sens = args.motion_sensitivity
+        monitor.set_motion_detection(enabled, sensitivity=sens)
+        print(f"✓ Motion detection {'enabled' if enabled else 'disabled'}")
+
+    if args.sound is not None:
+        enabled = args.sound.lower() in ["on", "true", "1"]
+        sens = args.sound_sensitivity
+        monitor.set_sound_detection(enabled, sensitivity=sens)
+        print(f"✓ Sound detection {'enabled' if enabled else 'disabled'}")
+
+    if args.cry is not None:
+        enabled = args.cry.lower() in ["on", "true", "1"]
+        monitor.set_cry_detection(enabled)
+        print(f"✓ Cry detection {'enabled' if enabled else 'disabled'}")
+
+    if args.temp_alert is not None:
+        enabled = args.temp_alert.lower() in ["on", "true", "1"]
+        monitor.set_temperature_alert(enabled, min_c=args.temp_min, max_c=args.temp_max)
+        print(f"✓ Temp alerts {'enabled' if enabled else 'disabled'}")
+
+    if args.volume is not None:
+        monitor.set_volume(args.volume)
+        print(f"✓ Master volume set to {args.volume}%")
+
+
+def cmd_ptz(args: argparse.Namespace) -> None:
+    """Move camera pan/tilt."""
+    monitor = _get_configured_device(args)
+    dir_map = {
+        "up": PtzDirection.UP,
+        "down": PtzDirection.DOWN,
+        "left": PtzDirection.LEFT,
+        "right": PtzDirection.RIGHT,
+    }
+    action = args.action.lower()
+    if action == "stop":
+        monitor.ptz_stop()
+        print("✓ Camera PTZ stopped")
+    elif action in dir_map:
+        if args.duration and args.duration > 0:
+            monitor.ptz_step(dir_map[action], duration_seconds=args.duration)
+            print(f"✓ Panned {action} for {args.duration}s")
+        else:
+            monitor.ptz_move(dir_map[action])
+            print(f"✓ Moving {action} (call 'ptz stop' to halt)")
+
+
+def cmd_lullaby(args: argparse.Namespace) -> None:
+    """Play or stop lullabies."""
+    monitor = _get_configured_device(args)
+    if args.action == "stop":
+        monitor.stop_lullaby()
+        print("✓ Lullaby stopped")
+    elif args.action == "play":
+        track_id = str(args.track)
+        name = LULLABY_TRACKS.get(track_id, f"Track {track_id}")
+        monitor.play_lullaby(track_id=track_id, volume=args.volume)
+        print(f"✓ Playing '{name}' at volume {args.volume or 50}%")
+    elif args.action == "list":
+        print("Available Lullabies:")
+        for tid, name in LULLABY_TRACKS.items():
+            print(f"  [{tid}] {name}")
+
+
+def cmd_snapshot(args: argparse.Namespace) -> None:
+    """Take a still image snapshot."""
+    monitor = _get_configured_device(args)
+    streamer = VideoStreamer(
+        device_id=monitor.device_id,
+        local_key=monitor.local_key,
+        email=monitor.stream_email or "",
+        password=monitor.stream_password or "",
+        country_code=monitor.stream_country_code,
+        region=monitor.stream_region,
+    )
+    print(f"Connecting to {monitor.device_id} to capture snapshot...")
+    try:
+        frame = asyncio.run(streamer.get_snapshot(timeout_seconds=args.timeout))
+        out_path = Path(args.output)
+        out_path.write_bytes(frame)
+        print(f"✓ Snapshot saved to {out_path.resolve()} ({len(frame)} bytes)")
+    except Exception as e:
+        print(f"Error taking snapshot: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_record(args: argparse.Namespace) -> None:
+    """Record an MP4 video clip."""
+    monitor = _get_configured_device(args)
+    streamer = VideoStreamer(
+        device_id=monitor.device_id,
+        local_key=monitor.local_key,
+        email=monitor.stream_email or "",
+        password=monitor.stream_password or "",
+        country_code=monitor.stream_country_code,
+        region=monitor.stream_region,
+    )
+    print(f"Recording {args.duration}s clip from {monitor.device_id} to {args.output}...")
+    try:
+        saved_path = asyncio.run(
+            streamer.record_clip(
+                output_file=args.output,
+                duration_seconds=args.duration,
+                fps=args.fps,
+            )
+        )
+        print(f"✓ Video recorded successfully to {saved_path.resolve()}")
+    except Exception as e:
+        print(f"Error recording video: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    """Run Web Dashboard and MJPEG stream server."""
+    monitor = _get_configured_device(args)
+    streamer = None
+    if monitor.stream_email and monitor.stream_password:
+        streamer = VideoStreamer(
+            device_id=monitor.device_id,
+            local_key=monitor.local_key,
+            email=monitor.stream_email,
+            password=monitor.stream_password,
+            country_code=monitor.stream_country_code,
+            region=monitor.stream_region,
+        )
+
+    server = WebServer(
+        monitor=monitor,
+        streamer=streamer,
+        host=args.host,
+        port=args.port,
+    )
+    print(f"\n=======================================================")
+    print(f" Momcozy BM04 Web Dashboard & MJPEG Streaming Server")
+    print(f" Dashboard:  http://{args.host}:{args.port}")
+    print(f" Live Stream: http://{args.host}:{args.port}/stream")
+    print(f" Snapshot:   http://{args.host}:{args.port}/snapshot")
+    print(f"=======================================================\n")
+    try:
+        asyncio.run(server.run())
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="momcozy",
+        description="Momcozy BM04 Baby Monitor Python Client & Streaming Server",
+    )
+    parser.add_argument("--config", help="Path to config JSON file (~/.momcozy.json by default)")
+    parser.add_argument("--device-id", help="Target device ID")
+    parser.add_argument("--local-key", help="Device local encryption key")
+    parser.add_argument("--ip", help="Device IP on local Wi-Fi")
+
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    # login
+    p_login = sub.add_parser("login", help="Log in to Momcozy Cloud")
+    p_login.add_argument("--email", "-e")
+    p_login.add_argument("--password", "-p")
+    p_login.add_argument("--country", "-c", default="US")
+    p_login.set_defaults(func=cmd_login)
+
+    # status
+    p_status = sub.add_parser("status", help="Show all monitor measurements and settings")
+    p_status.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_status.set_defaults(func=cmd_status)
+
+    # temperature
+    p_temp = sub.add_parser("temperature", help="Print current temperature")
+    p_temp.add_argument("-f", "--fahrenheit", action="store_true", help="Output in Fahrenheit")
+    p_temp.set_defaults(func=cmd_temperature)
+
+    # set
+    p_set = sub.add_parser("set", help="Change monitor settings")
+    p_set.add_argument("--night-vision", choices=["auto", "off", "on"])
+    p_set.add_argument("--privacy", choices=["on", "off"])
+    p_set.add_argument("--led", choices=["on", "off"])
+    p_set.add_argument("--flip", choices=["on", "off"])
+    p_set.add_argument("--motion", choices=["on", "off"])
+    p_set.add_argument("--motion-sensitivity", choices=["0", "1", "2"])
+    p_set.add_argument("--sound", choices=["on", "off"])
+    p_set.add_argument("--sound-sensitivity", choices=["0", "1", "2"])
+    p_set.add_argument("--cry", choices=["on", "off"])
+    p_set.add_argument("--temp-alert", choices=["on", "off"])
+    p_set.add_argument("--temp-min", type=float, help="Min temp alert in Celsius")
+    p_set.add_argument("--temp-max", type=float, help="Max temp alert in Celsius")
+    p_set.add_argument("--volume", type=int, help="Master volume (1-100)")
+    p_set.set_defaults(func=cmd_set)
+
+    # ptz
+    p_ptz = sub.add_parser("ptz", help="Pan, tilt, and zoom controls")
+    p_ptz.add_argument("action", choices=["up", "down", "left", "right", "stop"])
+    p_ptz.add_argument("--duration", "-d", type=float, default=0.5, help="Step duration in seconds")
+    p_ptz.set_defaults(func=cmd_ptz)
+
+    # lullaby
+    p_lullaby = sub.add_parser("lullaby", help="Lullaby controls")
+    p_lullaby.add_argument("action", choices=["play", "stop", "list"])
+    p_lullaby.add_argument("--track", "-t", default="0", help="Track ID (0..7)")
+    p_lullaby.add_argument("--volume", "-v", type=int, default=50)
+    p_lullaby.set_defaults(func=cmd_lullaby)
+
+    # snapshot
+    p_snap = sub.add_parser("snapshot", help="Capture a still JPEG image from video stream")
+    p_snap.add_argument("-o", "--output", default="snapshot.jpg")
+    p_snap.add_argument("-t", "--timeout", type=float, default=10.0)
+    p_snap.set_defaults(func=cmd_snapshot)
+
+    # record
+    p_rec = sub.add_parser("record", help="Record an MP4 video clip from live stream")
+    p_rec.add_argument("-o", "--output", default="recording.mp4")
+    p_rec.add_argument("-d", "--duration", type=int, default=10, help="Duration in seconds")
+    p_rec.add_argument("--fps", type=int, default=15)
+    p_rec.set_defaults(func=cmd_record)
+
+    # serve
+    p_serve = sub.add_parser("serve", help="Start Web UI and MJPEG live stream server")
+    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--port", "-p", type=int, default=8080)
+    p_serve.set_defaults(func=cmd_serve)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "momcozy-client"
+version = "0.1.0"
+description = "Python client and video streaming server for Momcozy BM04 baby monitor"
+readme = "README.md"
+authors = [{ name = "Momcozy Python Client Contributors" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Home Automation",
+    "Topic :: Multimedia :: Video",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "tinytuya>=1.14.0",
+    "tuya-ipc-p2p-sdk>=0.1.0",
+    "argon2-cffi>=21.3.0",
+    "requests>=2.28.0",
+    "aiohttp>=3.8.0",
+    "opencv-python-headless>=4.6.0",
+    "pillow>=9.0.0",
+    "numpy>=1.20.0",
+]
+
+[project.scripts]
+momcozy = "momcozy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["momcozy*"]
