@@ -82,7 +82,7 @@ class VideoStreamer:
             try:
                 logger.info("Connecting to P2P video stream for %s...", self.device_id)
                 async with TuyaIpcP2pClient(
-                    username=self.email,
+                    email=self.email,
                     password=self.password,
                     country_code=self.country_code,
                     region=self.region,

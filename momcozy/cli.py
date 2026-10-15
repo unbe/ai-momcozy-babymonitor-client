@@ -35,6 +35,35 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
     local_key = getattr(args, "local_key", None) or saved.get("local_key")
     ip = getattr(args, "ip", None) or saved.get("ip")
 
+    # If dev_id is an app client UUID (36 chars with hyphens), auto-resolve to real camera ID
+    if (not dev_id) or (dev_id and len(dev_id) == 36 and "-" in dev_id):
+        api = MomcozyCloudApi.load_session(config_path)
+        if api and api.token:
+            try:
+                res = api.query_devices()
+                dev_list = res.get("deviceList") if isinstance(res, dict) else []
+                if dev_list:
+                    first = dev_list[0]
+                    ext_id = (first.get("metadata") or {}).get("extDeviceId") or first.get("sn", "").replace("BM04-", "")
+                    if ext_id:
+                        dev_id = ext_id
+                        saved["client_install_id"] = saved.get("device_id")
+                        saved["device_id"] = dev_id
+                        saved["camera_name"] = first.get("deviceName", "BM04")
+                        if first.get("mac"):
+                            saved["mac"] = first.get("mac")
+                        config_path.write_text(json.dumps(saved, indent=2))
+            except Exception as e:
+                logger.debug("Could not auto-resolve device ID from cloud: %s", e)
+
+    # Persist IP if explicitly passed via CLI
+    if getattr(args, "ip", None) and config_path.exists():
+        saved["ip"] = args.ip
+        try:
+            config_path.write_text(json.dumps(saved, indent=2))
+        except Exception:
+            pass
+
     if not dev_id:
         print(
             "Error: Device ID required. Run 'momcozy login' first or pass --device-id and --local-key.",
@@ -42,14 +71,22 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         )
         sys.exit(1)
 
+    tuya_reg = saved.get("tuya", {}).get("region") if saved.get("tuya") else None
+    account_reg = saved.get("region")
+    stream_reg = "eu" if (tuya_reg == "33" or account_reg == "EU") else "us"
+
+    cc = saved.get("country_code", "1")
+    phone_code_map = {"CH": "41", "DE": "49", "US": "1", "CA": "1", "GB": "44", "UK": "44", "FR": "33"}
+    stream_cc = phone_code_map.get(str(cc).upper(), str(cc))
+
     return MomcozyMonitor(
         device_id=dev_id,
         local_key=local_key or "",
         ip=ip,
         stream_account_email=saved.get("email"),
         stream_account_password=saved.get("stream_password"),
-        stream_country_code=saved.get("country_code", "1"),
-        stream_region=saved.get("tuya", {}).get("region", "us") if saved.get("tuya") else "us",
+        stream_country_code=stream_cc,
+        stream_region=stream_reg,
     )
 
 
@@ -69,6 +106,25 @@ def cmd_login(args: argparse.Namespace) -> None:
 
         data = json.loads(config_path.read_text())
         data["stream_password"] = password
+
+        # Automatically discover user's baby monitor
+        try:
+            dev_info = api.query_devices()
+            dev_list = dev_info.get("deviceList") if isinstance(dev_info, dict) else []
+            if dev_list:
+                first = dev_list[0]
+                ext_id = (first.get("metadata") or {}).get("extDeviceId") or first.get("sn", "").replace("BM04-", "")
+                dev_name = first.get("deviceName", "BM04")
+                mac = first.get("mac", "")
+                data["client_install_id"] = data.get("device_id")
+                data["device_id"] = ext_id
+                data["camera_name"] = dev_name
+                if mac:
+                    data["mac"] = mac
+                print(f"  • Discovered Monitor: {dev_name} (ID: {ext_id}, MAC: {mac})")
+        except Exception as exc:
+            logger.debug("Device discovery during login: %s", exc)
+
         config_path.write_text(json.dumps(data, indent=2))
 
         print(f"✓ Login successful! Saved session to {config_path}")
