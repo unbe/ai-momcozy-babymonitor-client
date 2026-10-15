@@ -382,33 +382,85 @@ class TuyaGatewayClient:
         )
         return bool(res)
 
+    def get_shared_devices(self, session: TuyaSession) -> List[Dict[str, Any]]:
+        """Query devices shared with the user from other accounts."""
+        logger.debug("Querying Tuya shared devices...")
+        for api_name in ("thing.m.my.shared.device.list", "smartlife.m.my.shared.device.list"):
+            try:
+                res = self.call_api(api_name, "3.2", {}, session=session)
+                if isinstance(res, list):
+                    return res
+                if isinstance(res, dict):
+                    devs = res.get("devices") or res.get("deviceList") or res.get("list")
+                    if isinstance(devs, list):
+                        return devs
+            except Exception as exc:
+                logger.debug("Tuya shared devices API %s failed: %s", api_name, exc)
+        return []
+
     def get_home_devices(self, session: TuyaSession, home_id: int) -> List[Dict[str, Any]]:
         """Query all devices in Tuya Home including their local encryption keys (localKey)."""
         logger.debug("Querying Tuya home %s devices...", home_id)
-        try:
-            res = self.call_api(
-                "smartlife.m.my.group.device.list",
-                "2.2",
-                {"gid": home_id},
-                session=session,
-                extra_params={"gid": str(home_id)},
-            )
-            if isinstance(res, list):
-                return res
-            if isinstance(res, dict):
-                return res.get("devices") or res.get("deviceList") or []
-        except Exception as exc:
-            logger.debug("smartlife.m.my.group.device.list failed: %s; trying location.dashboard.list", exc)
+        for api_name, ver in (
+            ("smartlife.m.my.group.device.list", "2.2"),
+            ("thing.m.my.group.device.list", "2.2"),
+            ("smartlife.m.location.dashboard.list", "1.0"),
+        ):
             try:
                 res = self.call_api(
-                    "smartlife.m.location.dashboard.list",
-                    "1.0",
+                    api_name,
+                    ver,
                     {"gid": home_id},
                     session=session,
                     extra_params={"gid": str(home_id)},
                 )
+                if isinstance(res, list):
+                    return res
                 if isinstance(res, dict):
-                    return res.get("devices") or res.get("deviceList") or []
-            except Exception:
-                pass
+                    devs = res.get("devices") or res.get("deviceList")
+                    if isinstance(devs, list):
+                        return devs
+            except Exception as exc:
+                logger.debug("Tuya home devices API %s failed: %s", api_name, exc)
         return []
+
+    def get_all_devices(
+        self, session: TuyaSession, home_id: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Query all accessible devices (both owned home devices and shared devices)."""
+        all_devs: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        # 1. Fetch owned home devices if home_id is provided or discoverable
+        target_home_id = home_id
+        if not target_home_id:
+            try:
+                target_home_id = self.get_home_id(session)
+            except Exception as exc:
+                logger.debug("Could not resolve Tuya home ID: %s", exc)
+
+        if target_home_id:
+            try:
+                for dev in self.get_home_devices(session, target_home_id):
+                    dev_id = str(dev.get("devId") or dev.get("id") or dev.get("gwId") or "")
+                    if dev_id and dev_id not in seen_ids:
+                        seen_ids.add(dev_id)
+                        all_devs.append(dev)
+                    elif not dev_id and isinstance(dev, dict):
+                        all_devs.append(dev)
+            except Exception as exc:
+                logger.debug("Error fetching home devices: %s", exc)
+
+        # 2. Fetch shared devices
+        try:
+            for dev in self.get_shared_devices(session):
+                dev_id = str(dev.get("devId") or dev.get("id") or dev.get("gwId") or "")
+                if dev_id and dev_id not in seen_ids:
+                    seen_ids.add(dev_id)
+                    all_devs.append(dev)
+                elif not dev_id and isinstance(dev, dict):
+                    all_devs.append(dev)
+        except Exception as exc:
+            logger.debug("Error fetching shared devices: %s", exc)
+
+        return all_devs

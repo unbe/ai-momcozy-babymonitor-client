@@ -368,6 +368,90 @@ class TestTuyaCloudGateway(unittest.TestCase):
             self.assertEqual(len(devs), 1)
             self.assertEqual(devs[0]["localKey"], "0123456789abcdef")
 
+    def test_get_shared_devices(self):
+        from unittest.mock import patch
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        session = TuyaSession(sid="sid1", ecode="eco1", uid="uid1")
+
+        mock_shared = [
+            {"devId": "bfb3260f33c5cdc22arfhh", "name": "Shared BM04", "localKey": "fedcba9876543210"}
+        ]
+        with patch.object(client, "call_api", return_value=mock_shared) as mock_api:
+            devs = client.get_shared_devices(session)
+            self.assertEqual(len(devs), 1)
+            self.assertEqual(devs[0]["localKey"], "fedcba9876543210")
+            self.assertEqual(mock_api.call_args[0][0], "thing.m.my.shared.device.list")
+
+    def test_get_all_devices_combines_home_and_shared(self):
+        from unittest.mock import patch
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        session = TuyaSession(sid="sid1", ecode="eco1", uid="uid1")
+
+        home_devs = [{"devId": "dev1", "name": "Home Cam", "localKey": "key1"}]
+        shared_devs = [{"devId": "dev2", "name": "Shared Cam", "localKey": "key2"}]
+
+        with patch.object(client, "get_home_devices", return_value=home_devs), \
+             patch.object(client, "get_shared_devices", return_value=shared_devs), \
+             patch.object(client, "get_home_id", return_value=123):
+            all_devs = client.get_all_devices(session)
+            self.assertEqual(len(all_devs), 2)
+            self.assertEqual({d["devId"] for d in all_devs}, {"dev1", "dev2"})
+
+    def test_sync_devices_and_keys(self):
+        import tempfile
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+        from momcozy.cloud import MomcozyCloudApi, TuyaCredentials
+
+        api = MomcozyCloudApi()
+        api.token = "fake_token"
+        api.tuya_creds = TuyaCredentials(region="33", uid="uid123", token="tuya_token")
+
+        momcozy_devs = {
+            "deviceList": [
+                {
+                    "sn": "BM04-bfb3260f33c5cdc22arfhh",
+                    "deviceName": "Baby Room",
+                    "mac": "50:7B:91:11:22:33",
+                    "metadata": {"extDeviceId": "bfb3260f33c5cdc22arfhh"},
+                }
+            ]
+        }
+        tuya_devs = [
+            {
+                "devId": "bfb3260f33c5cdc22arfhh",
+                "name": "Baby Room",
+                "localKey": "abcdef0123456789",
+                "ip": "10.11.2.12",
+            }
+        ]
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as tmp:
+            tmp.write(json.dumps({"device_id": "bfb3260f33c5cdc22arfhh"}))
+            tmp_path = Path(tmp.name)
+
+        try:
+            with patch.object(api, "query_devices", return_value=momcozy_devs), \
+                 patch.object(api, "get_tuya_devices", return_value=tuya_devs):
+                synced = api.sync_devices_and_keys(tmp_path)
+                self.assertIn("bfb3260f33c5cdc22arfhh", synced)
+                self.assertEqual(synced["bfb3260f33c5cdc22arfhh"]["local_key"], "abcdef0123456789")
+
+                # Verify updated JSON config
+                saved = json.loads(tmp_path.read_text())
+                self.assertEqual(saved["local_key"], "abcdef0123456789")
+                self.assertEqual(saved["camera_name"], "Baby Room")
+                self.assertEqual(saved["mac"], "50:7B:91:11:22:33")
+                self.assertEqual(saved["ip"], "10.11.2.12")
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
 
 class TestWebServer(unittest.IsolatedAsyncioTestCase):
     async def test_handle_api_status_success(self):

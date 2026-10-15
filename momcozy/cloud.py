@@ -402,15 +402,15 @@ class MomcozyCloudApi:
             target_member_code=target_member_code,
         )
 
-    def get_tuya_device_keys(self) -> Dict[str, str]:
-        """Fetch local encryption keys for devices in user's Tuya home."""
+    def get_tuya_devices(self) -> List[Dict[str, Any]]:
+        """Fetch all devices (both owned in Tuya Home and shared with user) from Tuya Cloud."""
         if not self.tuya_creds or not self.tuya_creds.token:
             try:
                 self.get_tuya_credentials()
             except Exception:
                 pass
         if not self.tuya_creds or not self.tuya_creds.token:
-            return {}
+            return []
 
         tuya_client = self.get_tuya_client()
         session = tuya_client.login_with_uid(
@@ -423,10 +423,14 @@ class MomcozyCloudApi:
             try:
                 home_id = tuya_client.get_home_id(session)
                 self.tuya_home_id = home_id
-            except Exception:
-                return {}
+            except Exception as exc:
+                logger.debug("Could not determine home ID during device query: %s", exc)
 
-        devs = tuya_client.get_home_devices(session, home_id)
+        return tuya_client.get_all_devices(session, home_id=home_id)
+
+    def get_tuya_device_keys(self) -> Dict[str, str]:
+        """Fetch local encryption keys for devices (both owned and shared) from Tuya Cloud."""
+        devs = self.get_tuya_devices()
         keys: Dict[str, str] = {}
         for d in devs:
             if isinstance(d, dict):
@@ -435,6 +439,104 @@ class MomcozyCloudApi:
                 if dev_id and key:
                     keys[str(dev_id)] = str(key)
         return keys
+
+    def sync_devices_and_keys(self, config_path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+        """Discover devices and their Tuya localKeys, updating config_path if provided.
+
+        Queries Momcozy Cloud and Tuya Cloud (owned and shared devices) to build a unified
+        map of devices and their local encryption keys.
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Query Momcozy devices
+        momcozy_devs: List[Dict[str, Any]] = []
+        try:
+            res = self.query_devices()
+            if isinstance(res, dict):
+                momcozy_devs = res.get("deviceList") or []
+            elif isinstance(res, list):
+                momcozy_devs = res
+        except Exception as exc:
+            logger.debug("queryDevices failed during sync: %s", exc)
+
+        for d in momcozy_devs:
+            meta = d.get("metadata") or {}
+            ext_id = meta.get("extDeviceId") or d.get("sn", "").replace("BM04-", "")
+            if ext_id:
+                results[ext_id] = {
+                    "device_id": ext_id,
+                    "name": d.get("deviceName", "BM04"),
+                    "mac": d.get("mac", ""),
+                    "local_key": "",
+                    "ip": "",
+                }
+
+        # 2. Query Tuya devices & keys (both owned and shared)
+        try:
+            tuya_devs = self.get_tuya_devices()
+            for td in tuya_devs:
+                if not isinstance(td, dict):
+                    continue
+                dev_id = str(td.get("devId") or td.get("id") or td.get("gwId") or "")
+                local_key = str(td.get("localKey") or td.get("devKey") or td.get("key") or "")
+                name = td.get("name") or "BM04"
+                mac = td.get("mac") or ""
+                ip = td.get("ip") or ""
+                if dev_id:
+                    if dev_id not in results:
+                        results[dev_id] = {
+                            "device_id": dev_id,
+                            "name": name,
+                            "mac": mac,
+                            "local_key": local_key,
+                            "ip": ip,
+                        }
+                    else:
+                        if local_key:
+                            results[dev_id]["local_key"] = local_key
+                        if mac and not results[dev_id].get("mac"):
+                            results[dev_id]["mac"] = mac
+                        if ip and not results[dev_id].get("ip"):
+                            results[dev_id]["ip"] = ip
+        except Exception as exc:
+            logger.debug("Failed querying Tuya devices during sync: %s", exc)
+
+        # 3. Update config file if path is specified
+        if config_path and Path(config_path).exists() and results:
+            cfg_p = Path(config_path)
+            try:
+                saved = json.loads(cfg_p.read_text())
+                primary_id = saved.get("device_id")
+                matched = None
+                if primary_id and primary_id in results:
+                    matched = results[primary_id]
+                elif len(results) == 1:
+                    matched = next(iter(results.values()))
+                    saved["device_id"] = matched["device_id"]
+                elif results:
+                    matched = next(
+                        (item for item in results.values() if item.get("local_key")),
+                        next(iter(results.values())),
+                    )
+                    if not primary_id:
+                        saved["device_id"] = matched["device_id"]
+
+                if matched:
+                    if matched.get("local_key"):
+                        saved["local_key"] = matched["local_key"]
+                    if matched.get("name"):
+                        saved["camera_name"] = matched["name"]
+                    if matched.get("mac") and not saved.get("mac"):
+                        saved["mac"] = matched["mac"]
+                    if matched.get("ip") and not saved.get("ip"):
+                        saved["ip"] = matched["ip"]
+
+                cfg_p.write_text(json.dumps(saved, indent=2))
+                logger.debug("Saved synchronized device info to %s", cfg_p)
+            except Exception as exc:
+                logger.debug("Could not write synced device info to config: %s", exc)
+
+        return results
 
     def add_device_share(
         self,

@@ -70,18 +70,16 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         try:
             api = MomcozyCloudApi.load_session(config_path)
             if api and api.tuya_creds and api.tuya_creds.token:
-                logger.debug("Attempting to auto-resolve local_key for device %s from Tuya Cloud...", dev_id)
-                keys = api.get_tuya_device_keys()
-                if dev_id in keys:
-                    local_key = keys[dev_id]
-                    saved["local_key"] = local_key
-                    config_path.write_text(json.dumps(saved, indent=2))
-                    logger.info("✓ Auto-discovered and saved local_key to %s", config_path)
-                elif keys:
-                    local_key = next(iter(keys.values()))
-                    saved["local_key"] = local_key
-                    config_path.write_text(json.dumps(saved, indent=2))
-                    logger.info("✓ Auto-discovered and saved local_key to %s", config_path)
+                logger.info("Retrieving Tuya encryption key for device %s from Tuya Cloud...", dev_id)
+                synced = api.sync_devices_and_keys(config_path)
+                if dev_id and dev_id in synced and synced[dev_id].get("local_key"):
+                    local_key = synced[dev_id]["local_key"]
+                    logger.info("✓ Retrieved and saved Tuya local encryption key for %s", dev_id)
+                else:
+                    found_key = next((item["local_key"] for item in synced.values() if item.get("local_key")), None)
+                    if found_key:
+                        local_key = found_key
+                        logger.info("✓ Retrieved and saved Tuya local encryption key")
         except Exception as e:
             logger.debug("Could not auto-resolve local_key from Tuya Cloud: %s", e)
 
@@ -121,27 +119,16 @@ def cmd_login(args: argparse.Namespace) -> None:
     print(f"Connecting to Momcozy Cloud ({api.base_url})...")
     try:
         api.login(email, password)
-        # Store stream password in config file to enable P2P video stream
         config_path = (Path(args.config) if args.config else DEFAULT_CONFIG_PATH).expanduser()
         api.save_session(config_path)
 
-        # Automatically discover user's baby monitor
+        # Automatically discover user's baby monitor and sync Tuya keys
         try:
-            dev_info = api.query_devices()
-            dev_list = dev_info.get("deviceList") if isinstance(dev_info, dict) else []
-            if dev_list:
-                data = json.loads(config_path.read_text())
-                first = dev_list[0]
-                ext_id = (first.get("metadata") or {}).get("extDeviceId") or first.get("sn", "").replace("BM04-", "")
-                dev_name = first.get("deviceName", "BM04")
-                mac = first.get("mac", "")
-                data["client_install_id"] = data.get("device_id")
-                data["device_id"] = ext_id
-                data["camera_name"] = dev_name
-                if mac:
-                    data["mac"] = mac
-                config_path.write_text(json.dumps(data, indent=2))
-                print(f"  • Discovered Monitor: {dev_name} (ID: {ext_id}, MAC: {mac})")
+            synced = api.sync_devices_and_keys(config_path)
+            if synced:
+                for did, dinfo in synced.items():
+                    key_tag = " [localKey retrieved]" if dinfo.get("local_key") else ""
+                    print(f"  • Discovered Monitor: {dinfo.get('name', 'BM04')} (ID: {did}){key_tag}")
         except Exception as exc:
             logger.debug("Device discovery during login: %s", exc)
 
@@ -151,6 +138,37 @@ def cmd_login(args: argparse.Namespace) -> None:
             print(f"  • Tuya UID:    {api.tuya_creds.uid}")
     except Exception as e:
         print(f"Login failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    """Synchronize devices and local encryption keys from Momcozy & Tuya Cloud."""
+    config_path = (Path(args.config) if args.config else DEFAULT_CONFIG_PATH).expanduser()
+    api = MomcozyCloudApi.load_session(config_path)
+    if not api or not api.token:
+        print("Not logged in. Run './momcozy.py login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Connecting to Momcozy & Tuya Cloud to synchronize devices and local keys...")
+    try:
+        synced = api.sync_devices_and_keys(config_path)
+        if not synced:
+            print("No devices found on your account.")
+            return
+
+        print(f"\n✓ Successfully synchronized {len(synced)} device(s) (saved to {config_path}):\n")
+        for dev_id, info in synced.items():
+            name = info.get("name", "BM04")
+            key = info.get("local_key")
+            mac = info.get("mac") or "Unknown"
+            ip = info.get("ip") or "Discovered locally"
+            print(f"  Device: {name} (ID: {dev_id})")
+            print(f"    • Local Key:  {key if key else 'Not available on cloud'}")
+            print(f"    • MAC:        {mac}")
+            print(f"    • Network IP: {ip}")
+            print()
+    except Exception as e:
+        print(f"Sync failed: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -505,6 +523,13 @@ def build_parser() -> argparse.ArgumentParser:
     # devices
     p_devices = sub.add_parser("devices", help="List devices bound to your account (raw JSON)")
     p_devices.set_defaults(func=cmd_devices)
+
+    # sync / keys
+    p_sync = sub.add_parser("sync", help="Synchronize devices and local encryption keys from Momcozy & Tuya Cloud")
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_keys = sub.add_parser("keys", help="Alias for 'sync' - fetch device encryption keys from cloud")
+    p_keys.set_defaults(func=cmd_sync)
 
     # status
     p_status = sub.add_parser("status", help="Show all monitor measurements and settings")
