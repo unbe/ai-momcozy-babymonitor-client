@@ -225,6 +225,24 @@ Now open `http://localhost:8080` in any browser:
 - **Control API:** `POST http://localhost:8080/api/control`
 - **PTZ API:** `POST http://localhost:8080/api/ptz`
 
+### 8. Device Sharing
+
+Share your baby monitor access with other Momcozy/Tuya accounts:
+
+```bash
+# Share device access with a partner/family member by email
+./momcozy.py share add partner@example.com
+
+# Search for a user's member code on Tuya/Momcozy
+./momcozy.py share search partner@example.com
+
+# Query email details for member codes
+./momcozy.py share query MEM12345
+
+# Revoke device access for a member code
+./momcozy.py share remove MEM12345
+```
+
 ---
 
 ## 🐍 Python Library Usage
