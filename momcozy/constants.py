@@ -11,6 +11,15 @@ from typing import Dict, Final
 # Momcozy Cloud API endpoints
 API_BASE_URL: Final[str] = "https://app-api.mcozycloud.com"
 API_BASE_URL_CN: Final[str] = "https://app-api-cn-1.mcozycloud.com"
+
+# Regional API gateways (from /api/app/sys/app/public/config -> regionConfigList).
+# An account lives in exactly one region; Switzerland/Germany/etc. are "EU".
+REGION_API_URLS: Final[dict] = {
+    "NA": "https://app-api-us-1.cozyinnov.com",
+    "EU": "https://app-api-eu-1.cozyinnov.com",
+    "AP": "https://app-api-ap-1.cozyinnov.com",
+    "CN": "https://app-api-cn-1.mcozycloud.com",
+}
 APP_ID: Final[str] = "momcozy-0719"
 APP_VERSION: Final[str] = "3.5.0"
 CLIENT_TYPE: Final[str] = "Android"

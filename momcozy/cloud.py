@@ -28,6 +28,7 @@ from .constants import (
     ARGON2_PARALLELISM,
     ARGON2_TIME_COST,
     CLIENT_TYPE,
+    REGION_API_URLS,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,11 @@ class MomcozyCloudApi:
         device_id: Optional[str] = None,
         country_code: str = "US",
         country_name: str = "United States",
+        region: Optional[str] = None,
     ) -> None:
+        if region:
+            base_url = REGION_API_URLS[region.upper()]
+        self.region = region.upper() if region else None
         self.base_url = base_url.rstrip("/")
         self.device_id = device_id or str(uuid.uuid4())
         self.country_code = country_code
@@ -127,7 +132,25 @@ class MomcozyCloudApi:
         return result.get("sid", "")
 
     def login(self, email: str, password: str) -> Dict[str, Any]:
-        """Authenticate with email and password."""
+        """Authenticate with email and password.
+
+        If no region was given, try every regional gateway (EU, NA, AP) until one
+        accepts the account; the account's home region is then remembered.
+        """
+        if self.region:
+            return self._login_once(email, password)
+        errors = []
+        for region in ("EU", "NA", "AP"):
+            self.region = region
+            self.base_url = REGION_API_URLS[region]
+            try:
+                return self._login_once(email, password)
+            except RuntimeError as exc:
+                errors.append(f"{region}: {exc}")
+        self.region = None
+        raise RuntimeError("Login failed in all regions - " + "; ".join(errors))
+
+    def _login_once(self, email: str, password: str) -> Dict[str, Any]:
         hashed_pw = hash_password(password)
         sid = self.init_auth()
 
@@ -169,6 +192,20 @@ class MomcozyCloudApi:
 
         raise RuntimeError(f"Momcozy login failed: {last_error}")
 
+    def query_devices(self) -> Any:
+        """List devices bound to the account (/api/app/device/queryDevices).
+
+        NOTE: response shape not yet verified against a live account.
+        """
+        if not self.token:
+            raise RuntimeError("Must be logged in")
+        resp = requests.get(f"{self.base_url}/api/app/device/queryDevices",
+                            headers=self._headers(need_auth=True), timeout=15)
+        data = resp.json()
+        if data.get("code") != "200":
+            raise RuntimeError(f"queryDevices failed: {data.get('message')}")
+        return data.get("result")
+
     def get_tuya_credentials(self) -> TuyaCredentials:
         """Fetch Tuya cloud credentials linked to this Momcozy account."""
         if not self.token:
@@ -198,6 +235,7 @@ class MomcozyCloudApi:
             "device_id": self.device_id,
             "country_code": self.country_code,
             "country_name": self.country_name,
+            "region": self.region,
             "tuya": {
                 "region": self.tuya_creds.region if self.tuya_creds else "NA",
                 "uid": self.tuya_creds.uid if self.tuya_creds else "",
@@ -221,6 +259,7 @@ class MomcozyCloudApi:
                 device_id=data.get("device_id"),
                 country_code=data.get("country_code", "US"),
                 country_name=data.get("country_name", "United States"),
+                region=data.get("region"),
             )
             client.email = data.get("email")
             client.token = data.get("token")

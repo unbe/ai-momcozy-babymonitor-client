@@ -59,7 +59,7 @@ def cmd_login(args: argparse.Namespace) -> None:
     password = args.password or getpass.getpass("Password: ")
     country = args.country or "US"
 
-    api = MomcozyCloudApi(country_code=country)
+    api = MomcozyCloudApi(country_code=country, region=args.region)
     print(f"Connecting to Momcozy Cloud ({api.base_url})...")
     try:
         api.login(email, password)
@@ -77,6 +77,20 @@ def cmd_login(args: argparse.Namespace) -> None:
             print(f"  • Tuya UID:    {api.tuya_creds.uid}")
     except Exception as e:
         print(f"Login failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_devices(args: argparse.Namespace) -> None:
+    """Dump the raw device list from the cloud (use to find device_id / local key)."""
+    config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+    api = MomcozyCloudApi.load_session(config_path)
+    if not api or not api.token:
+        print("Not logged in. Run 'momcozy login' first.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        print(json.dumps(api.query_devices(), indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -297,8 +311,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_login = sub.add_parser("login", help="Log in to Momcozy Cloud")
     p_login.add_argument("--email", "-e")
     p_login.add_argument("--password", "-p")
-    p_login.add_argument("--country", "-c", default="US")
+    p_login.add_argument("--country", "-c", default="US", help="ISO2 country code, e.g. CH")
+    p_login.add_argument("--region", "-r", choices=["NA", "EU", "AP", "CN"], default=None,
+                         help="Account region (default: auto-detect; Switzerland/Germany = EU)")
     p_login.set_defaults(func=cmd_login)
+
+    # devices
+    p_devices = sub.add_parser("devices", help="List devices bound to your account (raw JSON)")
+    p_devices.set_defaults(func=cmd_devices)
 
     # status
     p_status = sub.add_parser("status", help="Show all monitor measurements and settings")
