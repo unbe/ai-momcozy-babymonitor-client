@@ -360,8 +360,13 @@ def cmd_share(args: argparse.Namespace) -> None:
 
     dev_id = args.device_id
     if not dev_id:
-        cfg = _load_config(args.config)
-        dev_id = cfg.get("device_id")
+        config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+        if config_path.exists():
+            try:
+                cfg = json.loads(config_path.read_text())
+                dev_id = cfg.get("device_id")
+            except Exception:
+                pass
     if not dev_id:
         print("Error: No target device ID specified or found in config.", file=sys.stderr)
         sys.exit(1)

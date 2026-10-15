@@ -192,16 +192,49 @@ class MomcozyCloudApi:
 
         raise RuntimeError(f"Momcozy login failed: {last_error}")
 
-    def query_devices(self) -> Any:
-        """List devices bound to the account (/api/app/device/queryDevices).
+    def _api_request(self, method: str, url: str, need_auth: bool = True, **kwargs) -> Dict[str, Any]:
+        """Perform HTTP request to Momcozy Cloud with automatic re-authentication if signed out."""
+        headers = self._headers(need_auth=need_auth)
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers"))
+        resp = requests.request(method, url, headers=headers, **kwargs)
+        resp.raise_for_status()
+        data = resp.json()
+        code = str(data.get("code", ""))
 
-        NOTE: response shape not yet verified against a live account.
-        """
+        # If signed out on another device or expired, and we have password, re-login and retry
+        if code in ("10004030", "10001002") and self.email and getattr(self, "_password", None):
+            logger.info("Momcozy session was logged out by another device. Automatically re-logging in...")
+            self.login(self.email, self._password)
+            if getattr(self, "_config_path", None):
+                try:
+                    cfg = json.loads(Path(self._config_path).read_text())
+                    cfg["token"] = self.token
+                    cfg["refresh_token"] = self.refresh_token
+                    cfg["user_uid"] = self.user_uid
+                    if self.tuya_creds:
+                        cfg["tuya"] = {
+                            "region": self.tuya_creds.region,
+                            "uid": self.tuya_creds.uid,
+                            "token": self.tuya_creds.token,
+                        }
+                    Path(self._config_path).write_text(json.dumps(cfg, indent=2))
+                except Exception as e:
+                    logger.debug("Failed updating config on auto re-login: %s", e)
+
+            # Retry request with new token
+            headers = self._headers(need_auth=need_auth)
+            resp = requests.request(method, url, headers=headers, **kwargs)
+            resp.raise_for_status()
+            data = resp.json()
+
+        return data
+
+    def query_devices(self) -> Any:
+        """List devices bound to the account (/api/app/device/queryDevices)."""
         if not self.token:
             raise RuntimeError("Must be logged in")
-        resp = requests.get(f"{self.base_url}/api/app/device/queryDevices",
-                            headers=self._headers(need_auth=True), timeout=15)
-        data = resp.json()
+        data = self._api_request("GET", f"{self.base_url}/api/app/device/queryDevices", need_auth=True, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"queryDevices failed: {data.get('message')}")
         return data.get("result")
@@ -211,9 +244,7 @@ class MomcozyCloudApi:
         if not self.token:
             raise RuntimeError("Must be logged in to fetch Tuya credentials")
         url = f"{self.base_url}/api/app/third/tuya/user"
-        resp = requests.get(url, headers=self._headers(need_auth=True), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._api_request("GET", url, need_auth=True, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"Failed to get Tuya user credentials: {data.get('message')}")
         result = data.get("result", {})
@@ -224,8 +255,8 @@ class MomcozyCloudApi:
         )
         return self.tuya_creds
 
-    def search_tuya_user(self, account: str, country_code: Optional[str] = None, account_type: int = 1) -> Dict[str, Any]:
-        """Search for a target Momcozy/Tuya user by email or account to prepare for device sharing.
+    def search_tuya_user(self, account: str, country_code: Optional[str] = None, account_type: Optional[int] = None) -> Dict[str, Any]:
+        """Search for a target Momcozy/Tuya user by email or phone to prepare for device sharing.
 
         Calls /api/app/third/tuya/user/search.
         Returns dict containing 'memberCode', 'uid', and 'region'.
@@ -233,14 +264,14 @@ class MomcozyCloudApi:
         if not self.token:
             raise RuntimeError("Must be logged in to search users")
         url = f"{self.base_url}/api/app/third/tuya/user/search"
-        params = {
-            "account": account,
-            "type": account_type,
-            "countryCode": country_code or self.country_code,
-        }
-        resp = requests.get(url, params=params, headers=self._headers(need_auth=True), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        if account_type is None:
+            account_type = 2 if account.replace("+", "").isdigit() else 1
+        params: Dict[str, Any] = {"type": account_type}
+        if account_type == 1:
+            params["email"] = account
+        else:
+            params["phone"] = account
+        data = self._api_request("GET", url, need_auth=True, params=params, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"User search failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
@@ -254,9 +285,7 @@ class MomcozyCloudApi:
             raise RuntimeError("Must be logged in to share device")
         url = f"{self.base_url}/api/app/third/tuya/device/{tuya_dev_id}/share"
         payload = {"memberCode": member_code}
-        resp = requests.post(url, json=payload, headers=self._headers(need_auth=True), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._api_request("POST", url, need_auth=True, json=payload, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"Device share failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
@@ -273,9 +302,7 @@ class MomcozyCloudApi:
             "tuyaDevId": tuya_dev_id,
             "memberCode": member_code,
         }
-        resp = requests.post(url, json=payload, headers=self._headers(need_auth=True), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._api_request("POST", url, need_auth=True, json=payload, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"Share notification failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
@@ -289,9 +316,7 @@ class MomcozyCloudApi:
             raise RuntimeError("Must be logged in to query shared user info")
         url = f"{self.base_url}/api/app/third/tuya/user/queryEmail"
         payload = {"memberCodeList": member_codes}
-        resp = requests.post(url, json=payload, headers=self._headers(need_auth=True), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._api_request("POST", url, need_auth=True, json=payload, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"Query shared emails failed: {data.get('message', 'Unknown error')}")
         res = data.get("result", {})
@@ -305,9 +330,7 @@ class MomcozyCloudApi:
         if not self.token:
             raise RuntimeError("Must be logged in to revoke device share")
         url = f"{self.base_url}/api/app/third/tuya/device/{tuya_dev_id}/share/{member_code}"
-        resp = requests.delete(url, headers=self._headers(need_auth=True), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._api_request("DELETE", url, need_auth=True, timeout=15)
         if data.get("code") != "200":
             raise RuntimeError(f"Revoke device share failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
@@ -346,11 +369,12 @@ class MomcozyCloudApi:
 
     def save_session(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
         """Save credentials to disk."""
-        path = Path(path)
+        path = Path(path).expanduser()
         payload = {
             "email": self.email,
             "token": self.token,
             "refresh_token": self.refresh_token,
+            "stream_password": self._password,
             "user_uid": self.user_uid,
             "device_id": self.device_id,
             "country_code": self.country_code,
@@ -370,7 +394,7 @@ class MomcozyCloudApi:
     @classmethod
     def load_session(cls, path: Path | str = DEFAULT_CONFIG_PATH) -> Optional[MomcozyCloudApi]:
         """Load session from disk if present."""
-        path = Path(path)
+        path = Path(path).expanduser()
         if not path.exists():
             return None
         try:
@@ -385,6 +409,8 @@ class MomcozyCloudApi:
             client.token = data.get("token")
             client.refresh_token = data.get("refresh_token")
             client.user_uid = data.get("user_uid")
+            client._password = data.get("stream_password")
+            client._config_path = str(path)
             tuya_data = data.get("tuya")
             if tuya_data:
                 client.tuya_creds = TuyaCredentials(

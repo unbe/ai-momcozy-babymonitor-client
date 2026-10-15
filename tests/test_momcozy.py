@@ -172,19 +172,20 @@ class TestMomcozyDeviceShare(unittest.TestCase):
         }
         mock_resp.raise_for_status = MagicMock()
 
-        with patch("requests.get", return_value=mock_resp) as mock_get:
+        with patch("requests.request", return_value=mock_resp) as mock_req:
             res = self.api.search_tuya_user("friend@example.com", country_code="CH")
             self.assertEqual(res["memberCode"], "MEM999")
             self.assertEqual(res["region"], "33")
-            mock_get.assert_called_once()
-            args, kwargs = mock_get.call_args
-            self.assertIn("/api/app/third/tuya/user/search", args[0])
-            self.assertEqual(kwargs["params"]["account"], "friend@example.com")
+            mock_req.assert_called_once()
+            args, kwargs = mock_req.call_args
+            self.assertEqual(args[0], "GET")
+            self.assertIn("/api/app/third/tuya/user/search", args[1])
+            self.assertEqual(kwargs["params"]["email"], "friend@example.com")
 
     def test_add_device_share_flow(self):
         from unittest.mock import patch, MagicMock
 
-        def mock_req(url, *args, **kwargs):
+        def mock_req(method, url, *args, **kwargs):
             mock = MagicMock()
             mock.raise_for_status = MagicMock()
             if "/search" in url:
@@ -195,7 +196,7 @@ class TestMomcozyDeviceShare(unittest.TestCase):
                 mock.json.return_value = {"code": "200", "result": {}}
             return mock
 
-        with patch("requests.get", side_effect=mock_req), patch("requests.post", side_effect=mock_req):
+        with patch("requests.request", side_effect=mock_req):
             res = self.api.add_device_share("partner@example.com", tuya_dev_id="test_camera")
             self.assertEqual(res["account"], "partner@example.com")
             self.assertEqual(res["member_code"], "MEM1")
