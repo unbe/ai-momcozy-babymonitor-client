@@ -195,6 +195,28 @@ flowchart TD
    - Handled via `aiohttp` `/stream` returning `multipart/x-mixed-replace`.
    - **Pacing & Backpressure:** Paced at ~15 FPS (`min_interval = 0.065s`) with explicit `await response.drain()`, preventing 1080p frames (up to 4 MB/s) from overflowing socket buffers or choking the Python event loop.
 
+### Transport Architecture: Local LAN vs. Cloud Relay
+
+A common question is whether the video stream can come via the cloud or if it can be streamed locally over the LAN:
+
+> [!IMPORTANT]
+> **Can the video stream come via the cloud?**
+> **Yes.** In fact, with the Momcozy BM04, the video stream **always** comes via Tuya's Cloud TCP Relay infrastructure (`tcpRelay` servers over port 1443).
+
+Here is the breakdown of why and how each transport channel works:
+
+| Channel | Protocol / Port | Transport | Path | Why? |
+|:---|:---|:---:|:---:|:---|
+| **Device Control & Telemetry** (PTZ, Night Vision, Lullaby, Privacy) | Tuya v3.3/3.4 TCP `6668` | **Local LAN** | Client $\rightarrow$ Camera IP | Extremely fast (~30ms), zero cloud latency, operates completely offline on the home network. |
+| **Video Live Stream** (1080p HEVC H.265) | Tuya P2P Relay TCP `1443` | **Cloud Relay** | Camera $\rightarrow$ Tuya Cloud Relay $\rightarrow$ Client | Camera firmware has no local RTSP/HTTP server. Direct local ICE peer-to-peer binding triggers role conflicts with camera firmware. |
+
+#### Why Video Uses Tuya Cloud TCP Relay:
+1. **No Local Media Daemon:** The BM04 camera only listens on local port `6668` for standard Tuya binary Datapoint commands. It does not run an RTSP, RTMP, or local HTTP video server on LAN.
+2. **Firmware ICE Role Incompatibility:** In Tuya's P2P WebRTC/ICE implementation, taking the controlling role locally causes the camera firmware to drop sessions almost immediately (`close_reason=6`). The open-source `tuya_ipc_p2p_sdk` relies on Tuya's managed `RelaySession` (`tcpRelay` cloud endpoints), where Tuya's cloud relay handles media packet routing reliably.
+3. **Transport Transparency:** The CLI (`./momcozy.py status`) and Web Dashboard provide real-time indicators:
+   - **Control:** `Local LAN (<ip>:6668)` (or `Tuya Cloud Gateway` if IP is not set)
+   - **Stream:** `Cloud Relay (Tuya P2P)` badge (with `☁️ Cloud Relay` overlay on the player)
+
 ---
 
 ## 5. Web Dashboard & Resilient Error Handling

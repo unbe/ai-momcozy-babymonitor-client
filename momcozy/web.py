@@ -258,13 +258,45 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       from { transform: translateX(100%); opacity: 0; }
       to { transform: translateX(0); opacity: 1; }
     }
+
+    /* Transport badges */
+    .transport-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.2);
+      color: #fff;
+      margin-left: 6px;
+      letter-spacing: 0.2px;
+    }
+    .transport-pill.cloud {
+      background: rgba(66, 153, 225, 0.35);
+      border: 1px solid rgba(66, 153, 225, 0.55);
+      color: #EBF8FF;
+    }
+    .transport-pill.local {
+      background: rgba(72, 187, 120, 0.35);
+      border: 1px solid rgba(72, 187, 120, 0.55);
+      color: #F0FFF4;
+    }
   </style>
 </head>
 <body>
   <div id="toast-container"></div>
   <div class="container">
     <header>
-      <h1>🍼 Momcozy BM04 Monitor</h1>
+      <div>
+        <h1>🍼 Momcozy BM04 Monitor</h1>
+        <div style="font-size: 0.76rem; color: var(--text-muted); margin-top: 3px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+          <span>Control: <strong id="hdr-control-transport" style="color:var(--text);">Local LAN (:6668)</strong></span>
+          <span>&bull;</span>
+          <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong></span>
+        </div>
+      </div>
       <span id="conn-badge" class="badge active">Connected</span>
     </header>
 
@@ -272,6 +304,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div class="video-overlay" id="video-overlay">
         <div class="live-dot" id="live-dot"></div>
         <span id="stream-badge">LIVE STREAM</span>
+        <span id="stream-transport-badge" class="transport-pill cloud">☁️ Cloud Relay</span>
       </div>
       <img id="stream-img" src="/stream" alt="Camera Stream">
       <div id="video-error" class="video-error-overlay hidden">
@@ -562,6 +595,29 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           }
         }
 
+        // Update transport badges
+        if (d.control_transport) {
+          const ctrlEl = document.getElementById('hdr-control-transport');
+          if (ctrlEl) ctrlEl.innerText = d.control_transport;
+        }
+        if (d.stream_transport) {
+          const stEl = document.getElementById('hdr-stream-transport');
+          if (stEl) stEl.innerText = d.stream_transport;
+          const stBadge = document.getElementById('stream-transport-badge');
+          if (stBadge) {
+            if (d.stream_mode === 'local') {
+              stBadge.className = 'transport-pill local';
+              stBadge.innerText = '🏠 Local Stream';
+            } else if (d.stream_mode === 'cloud_relay') {
+              stBadge.className = 'transport-pill cloud';
+              stBadge.innerText = '☁️ Cloud Relay';
+            } else {
+              stBadge.className = 'transport-pill';
+              stBadge.innerText = d.stream_transport;
+            }
+          }
+        }
+
         if (d.temperature_c !== null && d.temperature_c !== undefined) {
           document.getElementById('temp-val').innerHTML = `${d.temperature_c.toFixed(1)}°C <span>(${d.temperature_f.toFixed(1)}°F)</span>`;
         }
@@ -700,11 +756,27 @@ class WebServer:
 
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
+        raw_sm = getattr(self.streamer, "stream_mode", "none") if self.streamer else "none"
+        stream_mode = raw_sm if isinstance(raw_sm, str) else "none"
+
+        raw_st = getattr(self.streamer, "transport_description", "Disabled") if self.streamer else "Disabled"
+        stream_transport = raw_st if isinstance(raw_st, str) else "Disabled"
+
+        raw_cm = getattr(self.monitor, "control_mode", "cloud")
+        control_mode = raw_cm if isinstance(raw_cm, str) else "cloud"
+
+        raw_ct = getattr(self.monitor, "control_transport", "Tuya Cloud Gateway")
+        control_transport = raw_ct if isinstance(raw_ct, str) else "Tuya Cloud Gateway"
+
         stream_info = {
             "stream_configured": self.streamer is not None,
             "stream_running": self.streamer.is_running if self.streamer else False,
             "stream_connected": self.streamer.is_connected if self.streamer else False,
             "stream_error": self.streamer.last_error if self.streamer else None,
+            "stream_mode": stream_mode,
+            "stream_transport": stream_transport,
+            "control_mode": control_mode,
+            "control_transport": control_transport,
         }
         try:
             status = await asyncio.to_thread(self.monitor.get_status)

@@ -563,12 +563,16 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         from momcozy.device import BM04Status
 
         mock_monitor = MagicMock()
+        mock_monitor.control_mode = "local_lan"
+        mock_monitor.control_transport = "Local LAN (192.168.1.50:6668)"
         mock_monitor.get_status.return_value = BM04Status(temperature_c=21.0, temperature_f=69.8)
 
         mock_streamer = MagicMock()
         mock_streamer.is_running = True
         mock_streamer.is_connected = False
         mock_streamer.last_error = "Signaling error: 135"
+        mock_streamer.stream_mode = "cloud_relay"
+        mock_streamer.transport_description = "Cloud Relay (Tuya P2P)"
 
         server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
         req = make_mocked_request("GET", "/api/status")
@@ -581,6 +585,10 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["stream_running"])
         self.assertFalse(body["stream_connected"])
         self.assertEqual(body["stream_error"], "Signaling error: 135")
+        self.assertEqual(body["stream_mode"], "cloud_relay")
+        self.assertEqual(body["stream_transport"], "Cloud Relay (Tuya P2P)")
+        self.assertEqual(body["control_mode"], "local_lan")
+        self.assertEqual(body["control_transport"], "Local LAN (192.168.1.50:6668)")
 
     async def test_handle_stream_not_configured(self):
         from unittest.mock import MagicMock

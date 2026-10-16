@@ -335,6 +335,16 @@ class VideoStreamer:
     def latest_frame(self) -> Optional[bytes]:
         return self._latest_frame
 
+    @property
+    def stream_mode(self) -> str:
+        """Stream transport mode: 'cloud_relay' or 'local'."""
+        return "cloud_relay"
+
+    @property
+    def transport_description(self) -> str:
+        """Human-readable description of video stream transport."""
+        return "Cloud Relay (Tuya P2P)"
+
     async def start(self) -> None:
         """Start background streaming task."""
         async with self._lock:

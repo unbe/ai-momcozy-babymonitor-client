@@ -329,9 +329,15 @@ def cmd_status(args: argparse.Namespace) -> None:
     try:
         status = monitor.get_status()
         if args.json:
-            print(json.dumps(status.__dict__, indent=2, default=str))
+            data = dict(status.__dict__)
+            data["control_transport"] = monitor.control_transport
+            data["stream_transport"] = "Cloud Relay (Tuya P2P)"
+            print(json.dumps(data, indent=2, default=str))
         else:
-            print(status.summary())
+            summary = status.summary()
+            if "Stream Transport:" not in summary:
+                summary += "  • Stream Transport:   Cloud Relay (Tuya P2P)\n"
+            print(summary)
     except Exception as e:
         print(f"Error reading status: {e}", file=sys.stderr)
         sys.exit(1)

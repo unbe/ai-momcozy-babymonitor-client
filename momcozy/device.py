@@ -66,6 +66,7 @@ class BM04Status:
     master_volume: int = 50
     sd_card_status: int = 1  # 1=normal, 4=no card
     sd_storage: str = ""
+    control_transport: str = ""
 
     raw_dps: Dict[str, Any] = field(default_factory=dict)
 
@@ -83,9 +84,11 @@ class BM04Status:
             if self.lullaby_playing
             else "Stopped"
         )
+        transport_line = f"  • Control Transport:  {self.control_transport}\n" if self.control_transport else ""
 
         return (
             f"--- Momcozy BM04 Baby Monitor Status ---\n"
+            f"{transport_line}"
             f"  • Temperature:        {temp_str}\n"
             f"  • Temp Alerts:        {'Enabled' if self.temp_alert_enabled else 'Disabled'} "
             f"(Range: {self.temp_min_c}°C - {self.temp_max_c}°C)\n"
@@ -163,6 +166,16 @@ class MomcozyMonitor:
             self._device.set_socketTimeout(1.0)
             self._lan_tcp_unavailable = False
             self._lan_status_unsupported = False
+
+    @property
+    def control_mode(self) -> str:
+        """Control mode: 'local_lan' or 'cloud'."""
+        return "local_lan" if self.ip else "cloud"
+
+    @property
+    def control_transport(self) -> str:
+        """Human-readable description of device control transport."""
+        return f"Local LAN ({self.ip}:6668)" if self.ip else "Tuya Cloud Gateway"
 
     def set_ip(self, ip: str) -> None:
         """Update monitor IP address."""
@@ -243,6 +256,7 @@ class MomcozyMonitor:
         status.master_volume = int(dps.get(str(int(DP.BASIC_DEVICE_VOLUME)), 50))
         status.sd_card_status = int(dps.get(str(int(DP.SD_STATUS)), 1))
         status.sd_storage = str(dps.get(str(int(DP.SD_STORAGE)), ""))
+        status.control_transport = self.control_transport
 
         return status
 
