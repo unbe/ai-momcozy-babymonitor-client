@@ -38,109 +38,19 @@ class MomcozyHevcHandler:
     """Reassembles and decodes BM04 1080p HEVC video streams into JPEG frames."""
 
     def __init__(self, on_frame: Any) -> None:
+        try:
+            import av
+        except ImportError as e:
+            raise ImportError(
+                "Live HEVC video streaming requires the 'av' package. "
+                "Install it with: pip install av (or pip install -r requirements.txt)"
+            ) from e
+
         self._on_frame = on_frame
         self._buffer = bytearray()
         self._fu_buffer = bytearray()
+        self._codec = av.CodecContext.create("hevc", "r")
         self.frame_count = 0
-        self._decoder_mode = None
-        self._codec = None
-        self._ffmpeg_proc = None
-        self._ffmpeg_thread = None
-
-        try:
-            import av
-
-            self._codec = av.CodecContext.create("hevc", "r")
-            self._decoder_mode = "av"
-        except ImportError:
-            import shutil
-
-            if shutil.which("ffmpeg"):
-                self._decoder_mode = "ffmpeg"
-                self._start_ffmpeg_pipe()
-            else:
-                raise ImportError(
-                    "HEVC video decoding requires either the 'av' Python package or 'ffmpeg' installed on system. "
-                    "Run 'pip install av' or 'pip install -r requirements.txt'."
-                )
-
-    def _start_ffmpeg_pipe(self) -> None:
-        import subprocess
-        import threading
-
-        self._ffmpeg_proc = subprocess.Popen(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-flags",
-                "low_delay",
-                "-fflags",
-                "nobuffer",
-                "-f",
-                "hevc",
-                "-i",
-                "pipe:0",
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "-q:v",
-                "3",
-                "pipe:1",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            bufsize=0,
-        )
-
-        def _read_jpegs() -> None:
-            buf = bytearray()
-            soi = b"\xff\xd8"
-            eoi = b"\xff\xd9"
-            stdout = self._ffmpeg_proc.stdout if self._ffmpeg_proc else None
-            if not stdout:
-                return
-            while self._ffmpeg_proc and self._ffmpeg_proc.poll() is None:
-                try:
-                    chunk = stdout.read(8192)
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    while True:
-                        s_idx = buf.find(soi)
-                        if s_idx < 0:
-                            if len(buf) > 1:
-                                del buf[:-1]
-                            break
-                        if s_idx > 0:
-                            del buf[:s_idx]
-                        e_idx = buf.find(eoi, 2)
-                        if e_idx < 0:
-                            break
-                        jpeg_frame = bytes(buf[: e_idx + 2])
-                        del buf[: e_idx + 2]
-                        self.frame_count += 1
-                        self._on_frame(jpeg_frame)
-                except Exception:
-                    break
-
-        self._ffmpeg_thread = threading.Thread(target=_read_jpegs, daemon=True)
-        self._ffmpeg_thread.start()
-
-    def close(self) -> None:
-        if self._ffmpeg_proc:
-            try:
-                if self._ffmpeg_proc.stdin:
-                    self._ffmpeg_proc.stdin.close()
-                if self._ffmpeg_proc.stdout:
-                    self._ffmpeg_proc.stdout.close()
-                self._ffmpeg_proc.terminate()
-                self._ffmpeg_proc.wait(timeout=1.0)
-            except Exception:
-                pass
-            self._ffmpeg_proc = None
 
     def feed_record(self, plaintext: bytes) -> None:
         self._buffer.extend(plaintext)
@@ -213,20 +123,13 @@ class MomcozyHevcHandler:
                 annexb_chunk.extend(payload)
 
         if annexb_chunk:
-            if self._decoder_mode == "av" and self._codec:
-                for packet in self._codec.parse(bytes(annexb_chunk)):
-                    for frame in self._codec.decode(packet):
-                        arr = frame.to_ndarray(format="bgr24")
-                        _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                        jpg_bytes = enc.tobytes()
-                        self.frame_count += 1
-                        self._on_frame(jpg_bytes)
-            elif self._decoder_mode == "ffmpeg" and self._ffmpeg_proc and self._ffmpeg_proc.stdin:
-                try:
-                    self._ffmpeg_proc.stdin.write(annexb_chunk)
-                    self._ffmpeg_proc.stdin.flush()
-                except Exception as exc:
-                    logger.debug("FFmpeg pipe write error: %s", exc)
+            for packet in self._codec.parse(bytes(annexb_chunk)):
+                for frame in self._codec.decode(packet):
+                    arr = frame.to_ndarray(format="bgr24")
+                    _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    jpg_bytes = enc.tobytes()
+                    self.frame_count += 1
+                    self._on_frame(jpg_bytes)
 
 
 def _patch_tuya_stream_session() -> None:
@@ -238,7 +141,6 @@ def _patch_tuya_stream_session() -> None:
         return
 
     orig_init = StreamSession.__init__
-    orig_close = StreamSession.async_close
 
     def momcozy_session_init(self: Any, *args: Any, **kwargs: Any) -> None:
         orig_init(self, *args, **kwargs)
@@ -253,14 +155,8 @@ def _patch_tuya_stream_session() -> None:
             self._momcozy_hevc.feed_record(pt)
             self._frames = self._momcozy_hevc.frame_count
 
-    async def momcozy_session_close(self: Any) -> None:
-        if hasattr(self, "_momcozy_hevc"):
-            self._momcozy_hevc.close()
-        await orig_close(self)
-
     StreamSession.__init__ = momcozy_session_init
     StreamSession._on_media_record = momcozy_on_media_record
-    StreamSession.async_close = momcozy_session_close
     StreamSession._momcozy_patched = True
 
 

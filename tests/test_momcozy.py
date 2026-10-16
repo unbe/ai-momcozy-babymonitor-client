@@ -563,17 +563,16 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         handler.feed_record(record)
         # Should parse RTP packet without error
         self.assertEqual(len(handler._buffer), 0)
-        handler.close()
 
-    def test_momcozy_hevc_handler_ffmpeg_fallback(self):
+    def test_momcozy_hevc_handler_requires_av(self):
         import sys
         from unittest.mock import patch
         from momcozy.stream import MomcozyHevcHandler
 
         with patch.dict(sys.modules, {"av": None}):
-            handler = MomcozyHevcHandler(lambda f: None)
-            self.assertEqual(handler._decoder_mode, "ffmpeg")
-            handler.close()
+            with self.assertRaises(ImportError) as ctx:
+                MomcozyHevcHandler(lambda f: None)
+            self.assertIn("requires the 'av' package", str(ctx.exception))
 
     def test_create_p2p_client_mqtt_identity(self):
         from momcozy.stream import create_p2p_client
