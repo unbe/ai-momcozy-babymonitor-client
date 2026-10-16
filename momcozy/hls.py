@@ -7,11 +7,13 @@ using FFmpeg. Supports Google Chromecast, Apple TV, iOS Safari, and smart displa
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
 import os
 import queue
 import re
+import select
 import shutil
 import subprocess
 import threading
@@ -57,6 +59,8 @@ class HlsTranscoder:
         self._process: Optional[subprocess.Popen] = None
         self._queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=30)
         self._writer_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
         self._feed_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._last_access = time.monotonic()
@@ -157,6 +161,20 @@ class HlsTranscoder:
         ])
         return cmd
 
+    def _stderr_worker(self, proc: subprocess.Popen) -> None:
+        """Background thread continuously draining FFmpeg stderr to prevent pipe buffer deadlock."""
+        if not proc or not proc.stderr:
+            return
+        try:
+            for line in iter(proc.stderr.readline, b""):
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    self._stderr_lines.append(text)
+        except Exception:
+            pass
+
     async def _start_ffmpeg_process(self, playlist_path: Path, segment_pattern: str) -> bool:
         """Spawn FFmpeg process, attempting VA-API hardware acceleration first with software fallback."""
         vaapi_dev = self._detect_vaapi_device()
@@ -179,19 +197,19 @@ class HlsTranscoder:
                     stderr=subprocess.PIPE,
                     env=env,
                 )
+                self._stderr_lines.clear()
+                self._stderr_thread = threading.Thread(target=self._stderr_worker, args=(proc,), daemon=True)
+                self._stderr_thread.start()
+
                 await asyncio.sleep(0.08)
                 if proc.poll() is not None:
-                    err_msg = ""
-                    if proc.stderr:
-                        try:
-                            err_msg = proc.stderr.read().decode("utf-8", errors="replace").strip()
-                        except Exception:
-                            pass
+                    err_msg = "\n".join(list(self._stderr_lines)[-10:])
                     logger.warning(
                         "VA-API hardware acceleration failed to start (exit %s): %s. Falling back to software encoding.",
                         proc.returncode,
                         err_msg[-300:] if err_msg else "unknown error",
                     )
+                    proc = None
                 else:
                     self._process = proc
                     self._using_vaapi = True
@@ -202,13 +220,17 @@ class HlsTranscoder:
             logger.info("Starting FFmpeg HLS pipeline with software encoding (libx264)...")
             cmd = self._build_cmd(playlist_path, segment_pattern, use_vaapi=False)
             try:
-                self._process = subprocess.Popen(
+                proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     env=env,
                 )
+                self._stderr_lines.clear()
+                self._stderr_thread = threading.Thread(target=self._stderr_worker, args=(proc,), daemon=True)
+                self._stderr_thread.start()
+                self._process = proc
                 self._using_vaapi = False
             except Exception as exc:
                 logger.error("Failed to spawn FFmpeg process: %s", exc)
@@ -262,10 +284,17 @@ class HlsTranscoder:
             return True
 
     def _writer_worker(self) -> None:
-        """Worker thread pushing raw HEVC chunks into FFmpeg stdin pipe."""
+        """Worker thread pushing raw HEVC chunks into FFmpeg stdin pipe with non-blocking I/O."""
         proc = self._process
         if not proc or not proc.stdin:
             return
+
+        try:
+            fd = proc.stdin.fileno()
+            if not isinstance(fd, int):
+                fd = None
+        except Exception:
+            fd = None
 
         while self._running:
             try:
@@ -276,15 +305,36 @@ class HlsTranscoder:
             if chunk is None or not self._running:
                 break
 
-            try:
-                proc.stdin.write(chunk)
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                logger.warning("FFmpeg stdin closed or broken pipe")
-                break
-            except Exception as e:
-                logger.debug("Error writing frame to FFmpeg: %s", e)
-                break
+            if fd is None:
+                try:
+                    proc.stdin.write(chunk)
+                    proc.stdin.flush()
+                except Exception:
+                    return
+                continue
+
+            offset = 0
+            chunk_len = len(chunk)
+            while offset < chunk_len and self._running:
+                try:
+                    _, writable, _ = select.select([], [fd], [], 0.5)
+                except (ValueError, OSError):
+                    return
+
+                if not writable:
+                    if proc.poll() is not None:
+                        return
+                    continue
+
+                try:
+                    written = os.write(fd, chunk[offset:offset + 65536])
+                    offset += written
+                except (BrokenPipeError, OSError):
+                    logger.debug("FFmpeg stdin closed or broken pipe")
+                    return
+                except Exception as e:
+                    logger.debug("Error writing frame to FFmpeg: %s", e)
+                    return
 
     async def _feed_frames_task(self) -> None:
         """Read raw HEVC chunks from VideoStreamer and enqueue for FFmpeg."""
@@ -319,7 +369,7 @@ class HlsTranscoder:
             pass
 
     async def stop(self) -> None:
-        """Stop FFmpeg process and clean up temporary files."""
+        """Stop FFmpeg process and clean up temporary files without blocking event loop."""
         self._running = False
         self._using_vaapi = False
 
@@ -335,6 +385,36 @@ class HlsTranscoder:
                 await self._idle_task
         self._idle_task = None
 
+        proc = self._process
+        self._process = None
+
+        # Terminate FFmpeg process first to unblock pipes immediately
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+            try:
+                await asyncio.to_thread(proc.wait, timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
         # Signal writer thread to exit
         try:
             self._queue.put_nowait(None)
@@ -342,26 +422,12 @@ class HlsTranscoder:
             pass
 
         if self._writer_thread and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=1.0)
+            await asyncio.to_thread(self._writer_thread.join, 1.0)
         self._writer_thread = None
 
-        proc = self._process
-        self._process = None
-
-        if proc:
-            if proc.stdin:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-            try:
-                proc.terminate()
-                await asyncio.to_thread(proc.wait, timeout=2.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            await asyncio.to_thread(self._stderr_thread.join, 1.0)
+        self._stderr_thread = None
 
         self._cleanup_files()
         logger.info("HLS transcoder stopped and cleaned up.")
