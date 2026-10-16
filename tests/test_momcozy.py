@@ -1107,6 +1107,90 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
 
                 await hls.stop()
 
+    async def test_hls_transcoder_uses_vaapi_when_device_present(self):
+        import asyncio
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        from momcozy.hls import HlsTranscoder
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+
+        async def fake_hevc():
+            yield b"hevc_keyframe", True
+
+        mock_streamer.subscribe_hevc = fake_hevc
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            hls = HlsTranscoder(streamer=mock_streamer, output_dir=tmp_dir, hwaccel="vaapi", vaapi_device="/dev/dri/renderD128")
+            with patch("subprocess.Popen") as mock_popen:
+                mock_proc = MagicMock()
+                mock_proc.stdin = MagicMock()
+                mock_proc.poll.return_value = None  # Process stays alive
+                mock_popen.return_value = mock_proc
+
+                started = await hls.start()
+                self.assertTrue(started)
+                self.assertTrue(hls.using_vaapi)
+
+                # Verify VA-API hardware encoder arguments
+                mock_popen.assert_called_once()
+                cmd = mock_popen.call_args[0][0]
+                self.assertIn("-init_hw_device", cmd)
+                idx_hw = cmd.index("-init_hw_device")
+                self.assertEqual(cmd[idx_hw + 1], "vaapi=hw:/dev/dri/renderD128")
+                self.assertIn("-c:v", cmd)
+                idx_cv = cmd.index("-c:v")
+                self.assertEqual(cmd[idx_cv + 1], "h264_vaapi")
+                self.assertIn("-vf", cmd)
+                idx_vf = cmd.index("-vf")
+                self.assertEqual(cmd[idx_vf + 1], "format=nv12,hwupload")
+
+                await hls.stop()
+                self.assertFalse(hls.using_vaapi)
+
+    async def test_hls_transcoder_vaapi_fallback_to_software(self):
+        import asyncio
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        from momcozy.hls import HlsTranscoder
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+
+        async def fake_hevc():
+            yield b"hevc_keyframe", True
+
+        mock_streamer.subscribe_hevc = fake_hevc
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            hls = HlsTranscoder(streamer=mock_streamer, output_dir=tmp_dir, hwaccel="vaapi", vaapi_device="/dev/dri/renderD128")
+            with patch("subprocess.Popen") as mock_popen:
+                vaapi_fail_proc = MagicMock()
+                vaapi_fail_proc.poll.return_value = 1  # Fails immediately
+                vaapi_fail_proc.returncode = 1
+                vaapi_fail_proc.stderr = MagicMock()
+                vaapi_fail_proc.stderr.read.return_value = b"vaInitialize failed: driver error"
+
+                software_proc = MagicMock()
+                software_proc.stdin = MagicMock()
+                software_proc.poll.return_value = None  # Stays alive
+
+                mock_popen.side_effect = [vaapi_fail_proc, software_proc]
+
+                started = await hls.start()
+                self.assertTrue(started)
+                self.assertFalse(hls.using_vaapi)
+
+                # Popen should have been called twice: 1st for VA-API, 2nd for software fallback
+                self.assertEqual(mock_popen.call_count, 2)
+                second_cmd = mock_popen.call_args_list[1][0][0]
+                self.assertIn("-c:v", second_cmd)
+                idx_cv = second_cmd.index("-c:v")
+                self.assertEqual(second_cmd[idx_cv + 1], "libx264")
+
+                await hls.stop()
+
     async def test_handle_hls_endpoints(self):
         from unittest.mock import AsyncMock, MagicMock
         from aiohttp.test_utils import make_mocked_request

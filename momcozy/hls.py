@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import queue
 import re
 import shutil
@@ -27,7 +28,12 @@ _SEGMENT_RE = re.compile(r"^segment_\d+\.ts$")
 
 
 class HlsTranscoder:
-    """Live HLS transcoder feeding raw HEVC chunks from VideoStreamer into an FFmpeg HLS pipeline."""
+    """Live HLS transcoder feeding raw HEVC chunks from VideoStreamer into an FFmpeg HLS pipeline.
+
+    Supports Intel VA-API hardware acceleration (Intel Quick Sync Video) on Intel GPUs
+    (e.g., Haswell Gen 7.5 Pentium G3220 using i965 driver) with graceful fallback to
+    software libx264 encoding.
+    """
 
     def __init__(
         self,
@@ -36,12 +42,16 @@ class HlsTranscoder:
         hls_time: int = 2,
         hls_list_size: int = 5,
         idle_timeout: float = 60.0,
+        hwaccel: Optional[str] = None,
+        vaapi_device: Optional[str] = None,
     ) -> None:
         self.streamer = streamer
         self.output_dir = Path(output_dir or "/tmp/momcozy_hls")
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
         self.idle_timeout = idle_timeout
+        self.hwaccel = (hwaccel or os.getenv("MOMCOZY_HWACCEL", "auto")).lower()
+        self.vaapi_device = vaapi_device or os.getenv("MOMCOZY_VAAPI_DEVICE")
 
         self._running = False
         self._process: Optional[subprocess.Popen] = None
@@ -51,6 +61,7 @@ class HlsTranscoder:
         self._idle_task: Optional[asyncio.Task] = None
         self._last_access = time.monotonic()
         self._lock = asyncio.Lock()
+        self._using_vaapi = False
 
     @property
     def is_available(self) -> bool:
@@ -62,9 +73,148 @@ class HlsTranscoder:
         """Return True if FFmpeg transcoder is currently active and healthy."""
         return self._running and self._process is not None and self._process.poll() is None
 
+    @property
+    def using_vaapi(self) -> bool:
+        """Return True if the active FFmpeg pipeline is using VA-API hardware acceleration."""
+        return self._using_vaapi
+
     def touch(self) -> None:
         """Update last access time to reset idle timeout."""
         self._last_access = time.monotonic()
+
+    def _detect_vaapi_device(self) -> Optional[str]:
+        """Detect available VA-API device path, or None if unavailable or disabled."""
+        if self.hwaccel in ("none", "cpu", "disabled", "false", "0"):
+            return None
+
+        # Check explicit device configuration
+        if self.vaapi_device:
+            if Path(self.vaapi_device).exists() or self.hwaccel in ("vaapi", "force"):
+                return self.vaapi_device
+
+        # Standard Linux DRM render nodes
+        for dev in ("/dev/dri/renderD128", "/dev/dri/card0"):
+            if Path(dev).exists():
+                return dev
+
+        if self.hwaccel in ("vaapi", "force"):
+            return "/dev/dri/renderD128"
+
+        return None
+
+    def _build_cmd(
+        self,
+        playlist_path: Path,
+        segment_pattern: str,
+        use_vaapi: bool = False,
+        vaapi_device: Optional[str] = None,
+    ) -> list[str]:
+        """Build FFmpeg command line arguments for either VA-API or software encoding."""
+        cmd = ["ffmpeg", "-y"]
+        if use_vaapi and vaapi_device:
+            cmd.extend([
+                "-init_hw_device", f"vaapi=hw:{vaapi_device}",
+                "-filter_hw_device", "hw",
+            ])
+
+        cmd.extend([
+            "-f", "hevc",
+            "-framerate", "15",
+            "-i", "pipe:0",
+            "-f", "lavfi",
+            "-i", "anullsrc=channel_layout=mono:sample_rate=8000",
+            "-shortest",
+        ])
+
+        if use_vaapi and vaapi_device:
+            # Software HEVC decode -> upload to VA-API surface -> hardware H.264 encode (Intel QSV)
+            cmd.extend([
+                "-vf", "format=nv12,hwupload",
+                "-c:v", "h264_vaapi",
+                "-g", "30",
+                "-bf", "0",
+            ])
+        else:
+            # Software libx264 encode
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-pix_fmt", "yuv420p",
+                "-g", "30",
+                "-sc_threshold", "0",
+            ])
+
+        cmd.extend([
+            "-c:a", "aac",
+            "-b:a", "32k",
+            "-f", "hls",
+            "-hls_time", str(self.hls_time),
+            "-hls_list_size", str(self.hls_list_size),
+            "-hls_flags", "delete_segments+split_by_time+omit_endlist",
+            "-hls_segment_filename", segment_pattern,
+            str(playlist_path),
+        ])
+        return cmd
+
+    async def _start_ffmpeg_process(self, playlist_path: Path, segment_pattern: str) -> bool:
+        """Spawn FFmpeg process, attempting VA-API hardware acceleration first with software fallback."""
+        vaapi_dev = self._detect_vaapi_device()
+        env = os.environ.copy()
+        if "LIBVA_DRIVER_NAME" not in env:
+            # Intel Pentium G3220 (Haswell Gen 7.5) uses i965 driver
+            env["LIBVA_DRIVER_NAME"] = "i965"
+
+        self._using_vaapi = False
+        self._process = None
+
+        if vaapi_dev:
+            logger.info("Starting FFmpeg HLS pipeline with Intel VA-API hardware acceleration (%s)...", vaapi_dev)
+            cmd = self._build_cmd(playlist_path, segment_pattern, use_vaapi=True, vaapi_device=vaapi_dev)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                await asyncio.sleep(0.08)
+                if proc.poll() is not None:
+                    err_msg = ""
+                    if proc.stderr:
+                        try:
+                            err_msg = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            pass
+                    logger.warning(
+                        "VA-API hardware acceleration failed to start (exit %s): %s. Falling back to software encoding.",
+                        proc.returncode,
+                        err_msg[-300:] if err_msg else "unknown error",
+                    )
+                else:
+                    self._process = proc
+                    self._using_vaapi = True
+            except Exception as exc:
+                logger.warning("Failed to spawn FFmpeg with VA-API: %s. Falling back to software encoding.", exc)
+
+        if self._process is None or self._process.poll() is not None:
+            logger.info("Starting FFmpeg HLS pipeline with software encoding (libx264)...")
+            cmd = self._build_cmd(playlist_path, segment_pattern, use_vaapi=False)
+            try:
+                self._process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                self._using_vaapi = False
+            except Exception as exc:
+                logger.error("Failed to spawn FFmpeg process: %s", exc)
+                return False
+
+        return True
 
     async def start(self) -> bool:
         """Start FFmpeg HLS transcoding process."""
@@ -87,41 +237,8 @@ class HlsTranscoder:
             playlist_path = self.output_dir / "stream.m3u8"
             segment_pattern = str(self.output_dir / "segment_%03d.ts")
 
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-f", "hevc",
-                "-framerate", "15",
-                "-i", "pipe:0",
-                "-f", "lavfi",
-                "-i", "anullsrc=channel_layout=mono:sample_rate=8000",
-                "-shortest",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-pix_fmt", "yuv420p",
-                "-g", "30",
-                "-sc_threshold", "0",
-                "-c:a", "aac",
-                "-b:a", "32k",
-                "-f", "hls",
-                "-hls_time", str(self.hls_time),
-                "-hls_list_size", str(self.hls_list_size),
-                "-hls_flags", "delete_segments+split_by_time+omit_endlist",
-                "-hls_segment_filename", segment_pattern,
-                str(playlist_path),
-            ]
-
-            logger.info("Starting FFmpeg HLS pipeline: %s", " ".join(cmd[:6]) + " ...")
-            try:
-                self._process = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-            except Exception as exc:
-                logger.error("Failed to spawn FFmpeg process: %s", exc)
+            ok = await self._start_ffmpeg_process(playlist_path, segment_pattern)
+            if not ok:
                 return False
 
             self._running = True
@@ -204,6 +321,7 @@ class HlsTranscoder:
     async def stop(self) -> None:
         """Stop FFmpeg process and clean up temporary files."""
         self._running = False
+        self._using_vaapi = False
 
         if self._feed_task and not self._feed_task.done():
             self._feed_task.cancel()

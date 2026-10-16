@@ -1,8 +1,10 @@
 FROM python:3.12-slim-bookworm
 
-# Install system dependencies required for OpenCV, PyAV (FFmpeg), and health checks
+# Install system dependencies required for OpenCV, PyAV (FFmpeg), VA-API hardware acceleration, and health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    va-driver-all \
+    vainfo \
     libgl1 \
     libglib2.0-0 \
     ca-certificates \
