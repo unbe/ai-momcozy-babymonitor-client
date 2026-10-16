@@ -6,8 +6,8 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mount directory so .momcozy.json is saved directly next to momcozy.py:
-      - .:/config
+      # Mount single config file (ensure `touch .momcozy.json` exists before running)
+      - ./.momcozy.json:/config/.momcozy.json
     environment:
       - MOMCOZY_CONFIG=/config/.momcozy.json
       # Optional environment overrides:

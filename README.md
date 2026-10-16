@@ -101,43 +101,49 @@ sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 ffmpeg
 
 The fastest way to deploy the web dashboard and streaming server without installing local dependencies is using Docker:
 
+> [!IMPORTANT]
+> **Prerequisite:** Ensure `.momcozy.json` exists in your project directory before starting Docker (`touch .momcozy.json`). If a bind-mounted file does not exist on the host, the Docker daemon will automatically create it as a directory instead of a file.
+
 ### 1. Using Docker Compose (Recommended)
 
 ```bash
-# Start the web dashboard and streaming server (builds automatically)
+# 1. Ensure config file exists in the project root
+touch .momcozy.json
+
+# 2. Log in to your Momcozy account (credentials will be saved to .momcozy.json)
+docker compose run --rm momcozy login
+
+# 3. Start the web dashboard and streaming server (builds automatically)
 docker compose up -d
 
-# Check logs
+# 4. Check logs
 docker compose logs -f
 ```
 
 The web dashboard is now live at [**http://localhost:8080**](http://localhost:8080).
 
-To log in and save credentials directly next to `momcozy.py`:
-```bash
-# Interactive login (prompts for email and password securely):
-docker compose run --rm momcozy login
-
-# Or non-interactive login with arguments:
-docker compose run --rm momcozy login --email you@example.com --password "secret" --country US
-```
-
 ### 2. Using Docker CLI
 
 ```bash
-# Build the image
+# 1. Ensure config file exists
+touch .momcozy.json
+
+# 2. Build the image
 docker build -t momcozy-client .
 
-# Run the streaming server
+# 3. Log in
+docker run -it --rm -v $(pwd)/.momcozy.json:/config/.momcozy.json momcozy-client login
+
+# 4. Run the streaming server
 docker run -d \
   --name momcozy-monitor \
   --restart unless-stopped \
   -p 8080:8080 \
-  -v $(pwd):/config \
+  -v $(pwd)/.momcozy.json:/config/.momcozy.json \
   momcozy-client
 
 # Run any CLI command (e.g. status)
-docker run --rm -v $(pwd):/config momcozy-client status
+docker run --rm -v $(pwd)/.momcozy.json:/config/.momcozy.json momcozy-client status
 ```
 
 ---
