@@ -36,6 +36,9 @@ Reverse-engineered from the official Momcozy Android app (`com.lute.momcozy`), t
 
 ## 🔬 Protocol & Reverse Engineering Details
 
+> [!TIP]
+> For a comprehensive technical overview of the architecture, protocol interactions, authentication bridging, and P2P streaming pipeline, see [**`ARCHITECTURE.md`**](ARCHITECTURE.md).
+
 Through decompilation of the Momcozy Android APK (`com.lute.momcozy`), the following architecture was discovered:
 
 1. **Momcozy Cloud Gateway:** `https://app-api.mcozycloud.com`
