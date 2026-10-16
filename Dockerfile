@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     ca-certificates \
     curl \
+    openssl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -33,9 +34,9 @@ ENV PYTHONUNBUFFERED=1 \
 # Expose web dashboard & MJPEG stream port
 EXPOSE 8421
 
-# Health check to ensure the dashboard status API is responding
+# Health check to ensure the dashboard status API is responding (supports HTTP and HTTPS)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8421/api/status || exit 1
+    CMD curl -f -k http://localhost:8421/api/status || curl -f -k https://localhost:8421/api/status || exit 1
 
 # Default entrypoint and command: run web server on 0.0.0.0:8421
 ENTRYPOINT ["python3", "/app/momcozy.py"]
