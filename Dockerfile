@@ -1,7 +1,10 @@
 FROM python:3.12-slim-bookworm
 
-# Install system dependencies required for OpenCV, PyAV (FFmpeg), VA-API hardware acceleration, and health checks
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies required for OpenCV, PyAV (FFmpeg), VA-API hardware acceleration, and health checks.
+# Note: i965-va-driver-shaders (in non-free) provides the encoding shaders required for Intel Haswell Gen 7.5.
+RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+ || sed -i 's/main/main non-free/' /etc/apt/sources.list 2>/dev/null || true \
+ && apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     va-driver-all \
     vainfo \
@@ -10,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     openssl \
+ && (apt-get install -y --no-install-recommends i965-va-driver-shaders || true) \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
