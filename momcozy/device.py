@@ -146,7 +146,7 @@ class MomcozyMonitor:
         self._cached_dps: Dict[str, Any] = dict(initial_dps) if initial_dps else {}
         self._lan_tcp_unavailable: bool = False
         self._lan_status_unsupported: bool = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         self._device: Optional[tinytuya.Device] = None
         self._init_local_device()
@@ -300,7 +300,7 @@ class MomcozyMonitor:
         status = self.get_status()
         return status.temperature_c, status.temperature_f
 
-    def set_dp(self, dp_id: int | DP, value: Any, nowait: bool = False) -> Dict[str, Any]:
+    def set_dp(self, dp_id: int | DP, value: Any) -> Dict[str, Any]:
         """Send a single DataPoint command to the camera."""
         dp_key = int(dp_id)
         logger.debug("Setting DP %s = %r", dp_key, value)
@@ -310,7 +310,7 @@ class MomcozyMonitor:
             try:
                 with self._lock:
                     dev = self._ensure_device()
-                    res = dev.set_value(dp_key, value, nowait=nowait)
+                    res = dev.set_value(dp_key, value)
                     self._cached_dps[str(dp_key)] = value
                     return res or {"dps": {str(dp_key): value}}
             except Exception as exc:
@@ -331,7 +331,7 @@ class MomcozyMonitor:
             raise RuntimeError(f"Failed to set DP {dp_key} on device {self.device_id}: {last_error}")
         return {"dps": {str(dp_key): value}}
 
-    def set_dps(self, dps_dict: Dict[int | DP | str, Any], nowait: bool = False) -> Dict[str, Any]:
+    def set_dps(self, dps_dict: Dict[int | DP | str, Any]) -> Dict[str, Any]:
         """Send multiple DataPoints in a single packet."""
         formatted = {str(int(k)): v for k, v in dps_dict.items()}
         last_error = None
@@ -340,7 +340,7 @@ class MomcozyMonitor:
             try:
                 with self._lock:
                     dev = self._ensure_device()
-                    res = dev.set_multiple_values(formatted, nowait=nowait)
+                    res = dev.set_multiple_values(formatted)
                     self._cached_dps.update(formatted)
                     return res or {"dps": formatted}
             except Exception as exc:
@@ -413,17 +413,19 @@ class MomcozyMonitor:
     def ptz_move(self, direction: PtzDirection | str) -> None:
         """Start pan/tilt rotation (direction: '0'=up, '2'=right, '4'=down, '6'=left)."""
         val = direction.value if isinstance(direction, PtzDirection) else str(direction)
-        self.set_dp(DP.PTZ_CONTROL, val, nowait=True)
+        self.set_dp(DP.PTZ_CONTROL, val)
 
     def ptz_stop(self) -> None:
         """Stop camera movement."""
-        self.set_dp(DP.PTZ_STOP, True, nowait=True)
+        self.set_dp(DP.PTZ_STOP, True)
 
     def ptz_step(self, direction: PtzDirection | str, duration_seconds: float = 0.35) -> None:
         """Rotate camera in a direction for a short duration and then stop."""
-        self.ptz_move(direction)
-        time.sleep(duration_seconds)
-        self.ptz_stop()
+        with self._lock:
+            val = direction.value if isinstance(direction, PtzDirection) else str(direction)
+            self.set_dp(DP.PTZ_CONTROL, val)
+            time.sleep(duration_seconds)
+            self.set_dp(DP.PTZ_STOP, True)
 
     def set_night_vision(self, mode: NightVisionMode | str) -> None:
         """Set Infrared Night Vision (0=auto, 1=off, 2=on)."""

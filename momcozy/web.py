@@ -213,7 +213,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     <div class="video-card">
       <div class="video-overlay"><div class="live-dot"></div> LIVE STREAM</div>
-      <img id="stream-img" src="/stream" alt="Camera Stream" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'400\\' height=\\'225\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%23111\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%23888\\' font-size=\\'16\\' text-anchor=\\'middle\\'>Connecting to camera stream...</text></svg>'">
+      <img id="stream-img" src="/stream" alt="Camera Stream">
     </div>
 
     <div class="grid">
@@ -246,13 +246,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <h2>🕹️ Camera Pan & Tilt</h2>
         <div class="ptz-grid">
           <div></div>
-          <button class="btn" onpointerdown="ptzStart(event, '0')" onpointerup="ptzEnd(event, '0')" onpointercancel="ptzEnd(event, '0')">▲</button>
+          <button class="btn" onclick="ptzStep('0')">▲</button>
           <div></div>
-          <button class="btn" onpointerdown="ptzStart(event, '6')" onpointerup="ptzEnd(event, '6')" onpointercancel="ptzEnd(event, '6')">◀</button>
+          <button class="btn" onclick="ptzStep('6')">◀</button>
           <button class="btn" onclick="ptzStop()">⏹</button>
-          <button class="btn" onpointerdown="ptzStart(event, '2')" onpointerup="ptzEnd(event, '2')" onpointercancel="ptzEnd(event, '2')">▶</button>
+          <button class="btn" onclick="ptzStep('2')">▶</button>
           <div></div>
-          <button class="btn" onpointerdown="ptzStart(event, '4')" onpointerup="ptzEnd(event, '4')" onpointercancel="ptzEnd(event, '4')">▼</button>
+          <button class="btn" onclick="ptzStep('4')">▼</button>
           <div></div>
         </div>
         <div style="text-align: center; margin-top: 8px;">
@@ -324,38 +324,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       } catch(e) { console.error(e); }
     }
 
-    let ptzHoldTimer = null;
-    let ptzIsHolding = false;
-
-    function ptzStart(e, dir) {
-      if (e) {
-        if (e.pointerId && e.target && e.target.setPointerCapture) {
-          try { e.target.setPointerCapture(e.pointerId); } catch(_) {}
-        }
-      }
-      ptzIsHolding = false;
-      clearTimeout(ptzHoldTimer);
-      ptzHoldTimer = setTimeout(() => {
-        ptzIsHolding = true;
-        apiPost('ptz_move', {direction: dir});
-      }, 350);
-    }
-
-    function ptzEnd(e, dir) {
-      clearTimeout(ptzHoldTimer);
-      if (ptzIsHolding) {
-        ptzIsHolding = false;
-        ptzStop();
-      } else {
-        apiPost('ptz_step', {direction: dir, duration: 0.35});
+    let ptzBusy = false;
+    async function ptzStep(dir) {
+      if (ptzBusy) return;
+      ptzBusy = true;
+      try {
+        await apiPost('ptz_step', {direction: dir, duration: 0.35});
+      } finally {
+        setTimeout(() => { ptzBusy = false; }, 350);
       }
     }
 
     function ptz(dir) { apiPost('ptz_move', {direction: dir}); }
-    function ptzStop() {
-      clearTimeout(ptzHoldTimer);
-      ptzIsHolding = false;
-      apiPost('ptz_stop');
+    function ptzStop() { apiPost('ptz_stop'); }
+
+    // Stream auto-reconnection guard
+    const streamImg = document.getElementById('stream-img');
+    let streamRetryTimer = null;
+    if (streamImg) {
+      streamImg.onerror = function() {
+        if (!streamRetryTimer) {
+          streamRetryTimer = setTimeout(() => {
+            streamRetryTimer = null;
+            streamImg.src = '/stream?t=' + Date.now();
+          }, 1500);
+        }
+      };
     }
     function setNightVision(mode) { apiPost('night_vision', {mode}); }
     function togglePrivacy() { apiPost('toggle_privacy'); }
@@ -460,15 +454,17 @@ class WebServer:
         response = web.StreamResponse(
             status=200,
             reason="OK",
-            headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame"},
+            headers={
+                "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+                "Cache-Control": "no-cache, no-store, must-revalidate, pre-check=0, post-check=0, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Connection": "close",
+            },
         )
         await response.prepare(request)
 
         if not self.streamer:
-            # Fallback test pattern if camera P2P streamer is not active
-            while True:
-                await asyncio.sleep(1)
-                break
             return response
 
         if not self.streamer.is_running:
@@ -478,14 +474,22 @@ class WebServer:
                 logger.warning("Could not start live video streamer: %s", e)
                 return response
 
+        last_sent = 0.0
+        min_interval = 0.065  # Target smooth ~15 FPS to prevent browser buffer saturation
+
         try:
             async for frame in self.streamer.subscribe():
+                now = time.monotonic()
+                if now - last_sent < min_interval:
+                    continue
+                last_sent = now
                 header = (
-                    f"--frame\r\n"
-                    f"Content-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(frame)}\r\n\r\n"
-                ).encode("ascii")
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(frame)).encode("ascii") + b"\r\n\r\n"
+                )
                 await response.write(header + frame + b"\r\n")
+                await response.drain()
         except (asyncio.CancelledError, ConnectionResetError):
             pass
         except Exception as e:
@@ -595,10 +599,20 @@ class WebServer:
 
     async def run(self) -> None:
         """Run the server until interrupted."""
+        if self.streamer and not self.streamer.is_running:
+            try:
+                await self.streamer.start()
+            except Exception as e:
+                logger.warning("Could not auto-start live video streamer: %s", e)
+
         runner = web.AppRunner(self.app)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
         logger.info("Momcozy Web Dashboard running at http://%s:%d", self.host, self.port)
-        while True:
-            await asyncio.sleep(3600)
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            if self.streamer:
+                await self.streamer.stop()
