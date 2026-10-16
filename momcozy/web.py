@@ -29,6 +29,52 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Momcozy BM04 Baby Monitor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <script>
+    // Define Cast SDK callback before script tag so it is not missed on load
+    window['__onGCastApiAvailable'] = function(isAvailable) {
+      if (isAvailable && window.cast && window.cast.framework) {
+        try {
+          const castContext = cast.framework.CastContext.getInstance();
+          castContext.setOptions({
+            receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+            autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+          });
+          window.googleCastInitialized = true;
+          console.log("✓ Google Cast Web Sender SDK ready");
+
+          castContext.addEventListener(
+            cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
+            function(event) {
+              const session = castContext.getCurrentSession();
+              const wrapper = document.getElementById('cast-btn-wrapper');
+              const textEl = document.getElementById('cast-btn-text');
+              const badge = document.getElementById('cast-status-badge');
+              if (session) {
+                if (wrapper) wrapper.classList.add('casting');
+                if (textEl) textEl.textContent = 'Casting';
+                if (badge) {
+                  badge.textContent = 'Browser Cast';
+                  badge.className = 'badge active';
+                }
+                if (typeof window.loadStreamToCastSession === 'function') {
+                  window.loadStreamToCastSession(session);
+                }
+              } else {
+                if (wrapper) wrapper.classList.remove('casting');
+                if (textEl) textEl.textContent = 'Cast';
+                if (badge && !window.activeServerCast) {
+                  badge.textContent = 'Idle';
+                  badge.className = 'badge';
+                }
+              }
+            }
+          );
+        } catch (e) {
+          console.warn("Google Cast SDK init failed:", e);
+        }
+      }
+    };
+  </script>
   <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
   <style>
     :root {
@@ -164,6 +210,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       background: rgba(66, 153, 225, 0.85);
       border-color: rgba(66, 153, 225, 1);
       color: #fff;
+    }
+    google-cast-launcher {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      vertical-align: middle;
+      --disconnected-color: #FFFFFF;
+      --connected-color: #4299E1;
+      cursor: pointer;
     }
     /* Fullscreen styling for standard API and CSS fallback (iOS) */
     .video-card:fullscreen,
@@ -390,10 +445,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <svg id="audio-on-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
           <span id="audio-btn-text">Audio</span>
         </button>
-        <button class="video-ctrl-btn" id="cast-btn" onclick="scrollToCastCard()" title="Cast to Chromecast / TV">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
+        <div class="video-ctrl-btn" id="cast-btn-wrapper" onclick="triggerWebCast(event)" title="Cast to Chromecast / TV" style="cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+          <google-cast-launcher id="google-cast-button" style="width: 15px; height: 15px;"></google-cast-launcher>
+          <svg id="cast-custom-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
           <span id="cast-btn-text">Cast</span>
-        </button>
+        </div>
         <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
           <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
@@ -402,6 +458,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
       <img id="stream-img" src="/stream" alt="Camera Stream">
       <audio id="live-audio" preload="none"></audio>
+      <video id="cast-video" src="/hls/stream.m3u8" playsinline preload="none" style="display:none;"></video>
       <div id="video-error" class="video-error-overlay hidden">
         <div style="font-size: 2.2rem;">⚠️</div>
         <div id="video-error-title" style="font-weight: 700; font-size: 1.05rem;">Live Stream Offline</div>
@@ -1012,48 +1069,89 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
-    // Google Cast framework initialization for supported browsers (Chrome, Edge, Android)
-    window['__onGCastApiAvailable'] = function(isAvailable) {
-      if (isAvailable && window.cast && window.cast.framework) {
+    window.loadStreamToCastSession = function(session) {
+      if (!session) return;
+      const streamUrl = window.location.origin + '/hls/stream.m3u8';
+      const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegURL');
+      mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
+      mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
+      mediaInfo.metadata.title = 'Momcozy BM04 Baby Monitor';
+      mediaInfo.metadata.subtitle = 'Live Camera Feed';
+      if (window.location.origin) {
+        mediaInfo.metadata.images = [new chrome.cast.Image(window.location.origin + '/detection_snapshot.jpg')];
+      }
+      const request = new chrome.cast.media.LoadRequest(mediaInfo);
+      request.autoplay = true;
+
+      session.loadMedia(request).then(
+        function() {
+          showToast('Live stream casting to TV!', 'success', 3000);
+        },
+        function(err) {
+          console.error('Error loading cast media:', err);
+          showToast('Could not start stream on Cast device', 'error', 4000);
+        }
+      );
+    };
+
+    async function triggerWebCast(event) {
+      if (event) {
+        event.stopPropagation();
+      }
+
+      // 1. If currently in a Cast session, clicking ends session
+      if (window.cast && window.cast.framework) {
         try {
-          cast.framework.CastContext.getInstance().setOptions({
-            receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
-            autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
-          });
           const castContext = cast.framework.CastContext.getInstance();
-          castContext.addEventListener(
-            cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
-            function(event) {
-              const session = castContext.getCurrentSession();
-              const badge = document.getElementById('cast-status-badge');
-              const castBtn = document.getElementById('cast-btn');
-              if (session) {
-                if (badge) {
-                  badge.textContent = 'Browser Cast';
-                  badge.className = 'badge active';
-                }
-                if (castBtn) castBtn.classList.add('casting');
-                const streamUrl = window.location.origin + '/hls/stream.m3u8';
-                const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegURL');
-                mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
-                mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
-                mediaInfo.metadata.title = 'Momcozy Baby Monitor Live';
-                const request = new chrome.cast.media.LoadRequest(mediaInfo);
-                session.loadMedia(request);
-              } else {
-                if (badge && !activeServerCast) {
-                  badge.textContent = 'Idle';
-                  badge.className = 'badge';
-                }
-                if (castBtn && !activeServerCast) castBtn.classList.remove('casting');
-              }
-            }
-          );
-        } catch(e) {
-          console.debug('Google Cast SDK setup notice:', e);
+          const session = castContext.getCurrentSession();
+          if (session) {
+            castContext.endCurrentSession(true);
+            showToast('Cast session ended', 'info', 2000);
+            return;
+          }
+        } catch(e) {}
+      }
+
+      // 2. Trigger native Google Cast Web Sender requestSession dialog
+      if (window.cast && window.cast.framework && window.googleCastInitialized) {
+        try {
+          const castContext = cast.framework.CastContext.getInstance();
+          await castContext.requestSession();
+          return;
+        } catch (err) {
+          console.debug('CastContext.requestSession error/cancel:', err);
+          if (err === 'cancel' || (err && typeof err === 'string' && err.includes('cancel'))) {
+            return;
+          }
         }
       }
-    };
+
+      // 3. Fallback: Native HTML5 Video Remote Playback API (supported directly by Chrome on Android)
+      const castVideo = document.getElementById('cast-video');
+      if (castVideo && castVideo.remote && typeof castVideo.remote.prompt === 'function') {
+        try {
+          if (!castVideo.src) {
+            castVideo.src = window.location.origin + '/hls/stream.m3u8';
+          }
+          await castVideo.remote.prompt();
+          return;
+        } catch (err) {
+          console.debug('video.remote.prompt error:', err);
+        }
+      }
+
+      // 4. Click the official google-cast-launcher element if rendered
+      const launcher = document.getElementById('google-cast-button');
+      if (launcher && typeof launcher.click === 'function') {
+        try {
+          launcher.click();
+          return;
+        } catch(e) {}
+      }
+
+      // 5. Fallback notice
+      scrollToCastCard();
+    }
 
     function scrollToCastCard() {
       const card = document.getElementById('chromecast-card');
@@ -1066,11 +1164,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           card.style.boxShadow = 'none';
         }, 1500);
       }
-      if (window.cast && window.cast.framework) {
-        try {
-          cast.framework.CastContext.getInstance().requestSession();
-        } catch(e) {}
-      }
+    }
+
+    const castVideoEl = document.getElementById('cast-video');
+    if (castVideoEl && castVideoEl.remote) {
+      castVideoEl.remote.addEventListener('connect', function() {
+        const wrapper = document.getElementById('cast-btn-wrapper');
+        const textEl = document.getElementById('cast-btn-text');
+        if (wrapper) wrapper.classList.add('casting');
+        if (textEl) textEl.textContent = 'Casting';
+        showToast('Connected to TV via Remote Playback!', 'success', 3000);
+      });
+      castVideoEl.remote.addEventListener('disconnect', function() {
+        const wrapper = document.getElementById('cast-btn-wrapper');
+        const textEl = document.getElementById('cast-btn-text');
+        if (wrapper) wrapper.classList.remove('casting');
+        if (textEl) textEl.textContent = 'Cast';
+        showToast('Disconnected from TV', 'info', 2000);
+      });
     }
 
     let activeServerCast = null;
