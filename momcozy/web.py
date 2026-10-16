@@ -29,8 +29,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <title>Momcozy BM04 Baby Monitor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
   <script>
-    // Define Cast SDK callback before script tag so it is not missed on load
-    window['__onGCastApiAvailable'] = function(isAvailable) {
+    window.addEventListener('error', function(e) {
+      console.error('[Window Error]', e.message, 'at', e.filename, ':', e.lineno, e.error);
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      console.error('[Unhandled Promise Rejection]', e.reason);
+    });
+
+    window['__onGCastApiAvailable'] = function(isAvailable, reason) {
+      console.log(`[Google Cast] __onGCastApiAvailable called: isAvailable=${isAvailable}, reason=${reason}`);
       if (isAvailable && window.cast && window.cast.framework) {
         try {
           const castContext = cast.framework.CastContext.getInstance();
@@ -39,19 +46,36 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
           });
           window.googleCastInitialized = true;
-          console.log("✓ Google Cast Web Sender SDK ready");
+          console.log("[Google Cast] CastContext initialized successfully.");
 
           castContext.addEventListener(
             cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
             function(event) {
+              console.log("[Google Cast] Session state changed:", event.sessionState);
               const session = castContext.getCurrentSession();
-              if (session && typeof window.loadStreamToCastSession === 'function') {
-                window.loadStreamToCastSession(session);
+              const castBtn = document.getElementById('cast-btn');
+              const castText = document.getElementById('cast-btn-text');
+              if (session) {
+                if (castBtn) castBtn.classList.add('active');
+                if (castText) castText.innerText = 'Casting';
+                showToast('Connected to Cast device!', 'success', 3000);
+                if (typeof window.loadStreamToCastSession === 'function') {
+                  window.loadStreamToCastSession(session);
+                }
+              } else {
+                if (castBtn) castBtn.classList.remove('active');
+                if (castText) castText.innerText = 'Cast';
               }
             }
           );
         } catch (e) {
-          console.warn("Google Cast SDK init failed:", e);
+          console.error("[Google Cast] Exception during CastContext initialization:", e);
+        }
+      } else {
+        const isSecure = window.isSecureContext;
+        console.warn(`[Google Cast] Cast API is not available (isAvailable=${isAvailable}). isSecureContext=${isSecure}, origin=${window.location.origin}`);
+        if (!isSecure) {
+          console.error("[Google Cast] Insecure Context: Chrome restricts Google Cast to HTTPS or localhost. On plain HTTP over LAN, Chrome disables the Cast Web Sender API.");
         }
       }
     };
@@ -186,15 +210,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       background: rgba(72, 187, 120, 0.75);
       border-color: rgba(72, 187, 120, 0.9);
       color: #fff;
-    }
-    google-cast-launcher {
-      display: inline-block;
-      width: 22px;
-      height: 22px;
-      --disconnected-color: #FFFFFF;
-      --connected-color: #4299E1;
-      cursor: pointer;
-      vertical-align: middle;
     }
     /* Fullscreen styling for standard API and CSS fallback (iOS) */
     .video-card:fullscreen,
@@ -421,7 +436,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <svg id="audio-on-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
           <span id="audio-btn-text">Audio</span>
         </button>
-        <google-cast-launcher class="video-ctrl-btn" title="Cast to TV / Chromecast" style="width: auto; padding: 4px 8px;"></google-cast-launcher>
+        <button class="video-ctrl-btn" id="cast-btn" onclick="handleCastClick(event)" title="Cast to TV / Chromecast">
+          <svg id="cast-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
+            <line x1="2" y1="20" x2="2.01" y2="20"/>
+          </svg>
+          <span id="cast-btn-text">Cast</span>
+        </button>
         <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
           <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
@@ -1015,8 +1036,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
     window.loadStreamToCastSession = function(session) {
-      if (!session) return;
+      if (!session) {
+        console.warn("[Google Cast] loadStreamToCastSession called without active session.");
+        return;
+      }
       const streamUrl = window.location.origin + '/hls/stream.m3u8';
+      console.log("[Google Cast] Loading stream to receiver:", streamUrl);
       const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegURL');
       mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
       mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
@@ -1030,14 +1055,79 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       session.loadMedia(request).then(
         function() {
+          console.log("[Google Cast] Stream loaded onto Cast receiver successfully.");
           showToast('Live stream casting to TV!', 'success', 3000);
         },
         function(err) {
-          console.error('Error loading cast media:', err);
-          showToast('Could not start stream on Cast device', 'error', 4000);
+          console.error("[Google Cast] Error loading cast media:", err);
+          const errDetail = (err && (err.description || err.message || JSON.stringify(err))) || String(err);
+          showToast('Could not load stream on Cast device: ' + errDetail, 'error', 5000);
         }
       );
     };
+
+    async function handleCastClick(event) {
+      if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+
+      console.log("[Google Cast] Cast button clicked. isSecureContext:", window.isSecureContext, "googleCastInitialized:", !!window.googleCastInitialized);
+
+      // 1. If currently in a Cast session, clicking ends session
+      if (window.googleCastInitialized && window.cast && window.cast.framework) {
+        try {
+          const castContext = cast.framework.CastContext.getInstance();
+          const session = castContext.getCurrentSession();
+          if (session) {
+            console.log("[Google Cast] Ending active Cast session...");
+            castContext.endCurrentSession(true);
+            showToast('Cast session ended', 'info', 2000);
+            return;
+          }
+        } catch(e) {
+          console.error("[Google Cast] Error inspecting/ending session:", e);
+        }
+      }
+
+      // 2. If Google Cast SDK is initialized, open native Cast device picker
+      if (window.googleCastInitialized && window.cast && window.cast.framework) {
+        try {
+          const castContext = cast.framework.CastContext.getInstance();
+          console.log("[Google Cast] Triggering native cast dialog via CastContext.requestSession()...");
+          await castContext.requestSession();
+          console.log("[Google Cast] requestSession completed successfully.");
+          return;
+        } catch (err) {
+          if (err === 'cancel' || (err && typeof err === 'string' && err.includes('cancel'))) {
+            console.log("[Google Cast] User dismissed cast dialog.");
+            return;
+          }
+          console.error("[Google Cast] requestSession failed:", err);
+          showToast('Cast request failed: ' + (err.description || err.message || err), 'error', 5000);
+          return;
+        }
+      }
+
+      // 3. Cast SDK not initialized: log why and show actionable user error
+      console.error("[Google Cast] Cast framework is not available.");
+      if (!window.isSecureContext) {
+        const origin = window.location.origin;
+        console.error(`[Google Cast] INSECURE ORIGIN: Chrome strictly disables browser-side Cast on HTTP (${origin}).`);
+        console.error(`[Google Cast] To enable Cast in Chrome on Android / LAN:\n` +
+          `1. Open chrome://flags/#unsafely-treat-insecure-origin-as-secure in Chrome\n` +
+          `2. Enable the flag and add '${origin}' to the text field\n` +
+          `3. Relaunch Chrome\n` +
+          `OR access via HTTPS (e.g. run server with SSL).`);
+        showToast(`Google Cast requires HTTPS. Chrome blocks casting on HTTP (${origin}). Check browser console for setup.`, 'error', 8000);
+      } else if (!window.cast) {
+        console.error("[Google Cast] Google Cast Web SDK (cast_sender.js) did not load. Check network connection or script blockers.");
+        showToast("Google Cast script could not be reached. Check network connection.", "error", 5000);
+      } else {
+        console.error("[Google Cast] CastContext could not be initialized or no devices were discovered yet.");
+        showToast("Cast device discovery is still initializing. Ensure your Chromecast is on and on the same Wi-Fi.", "warn", 5000);
+      }
+    }
 
     setInterval(updateStatus, 3000);
     updateStatus();
