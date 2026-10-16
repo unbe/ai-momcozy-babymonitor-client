@@ -101,18 +101,78 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
     .video-overlay {
       position: absolute;
-      top: 10px;
-      left: 10px;
-      background: rgba(0,0,0,0.6);
+      bottom: 12px;
+      left: 12px;
+      background: rgba(0,0,0,0.65);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
       color: #fff;
-      padding: 4px 9px;
-      border-radius: 14px;
-      font-size: 0.75rem;
+      padding: 4px 8px;
+      border-radius: 12px;
+      font-size: 0.72rem;
       font-weight: 600;
       letter-spacing: 0.3px;
       display: flex;
       align-items: center;
       gap: 5px;
+      border: 1px solid rgba(255,255,255,0.15);
+      z-index: 10;
+      pointer-events: none;
+    }
+    .video-ctrl-btn {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      background: rgba(0,0,0,0.65);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 8px;
+      padding: 5px 9px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      transition: background 0.15s, transform 0.15s;
+      z-index: 10;
+      line-height: 1;
+    }
+    .video-ctrl-btn:hover {
+      background: rgba(0,0,0,0.85);
+      border-color: rgba(255,255,255,0.4);
+    }
+    .video-ctrl-btn:active {
+      transform: scale(0.95);
+    }
+    /* Fullscreen styling for standard API and CSS fallback (iOS) */
+    .video-card:fullscreen,
+    .video-card:-webkit-full-screen {
+      width: 100vw;
+      height: 100vh;
+      border-radius: 0;
+      background: #000;
+    }
+    .video-card.is-fullscreen {
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      z-index: 999999 !important;
+      border-radius: 0 !important;
+      margin: 0 !important;
+      background: #000 !important;
+      aspect-ratio: auto !important;
+    }
+    .video-card:fullscreen img,
+    .video-card:-webkit-full-screen img,
+    .video-card.is-fullscreen img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
     }
     .live-dot {
       width: 6px;
@@ -306,6 +366,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="live-dot" id="live-dot"></div>
         <span id="stream-badge">LIVE STREAM</span>
       </div>
+      <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
+        <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+        <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
+        <span id="fs-btn-text">Fullscreen</span>
+      </button>
       <img id="stream-img" src="/stream" alt="Camera Stream">
       <div id="video-error" class="video-error-overlay hidden">
         <div style="font-size: 2.2rem;">⚠️</div>
@@ -354,8 +419,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <button class="btn" onclick="ptzStep('4')">▼</button>
           <div></div>
         </div>
-        <div style="text-align: center; margin-top: 8px;">
+        <div style="text-align: center; margin-top: 8px; display: flex; justify-content: center; gap: 8px;">
           <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;">📷 Snapshot</a>
+          <button class="btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">⛶ Fullscreen</button>
         </div>
       </div>
 
@@ -463,9 +529,103 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     function ptz(dir) { apiPost('ptz_move', {direction: dir}); }
     function ptzStop() { apiPost('ptz_stop'); }
 
+    // Fullscreen support with mobile iOS fallback
+    function isFullscreen() {
+      const card = document.querySelector('.video-card');
+      return !!(
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.mozFullScreenElement ||
+        document.msFullscreenElement ||
+        (card && card.classList.contains('is-fullscreen'))
+      );
+    }
+
+    function updateFullscreenIcons(active) {
+      const enterIcon = document.getElementById('fs-enter-icon');
+      const exitIcon = document.getElementById('fs-exit-icon');
+      const btnText = document.getElementById('fs-btn-text');
+      if (enterIcon) enterIcon.style.display = active ? 'none' : 'block';
+      if (exitIcon) exitIcon.style.display = active ? 'block' : 'none';
+      if (btnText) btnText.innerText = active ? 'Exit' : 'Fullscreen';
+    }
+
+    async function toggleFullscreen() {
+      const card = document.querySelector('.video-card');
+      if (!card) return;
+      const active = isFullscreen();
+
+      if (!active) {
+        try {
+          if (card.requestFullscreen) {
+            await card.requestFullscreen();
+          } else if (card.webkitRequestFullscreen) {
+            await card.webkitRequestFullscreen();
+          } else if (card.mozRequestFullScreen) {
+            await card.mozRequestFullScreen();
+          } else if (card.msRequestFullscreen) {
+            await card.msRequestFullscreen();
+          } else {
+            card.classList.add('is-fullscreen');
+            updateFullscreenIcons(true);
+          }
+        } catch (e) {
+          console.warn('Native fullscreen request failed, falling back to CSS fullscreen:', e);
+          card.classList.add('is-fullscreen');
+          updateFullscreenIcons(true);
+        }
+      } else {
+        if (card.classList.contains('is-fullscreen')) {
+          card.classList.remove('is-fullscreen');
+          updateFullscreenIcons(false);
+        }
+        try {
+          if (document.exitFullscreen) {
+            await document.exitFullscreen();
+          } else if (document.webkitExitFullscreen) {
+            await document.webkitExitFullscreen();
+          } else if (document.mozCancelFullScreen) {
+            await document.mozCancelFullScreen();
+          } else if (document.msExitFullscreen) {
+            await document.msExitFullscreen();
+          }
+        } catch (e) {
+          console.warn('Exit fullscreen error:', e);
+        }
+      }
+    }
+
+    ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach(ev => {
+      document.addEventListener(ev, () => {
+        const active = isFullscreen();
+        updateFullscreenIcons(active);
+        const card = document.querySelector('.video-card');
+        if (!active && card && card.classList.contains('is-fullscreen')) {
+          card.classList.remove('is-fullscreen');
+        }
+      });
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        const card = document.querySelector('.video-card');
+        if (card && card.classList.contains('is-fullscreen')) {
+          card.classList.remove('is-fullscreen');
+          updateFullscreenIcons(false);
+        }
+      }
+    });
+
     // Stream auto-reconnection and error overlays
     const streamImg = document.getElementById('stream-img');
     let streamRetryTimer = null;
+
+    if (streamImg) {
+      streamImg.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        toggleFullscreen();
+      });
+    }
 
     function setStreamError(title, detail) {
       const streamBadge = document.getElementById('stream-badge');
