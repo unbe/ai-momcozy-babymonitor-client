@@ -608,123 +608,267 @@ def cmd_share(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    description = """🍼 Momcozy BM04 Baby Monitor Client & Streaming Server
+
+Control your Momcozy BM04/BM05 baby monitor locally over Wi-Fi or via cloud.
+Features live video streaming (MJPEG/P2P), responsive PTZ pan/tilt controls,
+real-time temperature and baby crying detection, and a modern Web UI."""
+
+    epilog = """Examples:
+  # 1. Authenticate and retrieve local encryption keys
+  ./momcozy.py login
+  ./momcozy.py sync
+
+  # 2. View current room temperature & monitor telemetry
+  ./momcozy.py status
+  ./momcozy.py temperature -f
+
+  # 3. Launch Web UI dashboard & live video stream (http://localhost:8080)
+  ./momcozy.py serve
+
+  # 4. Pan / tilt camera
+  ./momcozy.py ptz left --duration 0.35
+  ./momcozy.py ptz up --duration 0.5
+
+  # 5. Capture snapshot or record video clip
+  ./momcozy.py snapshot -o baby.jpg
+  ./momcozy.py record -d 15 -o nursery.mp4
+
+  # 6. Play soothing lullaby or white noise
+  ./momcozy.py lullaby list
+  ./momcozy.py lullaby play --track 4 --volume 60
+
+  # 7. Configure camera features
+  ./momcozy.py set --night-vision auto --led off --volume 70"""
+
     parser = argparse.ArgumentParser(
         prog="momcozy",
-        description="Momcozy BM04 Baby Monitor Python Client & Streaming Server",
+        description=description,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", help="Path to config JSON file (~/.momcozy.json by default)")
-    parser.add_argument("--device-id", help="Target device ID")
-    parser.add_argument("--local-key", help="Device local encryption key")
-    parser.add_argument("--ip", help="Device IP on local Wi-Fi")
+    parser.add_argument("--config", help="Path to credentials file (default: ~/.momcozy.json)")
+    parser.add_argument("--device-id", help="Target device ID (overrides ~/.momcozy.json)")
+    parser.add_argument("--local-key", help="Device local 16-character AES encryption key (overrides config)")
+    parser.add_argument("--ip", help="Device IP on local Wi-Fi (overrides config)")
 
-    sub = parser.add_subparsers(dest="subcommand", required=True)
+    sub = parser.add_subparsers(
+        dest="subcommand",
+        title="Available Commands",
+        metavar="COMMAND",
+        required=True,
+    )
 
     # login
-    p_login = sub.add_parser("login", help="Log in to Momcozy Cloud")
-    p_login.add_argument("--email", "-e")
-    p_login.add_argument("--password", "-p")
-    p_login.add_argument("--country", "-c", default="US", help="ISO2 country code, e.g. CH")
-    p_login.add_argument("--region", "-r", choices=["NA", "EU", "AP", "CN"], default=None,
-                         help="Account region (default: auto-detect; Switzerland/Germany = EU)")
+    p_login = sub.add_parser(
+        "login",
+        help="Log in to Momcozy Cloud and link Tuya credentials",
+        description="Authenticate with your Momcozy mobile account (email and password). Retrieves cloud authentication tokens and Tuya credentials needed for local device keys and video streaming.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_login.add_argument("--email", "-e", help="Momcozy account email address")
+    p_login.add_argument("--password", "-p", help="Momcozy account password (prompted securely if omitted)")
+    p_login.add_argument("--country", "-c", default="US", help="ISO2 country code (default: US, e.g. CH, DE, GB)")
+    p_login.add_argument(
+        "--region",
+        "-r",
+        choices=["NA", "EU", "AP", "CN"],
+        default=None,
+        help="Data center region (default: auto-detected from country; e.g. EU for Europe)",
+    )
     p_login.set_defaults(func=cmd_login)
 
     # whoami
-    p_whoami = sub.add_parser("whoami", help="Show logged-in account, region, and profile info")
+    p_whoami = sub.add_parser(
+        "whoami",
+        help="Show logged-in account, region, and profile info",
+        description="Display current authenticated Momcozy account email, user ID, data center region, and linked Tuya Cloud credentials.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_whoami.set_defaults(func=cmd_whoami)
 
     # devices
-    p_devices = sub.add_parser("devices", help="List devices bound to your account (raw JSON)")
+    p_devices = sub.add_parser(
+        "devices",
+        help="List devices bound to your account (raw JSON)",
+        description="Query Momcozy Cloud and dump the raw device list JSON, including hardware serial numbers, device names, and MAC addresses.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_devices.set_defaults(func=cmd_devices)
 
     # sync / keys
-    p_sync = sub.add_parser("sync", help="Synchronize devices and local encryption keys from Momcozy & Tuya Cloud")
+    p_sync = sub.add_parser(
+        "sync",
+        help="Synchronize device encryption keys & IP from cloud",
+        description="Fetch camera local IP addresses and 16-character AES local encryption keys from Tuya Cloud, saving them to ~/.momcozy.json for local LAN control.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_sync.set_defaults(func=cmd_sync)
 
-    p_keys = sub.add_parser("keys", help="Alias for 'sync' - fetch device encryption keys from cloud")
+    p_keys = sub.add_parser(
+        "keys",
+        help="Alias for 'sync' - fetch device encryption keys",
+        description="Alias for 'sync'. Retrieves local encryption keys and device metadata from Tuya Cloud.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_keys.set_defaults(func=cmd_sync)
 
     # status
-    p_status = sub.add_parser("status", help="Show all monitor measurements and settings")
-    p_status.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_status = sub.add_parser(
+        "status",
+        help="Show all monitor measurements, alerts, and settings",
+        description="Display real-time environmental telemetry (room temperature, baby crying, motion, sound detection) and camera settings (night vision, privacy, volume).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_status.add_argument("--json", action="store_true", help="Output telemetry in raw JSON format (useful for scripts & Home Assistant)")
     p_status.set_defaults(func=cmd_status)
 
     # temperature
-    p_temp = sub.add_parser("temperature", help="Print current temperature")
-    p_temp.add_argument("-f", "--fahrenheit", action="store_true", help="Output in Fahrenheit")
+    p_temp = sub.add_parser(
+        "temperature",
+        help="Print current room temperature",
+        description="Quickly read the baby's room temperature from the monitor's environmental sensor.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_temp.add_argument("-f", "--fahrenheit", action="store_true", help="Output temperature in Fahrenheit (°F) instead of Celsius (°C)")
     p_temp.set_defaults(func=cmd_temperature)
 
     # set
-    p_set = sub.add_parser("set", help="Change monitor settings")
-    p_set.add_argument("--night-vision", choices=["auto", "off", "on"])
-    p_set.add_argument("--privacy", choices=["on", "off"])
-    p_set.add_argument("--led", choices=["on", "off"])
-    p_set.add_argument("--flip", choices=["on", "off"])
-    p_set.add_argument("--motion", choices=["on", "off"])
-    p_set.add_argument("--motion-sensitivity", choices=["0", "1", "2"])
-    p_set.add_argument("--sound", choices=["on", "off"])
-    p_set.add_argument("--sound-sensitivity", choices=["0", "1", "2"])
-    p_set.add_argument("--cry", choices=["on", "off"])
-    p_set.add_argument("--temp-alert", choices=["on", "off"])
-    p_set.add_argument("--temp-min", type=float, help="Min temp alert in Celsius")
-    p_set.add_argument("--temp-max", type=float, help="Max temp alert in Celsius")
-    p_set.add_argument("--volume", type=int, help="Master volume (1-100)")
+    p_set = sub.add_parser(
+        "set",
+        help="Change monitor settings and thresholds",
+        description="Configure camera features, alert toggles, sensitivity levels, and volume on the monitor.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_set.add_argument("--night-vision", choices=["auto", "off", "on"], help="IR night vision mode ('auto': automatic IR-cut, 'off': always off, 'on': always on)")
+    p_set.add_argument("--privacy", choices=["on", "off"], help="Privacy/sleep mode (turns off lens and disables streaming)")
+    p_set.add_argument("--led", choices=["on", "off"], help="Front status LED light indicator")
+    p_set.add_argument("--flip", choices=["on", "off"], help="Rotate video 180° (for upside-down crib or ceiling mounts)")
+    p_set.add_argument("--motion", choices=["on", "off"], help="Motion detection alerts")
+    p_set.add_argument("--motion-sensitivity", choices=["0", "1", "2"], help="Motion sensitivity ('0': Low, '1': Medium, '2': High)")
+    p_set.add_argument("--sound", choices=["on", "off"], help="Sound & noise detection alerts")
+    p_set.add_argument("--sound-sensitivity", choices=["0", "1", "2"], help="Sound sensitivity ('0': Low, '1': Medium, '2': High)")
+    p_set.add_argument("--cry", choices=["on", "off"], help="Baby crying detection alerts")
+    p_set.add_argument("--temp-alert", choices=["on", "off"], help="Temperature out-of-range alarm notification")
+    p_set.add_argument("--temp-min", type=float, help="Minimum temperature threshold in Celsius (e.g. 18.0)")
+    p_set.add_argument("--temp-max", type=float, help="Maximum temperature threshold in Celsius (e.g. 26.0)")
+    p_set.add_argument("--volume", type=int, help="Camera speaker master volume (1-100%%)")
     p_set.set_defaults(func=cmd_set)
 
     # ptz
-    p_ptz = sub.add_parser("ptz", help="Pan, tilt, and zoom controls")
-    p_ptz.add_argument("action", choices=["up", "down", "left", "right", "stop"])
-    p_ptz.add_argument("--duration", "-d", type=float, default=0.5, help="Step duration in seconds")
+    p_ptz = sub.add_parser(
+        "ptz",
+        help="Pan and tilt camera motor",
+        description="Move the camera's motorized pan and tilt head in four directions or halt movement.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_ptz.add_argument("action", choices=["up", "down", "left", "right", "stop"], help="PTZ action ('up', 'down', 'left', 'right', or 'stop')")
+    p_ptz.add_argument("--duration", "-d", type=float, default=0.5, help="Step movement duration in seconds (default: 0.5; continuous if 0)")
     p_ptz.set_defaults(func=cmd_ptz)
 
     # lullaby
-    p_lullaby = sub.add_parser("lullaby", help="Lullaby controls")
-    p_lullaby.add_argument("action", choices=["play", "stop", "list"])
-    p_lullaby.add_argument("--track", "-t", default="0", help="Track ID (0..7)")
-    p_lullaby.add_argument("--volume", "-v", type=int, default=50)
+    p_lullaby = sub.add_parser(
+        "lullaby",
+        help="Play/stop soothing lullabies and sounds",
+        description="Control lullabies and ambient sound tracks (White Noise, Heartbeat, Rainforest, Brahms' Lullaby) on the monitor.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_lullaby.add_argument("action", choices=["play", "stop", "list"], help="Action: 'play' to start playback, 'stop' to halt, 'list' to view available tracks")
+    p_lullaby.add_argument(
+        "--track",
+        "-t",
+        default="0",
+        help="Track ID to play (0: Brahms, 1: Hush Baby, 2: London Bridge, 3: Twinkle, 4: White Noise, 5: Heartbeat, 6: Rainforest, 7: Stream; default: 0)",
+    )
+    p_lullaby.add_argument("--volume", "-v", type=int, default=50, help="Lullaby playback volume percentage (0-100; default: 50)")
     p_lullaby.set_defaults(func=cmd_lullaby)
 
     # snapshot
-    p_snap = sub.add_parser("snapshot", help="Capture a still JPEG image from video stream")
-    p_snap.add_argument("-o", "--output", default="snapshot.jpg")
-    p_snap.add_argument("-t", "--timeout", type=float, default=10.0)
+    p_snap = sub.add_parser(
+        "snapshot",
+        help="Capture a still JPEG image from video stream",
+        description="Capture a single 1080p JPEG still frame directly from the camera's live P2P video stream.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_snap.add_argument("-o", "--output", default="snapshot.jpg", help="Output file path for saved JPEG image (default: snapshot.jpg)")
+    p_snap.add_argument("-t", "--timeout", type=float, default=10.0, help="Timeout in seconds waiting for video stream frame (default: 10.0)")
     p_snap.set_defaults(func=cmd_snapshot)
 
     # record
-    p_rec = sub.add_parser("record", help="Record an MP4 video clip from live stream")
-    p_rec.add_argument("-o", "--output", default="recording.mp4")
-    p_rec.add_argument("-d", "--duration", type=int, default=10, help="Duration in seconds")
-    p_rec.add_argument("--fps", type=int, default=15)
+    p_rec = sub.add_parser(
+        "record",
+        help="Record an MP4 video clip from live stream",
+        description="Record a live video clip from the camera and encode it to an MP4 video file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_rec.add_argument("-o", "--output", default="recording.mp4", help="Output file path for MP4 video (default: recording.mp4)")
+    p_rec.add_argument("-d", "--duration", type=int, default=10, help="Recording duration in seconds (default: 10)")
+    p_rec.add_argument("--fps", type=int, default=15, help="Video recording frame rate (default: 15)")
     p_rec.set_defaults(func=cmd_record)
 
     # serve
-    p_serve = sub.add_parser("serve", help="Start Web UI and MJPEG live stream server")
-    p_serve.add_argument("--host", default="0.0.0.0")
-    p_serve.add_argument("--port", "-p", type=int, default=8080)
+    p_serve = sub.add_parser(
+        "serve",
+        help="Start Web UI dashboard & MJPEG video server",
+        description="Launch an embedded HTTP server hosting the interactive browser dashboard, MJPEG live video feed (/stream), and snapshot endpoint (/snapshot).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_serve.add_argument("--host", default="0.0.0.0", help="Network interface host IP to bind (default: 0.0.0.0, accessible on LAN)")
+    p_serve.add_argument("--port", "-p", type=int, default=8080, help="TCP port to listen on (default: 8080)")
     p_serve.set_defaults(func=cmd_serve)
 
     # share
-    p_share = sub.add_parser("share", help="Share camera access with another Momcozy account")
-    share_sub = p_share.add_subparsers(dest="action", required=True)
+    p_share = sub.add_parser(
+        "share",
+        help="Share camera access with another Momcozy account",
+        description="Manage camera sharing with family members and other Momcozy user accounts.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    share_sub = p_share.add_subparsers(
+        dest="action",
+        title="Share Commands",
+        metavar="ACTION",
+        required=True,
+    )
 
     # share add <account>
-    p_sadd = share_sub.add_parser("add", help="Share device with a user by email")
-    p_sadd.add_argument("account", help="Recipient email or Momcozy account")
-    p_sadd.add_argument("--country", "-c", help="Recipient country code (default: account country)")
-    p_sadd.add_argument("--home-id", type=int, help="Optional Tuya Home/Group ID (auto-detected if omitted)")
+    p_sadd = share_sub.add_parser(
+        "add",
+        help="Share device with a user by email",
+        description="Grant camera viewing and control access to another Momcozy account by email.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_sadd.add_argument("account", help="Recipient email or Momcozy account username")
+    p_sadd.add_argument("--country", "-c", help="Recipient ISO2 country code (default: your account country)")
+    p_sadd.add_argument("--home-id", type=int, help="Optional Tuya Home/Group ID (automatically resolved if omitted)")
 
     # share remove <member_code>
-    p_srem = share_sub.add_parser("remove", help="Revoke device access for a member code")
-    p_srem.add_argument("member_code", help="Recipient member code to remove")
+    p_srem = share_sub.add_parser(
+        "remove",
+        help="Revoke device access for a member code",
+        description="Revoke device access for an existing shared family member using their member code.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_srem.add_argument("member_code", help="Member code of the shared user to revoke")
 
     # share search <account>
-    p_ssearch = share_sub.add_parser("search", help="Search for a Momcozy user to get their member code")
-    p_ssearch.add_argument("account", help="Email or account to look up")
-    p_ssearch.add_argument("--country", "-c", help="Country code")
+    p_ssearch = share_sub.add_parser(
+        "search",
+        help="Search for a Momcozy user to get their member code",
+        description="Query the Tuya/Momcozy user directory to look up a user's member code and account details by email.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_ssearch.add_argument("account", help="Email or account username to look up")
+    p_ssearch.add_argument("--country", "-c", help="ISO2 country code of recipient (e.g. US, CH, DE)")
 
     # share query <member_code...>
-    p_squery = share_sub.add_parser("query", help="Look up email addresses for member codes")
-    p_squery.add_argument("member_codes", nargs="+", help="Member codes to look up")
-
+    p_squery = share_sub.add_parser(
+        "query",
+        help="Look up email addresses for member codes",
+        description="Resolve member codes back to their associated email addresses and phone numbers.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_squery.add_argument("member_codes", nargs="+", help="One or more member codes to resolve")
     p_share.set_defaults(func=cmd_share)
 
     return parser
@@ -732,6 +876,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_parser()
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
     args = parser.parse_args()
     args.func(args)
 
