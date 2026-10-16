@@ -1065,6 +1065,48 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(playlist)
             self.assertIn("segment_000.ts", playlist)
 
+    async def test_hls_transcoder_subscribes_hevc_and_avoids_mjpeg_transcoding(self):
+        import asyncio
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        from momcozy.hls import HlsTranscoder
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+
+        async def fake_hevc():
+            yield b"hevc_keyframe", True
+
+        mock_streamer.subscribe_hevc = fake_hevc
+        mock_streamer.subscribe = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            hls = HlsTranscoder(streamer=mock_streamer, output_dir=tmp_dir)
+            with patch("subprocess.Popen") as mock_popen:
+                mock_proc = MagicMock()
+                mock_proc.stdin = MagicMock()
+                mock_proc.poll.return_value = None
+                mock_popen.return_value = mock_proc
+
+                started = await hls.start()
+                self.assertTrue(started)
+
+                # Verify ffmpeg arguments: -f hevc -framerate 15 -i pipe:0
+                mock_popen.assert_called_once()
+                cmd = mock_popen.call_args[0][0]
+                self.assertIn("-f", cmd)
+                idx_f = cmd.index("-f")
+                self.assertEqual(cmd[idx_f + 1], "hevc")
+                self.assertIn("-framerate", cmd)
+                self.assertIn("pipe:0", cmd)
+
+                # Wait briefly for feed task
+                await asyncio.sleep(0.05)
+                # Ensure subscribe (MJPEG) was NEVER called
+                mock_streamer.subscribe.assert_not_called()
+
+                await hls.stop()
+
     async def test_handle_hls_endpoints(self):
         from unittest.mock import AsyncMock, MagicMock
         from aiohttp.test_utils import make_mocked_request

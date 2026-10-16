@@ -7,6 +7,7 @@ using FFmpeg. Supports Google Chromecast, Apple TV, iOS Safari, and smart displa
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
 import re
@@ -26,7 +27,7 @@ _SEGMENT_RE = re.compile(r"^segment_\d+\.ts$")
 
 
 class HlsTranscoder:
-    """Live HLS transcoder feeding MJPEG frames from VideoStreamer into an FFmpeg HLS pipeline."""
+    """Live HLS transcoder feeding raw HEVC chunks from VideoStreamer into an FFmpeg HLS pipeline."""
 
     def __init__(
         self,
@@ -89,9 +90,8 @@ class HlsTranscoder:
             cmd = [
                 "ffmpeg",
                 "-y",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "-r", "15",
+                "-f", "hevc",
+                "-framerate", "15",
                 "-i", "pipe:0",
                 "-f", "lavfi",
                 "-i", "anullsrc=channel_layout=mono:sample_rate=8000",
@@ -145,7 +145,7 @@ class HlsTranscoder:
             return True
 
     def _writer_worker(self) -> None:
-        """Worker thread pushing JPEGs into FFmpeg stdin pipe."""
+        """Worker thread pushing raw HEVC chunks into FFmpeg stdin pipe."""
         proc = self._process
         if not proc or not proc.stdin:
             return
@@ -170,9 +170,9 @@ class HlsTranscoder:
                 break
 
     async def _feed_frames_task(self) -> None:
-        """Read frames from VideoStreamer and enqueue for FFmpeg."""
+        """Read raw HEVC chunks from VideoStreamer and enqueue for FFmpeg."""
         try:
-            async for frame in self.streamer.subscribe():
+            async for chunk, is_key in self.streamer.subscribe_hevc():
                 if not self._running:
                     break
                 try:
@@ -181,7 +181,7 @@ class HlsTranscoder:
                             self._queue.get_nowait()
                         except queue.Empty:
                             pass
-                    self._queue.put_nowait(frame)
+                    self._queue.put_nowait(chunk)
                 except Exception:
                     pass
         except asyncio.CancelledError:
@@ -207,13 +207,13 @@ class HlsTranscoder:
 
         if self._feed_task and not self._feed_task.done():
             self._feed_task.cancel()
-            with asyncio.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._feed_task
         self._feed_task = None
 
         if self._idle_task and not self._idle_task.done():
             self._idle_task.cancel()
-            with asyncio.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._idle_task
         self._idle_task = None
 
