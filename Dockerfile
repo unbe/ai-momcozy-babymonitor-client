@@ -28,7 +28,7 @@ RUN mkdir -p /config
 
 # Environment defaults
 ENV PYTHONUNBUFFERED=1 \
-    MOMCOZY_CONFIG=/config/momcozy.json
+    MOMCOZY_CONFIG=/config/.momcozy.json
 
 # Expose web dashboard & MJPEG stream port
 EXPOSE 8080

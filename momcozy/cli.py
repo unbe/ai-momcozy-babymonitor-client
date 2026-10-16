@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .cloud import DEFAULT_CONFIG_PATH, MomcozyCloudApi
+from .cloud import DEFAULT_CONFIG_PATH, MomcozyCloudApi, normalize_config_path
 from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection, Sensitivity
 from .device import MomcozyMonitor
 from .stream import VideoStreamer
@@ -24,7 +24,8 @@ logger = logging.getLogger("momcozy-cli")
 
 def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
     """Resolve device credentials from CLI arguments or saved config file."""
-    config_path = Path(args.config) if hasattr(args, "config") and args.config else DEFAULT_CONFIG_PATH
+    raw_cfg = args.config if hasattr(args, "config") and args.config else DEFAULT_CONFIG_PATH
+    config_path = normalize_config_path(raw_cfg)
     saved = {}
     if config_path.exists():
         try:
@@ -210,7 +211,7 @@ def cmd_login(args: argparse.Namespace) -> None:
     print(f"Connecting to Momcozy Cloud ({api.base_url})...")
     try:
         api.login(email, password)
-        config_path = (Path(args.config) if args.config else DEFAULT_CONFIG_PATH).expanduser()
+        config_path = normalize_config_path(args.config if args.config else DEFAULT_CONFIG_PATH)
         api.save_session(config_path)
 
         # Automatically discover user's baby monitor and sync Tuya keys
@@ -234,7 +235,7 @@ def cmd_login(args: argparse.Namespace) -> None:
 
 def cmd_sync(args: argparse.Namespace) -> None:
     """Synchronize devices and local encryption keys from Momcozy & Tuya Cloud."""
-    config_path = (Path(args.config) if args.config else DEFAULT_CONFIG_PATH).expanduser()
+    config_path = normalize_config_path(args.config if args.config else DEFAULT_CONFIG_PATH)
     api = MomcozyCloudApi.load_session(config_path)
     if not api or not api.token:
         print("Not logged in. Run './momcozy.py login' first.", file=sys.stderr)
@@ -539,15 +540,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_share(args: argparse.Namespace) -> None:
-    """Handle device sharing subcommands."""
-    api = MomcozyCloudApi.load_session(args.config or DEFAULT_CONFIG_PATH)
+    config_target = normalize_config_path(args.config or DEFAULT_CONFIG_PATH)
+    api = MomcozyCloudApi.load_session(config_target)
     if not api or not api.token:
         print("Error: You must run './momcozy.py login' first.", file=sys.stderr)
         sys.exit(1)
 
     dev_id = args.device_id
     if not dev_id:
-        config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+        config_path = config_target
         if config_path.exists():
             try:
                 cfg = json.loads(config_path.read_text())

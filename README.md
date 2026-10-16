@@ -133,11 +133,11 @@ docker run -d \
   --name momcozy-monitor \
   --restart unless-stopped \
   -p 8080:8080 \
-  -v $(pwd)/.momcozy.json:/config/momcozy.json \
+  -v $(pwd):/config \
   momcozy-client
 
 # Run any CLI command (e.g. status)
-docker run --rm -v $(pwd)/.momcozy.json:/config/momcozy.json momcozy-client status
+docker run --rm -v $(pwd):/config momcozy-client status
 ```
 
 ---

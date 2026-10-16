@@ -722,6 +722,26 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertIn(PACKAGE_NAME, identity.client_id)
 
 
+    def test_normalize_config_path(self):
+        from pathlib import Path
+        from momcozy.cloud import normalize_config_path
+        import tempfile
+
+        # Standard file path
+        f = Path("/tmp/custom_config.json")
+        self.assertEqual(normalize_config_path(f), f)
+
+        # Directory path should append .momcozy.json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            self.assertEqual(normalize_config_path(tmp_path), tmp_path / ".momcozy.json")
+
+            # If existing file is inside
+            existing = tmp_path / "momcozy.json"
+            existing.write_text("{}")
+            self.assertEqual(normalize_config_path(tmp_path), existing)
+
+
 if __name__ == "__main__":
     unittest.main()
 

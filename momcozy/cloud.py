@@ -48,6 +48,17 @@ def _resolve_default_config_path() -> Path:
 DEFAULT_CONFIG_PATH = _resolve_default_config_path()
 
 
+def normalize_config_path(path: Path | str) -> Path:
+    """Normalize a config path. If pointing to a directory, append .momcozy.json or momcozy.json."""
+    p = Path(path).expanduser()
+    if p.is_dir():
+        for candidate in (".momcozy.json", "momcozy.json"):
+            if (p / candidate).is_file():
+                return p / candidate
+        return p / ".momcozy.json"
+    return p
+
+
 def hash_password(plain_password: str) -> str:
     """Hash password with Argon2id matching the official Momcozy Android app."""
     salt = base64.b64decode(ARGON2_FIXED_SALT_B64)
@@ -564,8 +575,8 @@ class MomcozyCloudApi:
                 raise RuntimeError(f"Cloud device synchronization failed: {err_msg}")
 
         # 3. Update config file if path is specified
-        if config_path and Path(config_path).exists() and results:
-            cfg_p = Path(config_path)
+        cfg_p = normalize_config_path(config_path) if config_path else None
+        if cfg_p and cfg_p.exists() and results:
             try:
                 saved = json.loads(cfg_p.read_text())
                 primary_id = saved.get("device_id")
@@ -665,7 +676,7 @@ class MomcozyCloudApi:
 
     def save_session(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
         """Save credentials to disk."""
-        path = Path(path).expanduser()
+        path = normalize_config_path(path)
         tuya_payload = None
         if self.tuya_creds:
             tuya_payload = {
@@ -695,7 +706,7 @@ class MomcozyCloudApi:
     @classmethod
     def load_session(cls, path: Path | str = DEFAULT_CONFIG_PATH) -> Optional[MomcozyCloudApi]:
         """Load session from disk if present."""
-        path = Path(path).expanduser()
+        path = normalize_config_path(path)
         if not path.exists():
             return None
         try:
