@@ -72,6 +72,10 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             if api and api.tuya_creds and api.tuya_creds.token:
                 logger.info("Retrieving Tuya encryption key for device %s from Tuya Cloud...", dev_id)
                 synced = api.sync_devices_and_keys(config_path, raise_on_error=True)
+                try:
+                    saved = json.loads(config_path.read_text())
+                except Exception:
+                    pass
                 if dev_id and dev_id in synced and synced[dev_id].get("local_key"):
                     local_key = synced[dev_id]["local_key"]
                     logger.info("✓ Retrieved and saved Tuya local encryption key for %s", dev_id)
@@ -102,13 +106,54 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         )
         sys.exit(1)
 
-    tuya_reg = saved.get("tuya", {}).get("region") if saved.get("tuya") else None
+    tuya_cfg = saved.get("tuya") if isinstance(saved.get("tuya"), dict) else {}
+    tuya_reg = tuya_cfg.get("region")
+    tuya_uid = tuya_cfg.get("uid")
+    tuya_token = tuya_cfg.get("token")
     account_reg = saved.get("region")
-    stream_reg = "eu" if (tuya_reg == "33" or account_reg == "EU") else "us"
+    stream_reg = "eu" if (str(tuya_reg) == "33" or account_reg == "EU") else "us"
 
     cc = saved.get("country_code", "1")
     phone_code_map = {"CH": "41", "DE": "49", "US": "1", "CA": "1", "GB": "44", "UK": "44", "FR": "33"}
     stream_cc = phone_code_map.get(str(cc).upper(), str(cc))
+
+    import time as _time
+
+    _dps_cache: dict = {"ts": 0.0, "dps": saved.get("dps") if isinstance(saved.get("dps"), dict) else {}, "session": None, "client": None}
+
+    def _fetch_cloud_dps() -> dict:
+        now = _time.time()
+        if _dps_cache["dps"] and (now - _dps_cache["ts"] < 15.0):
+            return _dps_cache["dps"]
+        if not config_path.exists():
+            return _dps_cache["dps"]
+        api_inst = MomcozyCloudApi.load_session(config_path)
+        if not api_inst or not api_inst.tuya_creds or not api_inst.tuya_creds.token:
+            return _dps_cache["dps"]
+        t_client = _dps_cache["client"] or api_inst.get_tuya_client()
+        _dps_cache["client"] = t_client
+        t_session = _dps_cache["session"]
+        if t_session is None:
+            t_session = t_client.login_with_uid(
+                country_code=api_inst.tuya_creds.region,
+                uid=api_inst.tuya_creds.uid,
+                token=api_inst.tuya_creds.token,
+            )
+            _dps_cache["session"] = t_session
+        try:
+            info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+        except Exception:
+            t_session = t_client.login_with_uid(
+                country_code=api_inst.tuya_creds.region,
+                uid=api_inst.tuya_creds.uid,
+                token=api_inst.tuya_creds.token,
+            )
+            _dps_cache["session"] = t_session
+            info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+        if isinstance(info, dict) and info.get("dps"):
+            _dps_cache["dps"] = info["dps"]
+            _dps_cache["ts"] = now
+        return _dps_cache["dps"]
 
     return MomcozyMonitor(
         device_id=dev_id,
@@ -118,6 +163,11 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         stream_account_password=os.environ.get("MOMCOZY_PASSWORD"),
         stream_country_code=stream_cc,
         stream_region=stream_reg,
+        stream_tuya_uid=tuya_uid,
+        stream_tuya_token=tuya_token,
+        stream_tuya_region=str(tuya_reg) if tuya_reg else None,
+        cloud_dps_provider=_fetch_cloud_dps if (tuya_uid and tuya_token) else None,
+        initial_dps=saved.get("dps") if isinstance(saved.get("dps"), dict) else None,
     )
 
 
@@ -372,6 +422,9 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
         password=monitor.stream_password or "",
         country_code=monitor.stream_country_code,
         region=monitor.stream_region,
+        tuya_uid=monitor.stream_tuya_uid,
+        tuya_token=monitor.stream_tuya_token,
+        tuya_region=monitor.stream_tuya_region,
     )
     print(f"Connecting to {monitor.device_id} to capture snapshot...")
     try:
@@ -394,6 +447,9 @@ def cmd_record(args: argparse.Namespace) -> None:
         password=monitor.stream_password or "",
         country_code=monitor.stream_country_code,
         region=monitor.stream_region,
+        tuya_uid=monitor.stream_tuya_uid,
+        tuya_token=monitor.stream_tuya_token,
+        tuya_region=monitor.stream_tuya_region,
     )
     print(f"Recording {args.duration}s clip from {monitor.device_id} to {args.output}...")
     try:
@@ -414,14 +470,19 @@ def cmd_serve(args: argparse.Namespace) -> None:
     """Run Web Dashboard and MJPEG stream server."""
     monitor = _get_configured_device(args)
     streamer = None
-    if monitor.stream_email and monitor.stream_password:
+    if (monitor.stream_tuya_uid and monitor.stream_tuya_token) or (
+        monitor.stream_email and monitor.stream_password
+    ):
         streamer = VideoStreamer(
             device_id=monitor.device_id,
             local_key=monitor.local_key,
-            email=monitor.stream_email,
-            password=monitor.stream_password,
+            email=monitor.stream_email or "",
+            password=monitor.stream_password or "",
             country_code=monitor.stream_country_code,
             region=monitor.stream_region,
+            tuya_uid=monitor.stream_tuya_uid,
+            tuya_token=monitor.stream_tuya_token,
+            tuya_region=monitor.stream_tuya_region,
         )
 
     server = WebServer(

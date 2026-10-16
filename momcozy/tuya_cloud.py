@@ -25,22 +25,22 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 logger = logging.getLogger(__name__)
 
-# Constants reverse-engineered from Momcozy BM04 APK & Tuya SDK
-PACKAGE_NAME = "com.tuya.smartlife"
+# Constants reverse-engineered from Momcozy BM04 APK (com.lute.momcozy) & libthing_security.so
+PACKAGE_NAME = "com.lute.momcozy"
 CERT_SHA256 = (
-    "0F:C3:61:99:9C:C0:C3:5B:A8:AC:A5:7D:AA:55:93:A2"
-    ":0C:F5:57:27:70:2E:A8:5A:D7:B3:22:89:49:F8:88:FE"
+    "86:48:51:9D:96:A7:15:C0:3F:27:A1:EF:8A:AC:9E:E2"
+    ":B8:2E:83:76:3F:97:E8:8F:2E:45:28:3D:2E:A5:93:F2"
 )
-DERIVED_KEY = "jfg5rs5kkmrj5mxahugvucrsvw43t48x"
-APP_SECRET = "r3me7ghmxjevrvnpemwmhw3fxtacphyg"
+DERIVED_KEY = "ker9483upg35v53uqaryum5j3wyhnv3x"
+APP_SECRET = "jnmtjkaqcvervwfxeu75kvtnrksgwutp"
 COMPOSITE_KEY = f"{PACKAGE_NAME}_{CERT_SHA256}_{DERIVED_KEY}_{APP_SECRET}"
 
-CLIENT_ID = "ekmnwp9f5pnh3trdtpgy"
-CH_KEY = "ec9709a4"
-APP_VERSION = "7.10.3"
-SDK_VERSION = "5.2.0"
+CLIENT_ID = "4t7ucfdpqkpys9fwy5yv"
+CH_KEY = "39641be9"
+APP_VERSION = "2.9.2"
+SDK_VERSION = "7.5.0"
 LANGUAGE = "en_US"
-TTID = f"sdk_international@{CLIENT_ID}"
+TTID = "android"
 
 DEFAULT_DEVICE_FINGERPRINT = "a" * 44
 
@@ -160,7 +160,7 @@ class TuyaSession:
 
 
 class TuyaGatewayClient:
-    """Synchronous Tuya Smart Home Gateway client for device sharing."""
+    """Synchronous Tuya Smart Home Gateway client for Momcozy OEM Tuya SDK."""
 
     def __init__(
         self,
@@ -186,6 +186,10 @@ class TuyaGatewayClient:
         timeout: int = 15,
     ) -> Any:
         """Issue a signed, AES-GCM encrypted et=3 request to Tuya Gateway and return result."""
+        # ThingApiParams.checkAPIName() in Tuya Android SDK rewrites "thing." prefix to "smartlife."
+        if api.startswith("thing."):
+            api = "smartlife." + api[len("thing."):]
+
         request_id = str(uuid.uuid4())
         key = (
             session_body_key(request_id, session.ecode, self.composite_key)
@@ -304,17 +308,25 @@ class TuyaGatewayClient:
             device_fingerprint=self.device_fingerprint,
         )
 
-    def get_home_id(self, session: TuyaSession) -> int:
-        """Query user's Tuya Home/Family ID."""
+    def get_home_ids(self, session: TuyaSession) -> List[int]:
+        """Query all Tuya Home/Family IDs for the user."""
         logger.debug("Querying Tuya home list...")
         homes = self.call_api("tuya.m.location.list", "2.1", {}, session=session)
-        if isinstance(homes, list) and len(homes) > 0:
-            first_home = homes[0]
-            if isinstance(first_home, dict):
-                home_id = first_home.get("gid") or first_home.get("homeId") or first_home.get("id")
-                if home_id:
-                    logger.debug("Found existing Tuya home ID: %s", home_id)
-                    return int(home_id)
+        home_ids: List[int] = []
+        if isinstance(homes, list):
+            for h in homes:
+                if isinstance(h, dict):
+                    hid = h.get("gid") or h.get("homeId") or h.get("id")
+                    if hid:
+                        home_ids.append(int(hid))
+        return home_ids
+
+    def get_home_id(self, session: TuyaSession) -> int:
+        """Query user's primary Tuya Home/Family ID."""
+        home_ids = self.get_home_ids(session)
+        if home_ids:
+            logger.debug("Found existing Tuya home ID: %s", home_ids[0])
+            return home_ids[0]
 
         # Create default home if none exists
         logger.info("No Tuya home found; creating default home...")
@@ -324,7 +336,7 @@ class TuyaGatewayClient:
             if home_id:
                 return int(home_id)
 
-        raise RuntimeError(f"Unable to determine Tuya home ID from: {homes}")
+        raise RuntimeError("Unable to determine Tuya home ID")
 
     def share_device_to_user(
         self,
@@ -382,100 +394,170 @@ class TuyaGatewayClient:
         )
         return bool(res)
 
+    @staticmethod
+    def _normalize_device_dict(dev: Dict[str, Any], home_id: Optional[int] = None) -> Dict[str, Any]:
+        """Ensure top-level 'dps' is populated from 'dataPointInfo.dps' if present."""
+        if not dev.get("dps"):
+            dp_info = dev.get("dataPointInfo")
+            if isinstance(dp_info, dict) and dp_info.get("dps"):
+                dev["dps"] = dp_info["dps"]
+        if home_id and not dev.get("homeId"):
+            dev["homeId"] = home_id
+        return dev
+
+    def get_device_info(
+        self, session: TuyaSession, dev_id: str, home_id: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Query a specific device's full DeviceRespBean (including localKey and dps)."""
+        extra = {"gid": str(home_id)} if home_id else None
+        errors: List[str] = []
+        for api_name, ver, post in (
+            ("smartlife.m.device.get", "4.1", {"devId": dev_id}),
+            ("smartlife.m.device.get", "2.0", {"devId": dev_id}),
+            ("tuya.m.device.get", "1.0", {"devId": dev_id}),
+        ):
+            try:
+                res = self.call_api(api_name, ver, post, session=session, extra_params=extra)
+                if isinstance(res, dict) and (
+                    res.get("devId") or res.get("localKey") or res.get("dps") or res.get("dataPointInfo")
+                ):
+                    return self._normalize_device_dict(res, home_id=home_id)
+            except Exception as exc:
+                errors.append(f"{api_name} (v{ver}): {exc}")
+                logger.debug("Tuya device info API %s (v%s) failed: %s", api_name, ver, exc)
+        if errors:
+            logger.warning("Tuya get_device_info for %s failed: %s", dev_id, "; ".join(errors))
+        return None
+
     def get_shared_devices(self, session: TuyaSession) -> List[Dict[str, Any]]:
         """Query devices shared with the user from other accounts."""
         logger.debug("Querying Tuya shared devices...")
-        errors: List[str] = []
-        for api_name in ("thing.m.my.shared.device.list", "smartlife.m.my.shared.device.list"):
-            try:
-                res = self.call_api(api_name, "3.2", {}, session=session)
-                if isinstance(res, list):
-                    return res
-                if isinstance(res, dict):
-                    devs = res.get("devices") or res.get("deviceList") or res.get("list")
-                    if isinstance(devs, list):
-                        return devs
-            except Exception as exc:
-                errors.append(f"{api_name}: {exc}")
-                logger.debug("Tuya shared devices API %s failed: %s", api_name, exc)
-        if errors:
-            logger.warning("Tuya shared devices query failed across endpoints: %s", "; ".join(errors))
-        return []
+        res = self.call_api("thing.m.my.shared.device.list", "3.2", {}, session=session)
+        devs: List[Dict[str, Any]] = []
+        if isinstance(res, list):
+            devs = [d for d in res if isinstance(d, dict)]
+        elif isinstance(res, dict):
+            raw_list = res.get("devices") or res.get("deviceList") or res.get("list")
+            if isinstance(raw_list, list):
+                devs = [d for d in raw_list if isinstance(d, dict)]
+        return [self._normalize_device_dict(d) for d in devs]
 
     def get_home_devices(self, session: TuyaSession, home_id: int) -> List[Dict[str, Any]]:
         """Query all devices in Tuya Home including their local encryption keys (localKey)."""
         logger.debug("Querying Tuya home %s devices...", home_id)
         errors: List[str] = []
-        for api_name, ver in (
-            ("smartlife.m.my.group.device.list", "2.2"),
-            ("thing.m.my.group.device.list", "2.2"),
-            ("smartlife.m.location.dashboard.list", "1.0"),
+        for api_name, ver, post in (
+            ("m.life.my.group.device.list", "2.2", {"gid": home_id}),
+            ("tuya.m.my.group.device.list", "1.0", {}),
+            ("m.life.app.smart.local.device.list", "1.1", {"homeId": home_id, "groupType": "homeGroup"}),
+            ("smartlife.m.my.group.device.list", "2.2", {"gid": home_id}),
         ):
             try:
                 res = self.call_api(
                     api_name,
                     ver,
-                    {"gid": home_id},
+                    post,
                     session=session,
                     extra_params={"gid": str(home_id)},
                 )
                 if isinstance(res, list):
-                    return res
+                    return [self._normalize_device_dict(d, home_id=home_id) for d in res if isinstance(d, dict)]
                 if isinstance(res, dict):
                     devs = res.get("devices") or res.get("deviceList")
                     if isinstance(devs, list):
-                        return devs
+                        return [self._normalize_device_dict(d, home_id=home_id) for d in devs if isinstance(d, dict)]
             except Exception as exc:
                 errors.append(f"{api_name} (v{ver}): {exc}")
                 logger.debug("Tuya home devices API %s failed: %s", api_name, exc)
         if errors:
-            logger.warning("Tuya home devices query for home %s failed across endpoints: %s", home_id, "; ".join(errors))
+            raise RuntimeError(
+                f"Tuya home devices query for home {home_id} failed across endpoints: {'; '.join(errors)}"
+            )
         return []
 
     def get_all_devices(
-        self, session: TuyaSession, home_id: Optional[int] = None
+        self,
+        session: TuyaSession,
+        home_id: Optional[int] = None,
+        known_device_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Query all accessible devices (both owned home devices and shared devices)."""
+        """Query all accessible devices (owned home devices, shared devices, and known device IDs)."""
         all_devs: List[Dict[str, Any]] = []
         seen_ids = set()
         errors: List[str] = []
 
-        # 1. Fetch owned home devices if home_id is provided or discoverable
-        target_home_id = home_id
-        if not target_home_id:
+        # 1. Discover all home IDs
+        home_ids: List[int] = []
+        try:
+            home_ids = self.get_home_ids(session)
+        except Exception as exc:
+            logger.debug("Could not resolve all Tuya home IDs via get_home_ids: %s", exc)
+
+        if not home_ids:
             try:
-                target_home_id = self.get_home_id(session)
+                discovered_id = self.get_home_id(session)
+                if discovered_id:
+                    home_ids.append(discovered_id)
             except Exception as exc:
                 logger.warning("Could not resolve Tuya home ID: %s", exc)
                 errors.append(f"get_home_id: {exc}")
 
-        if target_home_id:
+        if home_id and home_id not in home_ids:
+            home_ids.insert(0, home_id)
+
+        for hid in home_ids:
             try:
-                for dev in self.get_home_devices(session, target_home_id):
+                for dev in self.get_home_devices(session, hid):
+                    if not isinstance(dev, dict):
+                        continue
                     dev_id = str(dev.get("devId") or dev.get("id") or dev.get("gwId") or "")
                     if dev_id and dev_id not in seen_ids:
                         seen_ids.add(dev_id)
                         all_devs.append(dev)
-                    elif not dev_id and isinstance(dev, dict):
+                    elif not dev_id:
                         all_devs.append(dev)
             except Exception as exc:
-                logger.warning("Error fetching home devices: %s", exc)
-                errors.append(f"get_home_devices: {exc}")
+                logger.warning("Error fetching home %s devices: %s", hid, exc)
+                errors.append(f"get_home_devices({hid}): {exc}")
 
         # 2. Fetch shared devices
         try:
             for dev in self.get_shared_devices(session):
+                if not isinstance(dev, dict):
+                    continue
                 dev_id = str(dev.get("devId") or dev.get("id") or dev.get("gwId") or "")
                 if dev_id and dev_id not in seen_ids:
                     seen_ids.add(dev_id)
                     all_devs.append(dev)
-                elif not dev_id and isinstance(dev, dict):
+                elif not dev_id:
                     all_devs.append(dev)
         except Exception as exc:
             logger.warning("Error fetching shared devices: %s", exc)
             errors.append(f"get_shared_devices: {exc}")
 
+        # 3. Direct lookup for known device IDs if not yet found or missing localKey
+        if known_device_ids:
+            primary_hid = home_id or (home_ids[0] if home_ids else None)
+            for k_id in known_device_ids:
+                existing = next(
+                    (
+                        d
+                        for d in all_devs
+                        if str(d.get("devId") or d.get("id") or d.get("gwId") or "") == k_id
+                    ),
+                    None,
+                )
+                if not existing or not (existing.get("localKey") or existing.get("devKey") or existing.get("key")):
+                    info = self.get_device_info(session, k_id, home_id=primary_hid)
+                    if info:
+                        if existing:
+                            existing.update(info)
+                        else:
+                            seen_ids.add(k_id)
+                            all_devs.append(info)
+
         if not all_devs and errors:
             raise RuntimeError(f"Failed to fetch Tuya devices from cloud: {'; '.join(errors)}")
 
         return all_devs
+

@@ -402,7 +402,20 @@ class MomcozyCloudApi:
             target_member_code=target_member_code,
         )
 
-    def get_tuya_devices(self) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _is_private_lan_ip(ip_str: str) -> bool:
+        """Return True if ip_str is a private RFC1918 LAN IPv4/IPv6 address (not a public WAN IP)."""
+        if not ip_str:
+            return False
+        import ipaddress
+
+        try:
+            addr = ipaddress.ip_address(ip_str.strip())
+            return addr.is_private and not addr.is_loopback and not addr.is_unspecified
+        except ValueError:
+            return False
+
+    def get_tuya_devices(self, known_device_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Fetch all devices (both owned in Tuya Home and shared with user) from Tuya Cloud."""
         if not self.tuya_creds or not self.tuya_creds.token:
             try:
@@ -427,7 +440,12 @@ class MomcozyCloudApi:
             except Exception as exc:
                 logger.warning("Could not determine Tuya home ID (checking shared devices): %s", exc)
 
-        return tuya_client.get_all_devices(session, home_id=home_id)
+        devs = tuya_client.get_all_devices(session, home_id=home_id, known_device_ids=known_device_ids)
+        for d in devs:
+            if isinstance(d, dict) and d.get("homeId") and (d.get("localKey") or d.get("devKey")):
+                self.tuya_home_id = int(d["homeId"])
+                break
+        return devs
 
     def get_tuya_device_keys(self) -> Dict[str, str]:
         """Fetch local encryption keys for devices (both owned and shared) from Tuya Cloud."""
@@ -452,17 +470,25 @@ class MomcozyCloudApi:
         results: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
 
+        saved_cfg: Dict[str, Any] = {}
+        if config_path and Path(config_path).exists():
+            try:
+                saved_cfg = json.loads(Path(config_path).read_text())
+            except Exception:
+                pass
+
         # 1. Query Momcozy devices
         momcozy_devs: List[Dict[str, Any]] = []
-        try:
-            res = self.query_devices()
-            if isinstance(res, dict):
-                momcozy_devs = res.get("deviceList") or []
-            elif isinstance(res, list):
-                momcozy_devs = res
-        except Exception as exc:
-            logger.warning("Momcozy queryDevices failed during sync: %s", exc)
-            errors.append(f"Momcozy queryDevices: {exc}")
+        if self.token:
+            try:
+                res = self.query_devices()
+                if isinstance(res, dict):
+                    momcozy_devs = res.get("deviceList") or []
+                elif isinstance(res, list):
+                    momcozy_devs = res
+            except Exception as exc:
+                logger.warning("Momcozy queryDevices failed during sync: %s", exc)
+                errors.append(f"Momcozy queryDevices: {exc}")
 
         for d in momcozy_devs:
             meta = d.get("metadata") or {}
@@ -473,36 +499,49 @@ class MomcozyCloudApi:
                     "name": d.get("deviceName", "BM04"),
                     "mac": d.get("mac", ""),
                     "local_key": "",
-                    "ip": "",
+                    "ip": saved_cfg.get("ip", "") if saved_cfg.get("device_id") == ext_id else "",
+                    "dps": {},
                 }
+
+        known_ids = list(results.keys())
+        saved_dev_id = saved_cfg.get("device_id")
+        if saved_dev_id and saved_dev_id not in known_ids and not (len(saved_dev_id) == 36 and "-" in saved_dev_id):
+            known_ids.append(saved_dev_id)
 
         # 2. Query Tuya devices & keys (both owned and shared)
         try:
-            tuya_devs = self.get_tuya_devices()
+            tuya_devs = self.get_tuya_devices(known_device_ids=known_ids)
             for td in tuya_devs:
                 if not isinstance(td, dict):
                     continue
                 dev_id = str(td.get("devId") or td.get("id") or td.get("gwId") or "")
+                if not dev_id or dev_id.startswith("outdoor-weather_"):
+                    continue
                 local_key = str(td.get("localKey") or td.get("devKey") or td.get("key") or "")
                 name = td.get("name") or "BM04"
                 mac = td.get("mac") or ""
-                ip = td.get("ip") or ""
-                if dev_id:
-                    if dev_id not in results:
-                        results[dev_id] = {
-                            "device_id": dev_id,
-                            "name": name,
-                            "mac": mac,
-                            "local_key": local_key,
-                            "ip": ip,
-                        }
-                    else:
-                        if local_key:
-                            results[dev_id]["local_key"] = local_key
-                        if mac and not results[dev_id].get("mac"):
-                            results[dev_id]["mac"] = mac
-                        if ip and not results[dev_id].get("ip"):
-                            results[dev_id]["ip"] = ip
+                raw_ip = str(td.get("ip") or "")
+                lan_ip = raw_ip if self._is_private_lan_ip(raw_ip) else ""
+                dps = td.get("dps") or (td.get("dataPointInfo") or {}).get("dps") or {}
+
+                if dev_id not in results:
+                    results[dev_id] = {
+                        "device_id": dev_id,
+                        "name": name,
+                        "mac": mac,
+                        "local_key": local_key,
+                        "ip": lan_ip or (saved_cfg.get("ip", "") if saved_cfg.get("device_id") == dev_id else ""),
+                        "dps": dps,
+                    }
+                else:
+                    if local_key:
+                        results[dev_id]["local_key"] = local_key
+                    if mac and not results[dev_id].get("mac"):
+                        results[dev_id]["mac"] = mac
+                    if lan_ip and not results[dev_id].get("ip"):
+                        results[dev_id]["ip"] = lan_ip
+                    if dps:
+                        results[dev_id]["dps"] = dps
         except Exception as exc:
             logger.warning("Failed querying Tuya devices during sync: %s", exc)
             errors.append(f"Tuya devices: {exc}")
@@ -539,8 +578,13 @@ class MomcozyCloudApi:
                         saved["camera_name"] = matched["name"]
                     if matched.get("mac") and not saved.get("mac"):
                         saved["mac"] = matched["mac"]
-                    if matched.get("ip") and not saved.get("ip"):
+                    if matched.get("ip") and self._is_private_lan_ip(matched["ip"]) and not saved.get("ip"):
                         saved["ip"] = matched["ip"]
+                    if matched.get("dps"):
+                        saved["dps"] = matched["dps"]
+
+                if self.tuya_home_id and isinstance(saved.get("tuya"), dict):
+                    saved["tuya"]["home_id"] = self.tuya_home_id
 
                 cfg_p.write_text(json.dumps(saved, indent=2))
                 logger.debug("Saved synchronized device info to %s", cfg_p)

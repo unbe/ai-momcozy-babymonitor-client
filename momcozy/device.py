@@ -119,6 +119,11 @@ class MomcozyMonitor:
         stream_account_password: Optional[str] = None,
         stream_country_code: str = "1",
         stream_region: str = "us",
+        stream_tuya_uid: Optional[str] = None,
+        stream_tuya_token: Optional[str] = None,
+        stream_tuya_region: Optional[str] = None,
+        cloud_dps_provider: Optional[Any] = None,
+        initial_dps: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
@@ -130,6 +135,13 @@ class MomcozyMonitor:
         self.stream_password = stream_account_password
         self.stream_country_code = stream_country_code
         self.stream_region = stream_region
+        self.stream_tuya_uid = stream_tuya_uid
+        self.stream_tuya_token = stream_tuya_token
+        self.stream_tuya_region = stream_tuya_region
+
+        self.cloud_dps_provider = cloud_dps_provider
+        self._cached_dps: Dict[str, Any] = dict(initial_dps) if initial_dps else {}
+        self._lan_tcp_unavailable: bool = False
 
         self._device: Optional[tinytuya.Device] = None
         self._init_local_device()
@@ -143,7 +155,8 @@ class MomcozyMonitor:
                 version=self.version,
             )
             self._device.set_socketPersistent(True)
-            self._device.set_socketTimeout(5)
+            self._device.set_socketTimeout(2)
+            self._lan_tcp_unavailable = False
 
     def set_ip(self, ip: str) -> None:
         """Update monitor IP address."""
@@ -175,30 +188,8 @@ class MomcozyMonitor:
                 )
         return self._device
 
-    def get_status(self) -> BM04Status:
-        """Query all DataPoints from the monitor and return a structured status."""
-        dev = self._ensure_device()
-        data = dev.status()
-        dps = data.get("dps", {})
-        if not dps:
-            # Retry once with version 3.4/3.5 fallback if needed
-            for v in [3.4, 3.5, 3.3]:
-                dev.set_version(v)
-                data = dev.status()
-                dps = data.get("dps", {})
-                if dps:
-                    self.version = v
-                    break
-
-        if not dps:
-            err = data.get("Error") or data.get("Err") or "No response from device"
-            raise RuntimeError(
-                f"Failed to communicate with device at {self.ip} (device ID: {self.device_id}): {err}.\n"
-                f"  • {self.ip} did not return any Momcozy/Tuya monitor telemetry on port 6668.\n"
-                f"  • Verify that {self.ip} is the IP address of your BM04 camera on your Wi-Fi (Sigmastar MAC: 50:7B:91:xx:xx:xx).\n"
-                f"  • If the device requires a local encryption key, pass --local-key."
-            )
-
+    def _parse_dps(self, dps: Dict[str, Any]) -> BM04Status:
+        """Parse a raw Tuya DataPoint dictionary into a structured BM04Status."""
         status = BM04Status(raw_dps=dps)
 
         # Temperature sensor (tenths of degree Celsius)
@@ -248,6 +239,57 @@ class MomcozyMonitor:
         status.sd_storage = str(dps.get(str(int(DP.SD_STORAGE)), ""))
 
         return status
+
+    def get_status(self) -> BM04Status:
+        """Query all DataPoints from the monitor and return a structured status."""
+        dps: Dict[str, Any] = {}
+        data: Dict[str, Any] = {}
+
+        if (self._device is not None or not self.cloud_dps_provider) and not self._lan_tcp_unavailable:
+            try:
+                dev = self._ensure_device()
+                data = dev.status() or {}
+                dps = data.get("dps", {}) if isinstance(data, dict) else {}
+                if not dps:
+                    err_str = str(data.get("Error", "")) if isinstance(data, dict) else ""
+                    if "Unable to Connect" in err_str or str(data.get("Err", "")) == "901":
+                        # TCP port 6668 is closed/unreachable on IPC camera; skip version retries
+                        self._lan_tcp_unavailable = True
+                    else:
+                        for v in [3.4, 3.5, 3.3]:
+                            dev.set_version(v)
+                            data = dev.status() or {}
+                            dps = data.get("dps", {}) if isinstance(data, dict) else {}
+                            if dps:
+                                self.version = v
+                                break
+            except Exception as exc:
+                logger.debug("Local TCP status query failed: %s", exc)
+                data = {"Error": str(exc)}
+
+        if not dps and self.cloud_dps_provider:
+            try:
+                cloud_dps = self.cloud_dps_provider()
+                if isinstance(cloud_dps, dict) and cloud_dps:
+                    dps = cloud_dps
+            except Exception as exc:
+                logger.debug("Cloud DPS provider fallback failed: %s", exc)
+
+        if not dps and self._cached_dps:
+            dps = self._cached_dps
+
+        if not dps:
+            err = (data.get("Error") or data.get("Err")) if isinstance(data, dict) else None
+            err = err or "No response from device"
+            raise RuntimeError(
+                f"Failed to communicate with device at {self.ip} (device ID: {self.device_id}): {err}.\n"
+                f"  • {self.ip} did not return any Momcozy/Tuya monitor telemetry on port 6668.\n"
+                f"  • Verify that {self.ip} is the IP address of your BM04 camera on your Wi-Fi (Sigmastar MAC: 50:7B:91:xx:xx:xx).\n"
+                f"  • If the device requires a local encryption key, pass --local-key."
+            )
+
+        self._cached_dps = dict(dps)
+        return self._parse_dps(dps)
 
     def get_temperature(self) -> Tuple[Optional[float], Optional[float]]:
         """Return (celsius, fahrenheit) tuple of current room temperature."""
@@ -387,18 +429,23 @@ class MomcozyMonitor:
 
     async def async_stream_frames(self) -> AsyncIterator[bytes]:
         """Yield live JPEG video frames over native Tuya P2P connection."""
-        from tuya_ipc_p2p_sdk import TuyaIpcP2pClient
+        from .stream import create_p2p_client
 
-        if not self.stream_email or not self.stream_password:
+        if not (self.stream_tuya_uid and self.stream_tuya_token) and not (
+            self.stream_email and self.stream_password
+        ):
             raise ValueError(
-                "Streaming requires stream_account_email and stream_account_password."
+                "Streaming requires Tuya UID/token or stream_account_email and stream_account_password."
             )
 
-        async with TuyaIpcP2pClient(
-            username=self.stream_email,
-            password=self.stream_password,
+        async with create_p2p_client(
+            email=self.stream_email or "",
+            password=self.stream_password or "",
             country_code=self.stream_country_code,
             region=self.stream_region,
+            tuya_uid=self.stream_tuya_uid,
+            tuya_token=self.stream_tuya_token,
+            tuya_region=self.stream_tuya_region,
         ) as client:
             stream = client.create_camera_stream(self.device_id, self.local_key)
             await stream.async_start()

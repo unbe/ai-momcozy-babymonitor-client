@@ -10,12 +10,139 @@ import io
 import logging
 import time
 from pathlib import Path
-from typing import AsyncIterator, Optional, Set
+from typing import Any, AsyncIterator, Optional, Set
 
 import cv2
 import numpy as np
 
+from .tuya_cloud import (
+    APP_SECRET,
+    APP_VERSION,
+    CERT_SHA256,
+    CH_KEY,
+    CLIENT_ID,
+    COMPOSITE_KEY,
+    DERIVED_KEY,
+    PACKAGE_NAME,
+    SDK_VERSION,
+    TTID,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _configure_tuya_p2p_sdk() -> None:
+    """Configure tuya_ipc_p2p_sdk module constants with Momcozy OEM credentials."""
+    import tuya_ipc_p2p_sdk.const as sdk_const
+    import tuya_ipc_p2p_sdk.gateway.client as sdk_gw_client
+    import tuya_ipc_p2p_sdk.gateway.identity as sdk_gw_identity
+
+    for mod in (sdk_const, sdk_gw_client, sdk_gw_identity):
+        if hasattr(mod, "PACKAGE_NAME"):
+            mod.PACKAGE_NAME = PACKAGE_NAME
+        if hasattr(mod, "CERT_SHA256"):
+            mod.CERT_SHA256 = CERT_SHA256
+        if hasattr(mod, "DERIVED_KEY"):
+            mod.DERIVED_KEY = DERIVED_KEY
+        if hasattr(mod, "APP_SECRET"):
+            mod.APP_SECRET = APP_SECRET
+        if hasattr(mod, "COMPOSITE_KEY"):
+            mod.COMPOSITE_KEY = COMPOSITE_KEY
+        if hasattr(mod, "CLIENT_ID"):
+            mod.CLIENT_ID = CLIENT_ID
+        if hasattr(mod, "CH_KEY"):
+            mod.CH_KEY = CH_KEY
+        if hasattr(mod, "APP_VERSION"):
+            mod.APP_VERSION = APP_VERSION
+        if hasattr(mod, "SDK_VERSION"):
+            mod.SDK_VERSION = SDK_VERSION
+        if hasattr(mod, "TTID"):
+            mod.TTID = TTID
+
+
+def create_p2p_client(
+    email: str = "",
+    password: str = "",
+    country_code: str = "1",
+    region: str = "us",
+    tuya_uid: Optional[str] = None,
+    tuya_token: Optional[str] = None,
+    tuya_region: Optional[str] = None,
+) -> Any:
+    """Create a TuyaIpcP2pClient configured with Momcozy OEM gateway credentials."""
+    _configure_tuya_p2p_sdk()
+    from tuya_ipc_p2p_sdk import TuyaIpcP2pClient
+    from tuya_ipc_p2p_sdk.crypto import md5_hex
+    from tuya_ipc_p2p_sdk.exceptions import (
+        TuyaIpcP2pAuthenticationError,
+        TuyaIpcP2pGatewayError,
+    )
+    from tuya_ipc_p2p_sdk.gateway.client import GatewayClient, _encrypt_password
+    from tuya_ipc_p2p_sdk.json_types import require_str
+    from tuya_ipc_p2p_sdk.models import AccountSession
+
+    class MomcozyGatewayClient(GatewayClient):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs.setdefault("composite_key", COMPOSITE_KEY)
+            super().__init__(*args, **kwargs)
+
+        async def async_login(self, email_arg: str, password_arg: str, cc_arg: str) -> AccountSession:
+            if tuya_uid and tuya_token:
+                uid_cc = str(tuya_region or cc_arg)
+                try:
+                    token_obj = await self._async_call_object(
+                        "smartlife.m.user.username.token.get",
+                        "2.0",
+                        {"countryCode": uid_cc, "username": tuya_uid, "isUid": True},
+                    )
+                    encrypted_pw = _encrypt_password(
+                        require_str(token_obj, "publicKey"),
+                        require_str(token_obj, "exponent"),
+                        md5_hex(tuya_token),
+                    )
+                    login_post = {
+                        "countryCode": uid_cc,
+                        "uid": tuya_uid,
+                        "passwd": encrypted_pw,
+                        "token": require_str(token_obj, "token"),
+                        "ifencrypt": 1,
+                        "createGroup": True,
+                        "options": '{"group": 1}',
+                    }
+                    try:
+                        account = await self._async_call_object(
+                            "smartlife.m.user.uid.password.login.reg",
+                            "1.0",
+                            login_post,
+                        )
+                    except TuyaIpcP2pGatewayError:
+                        login_post_fallback = dict(login_post)
+                        login_post_fallback.pop("createGroup", None)
+                        account = await self._async_call_object(
+                            "smartlife.m.user.uid.password.login",
+                            "1.0",
+                            login_post_fallback,
+                        )
+                except TuyaIpcP2pGatewayError as exc:
+                    raise TuyaIpcP2pAuthenticationError(f"Failed to log in with Tuya UID: {exc}") from exc
+
+                return AccountSession(
+                    sid=require_str(account, "sid"),
+                    ecode=require_str(account, "ecode"),
+                    uid=require_str(account, "uid"),
+                    device_fingerprint=self._device_fingerprint,
+                )
+
+            return await super().async_login(email_arg, password_arg, cc_arg)
+
+    client = TuyaIpcP2pClient(
+        email=email or (tuya_uid or ""),
+        password=password or (tuya_token or ""),
+        country_code=country_code,
+        region=region,
+    )
+    client._gateway = MomcozyGatewayClient(region=region)
+    return client
 
 
 class VideoStreamer:
@@ -25,10 +152,13 @@ class VideoStreamer:
         self,
         device_id: str,
         local_key: str,
-        email: str,
-        password: str,
+        email: str = "",
+        password: str = "",
         country_code: str = "1",
         region: str = "us",
+        tuya_uid: Optional[str] = None,
+        tuya_token: Optional[str] = None,
+        tuya_region: Optional[str] = None,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
@@ -36,6 +166,9 @@ class VideoStreamer:
         self.password = password
         self.country_code = country_code
         self.region = region
+        self.tuya_uid = tuya_uid
+        self.tuya_token = tuya_token
+        self.tuya_region = tuya_region
 
         self._running = False
         self._latest_frame: Optional[bytes] = None
@@ -75,17 +208,18 @@ class VideoStreamer:
 
     async def _stream_loop(self) -> None:
         """Internal loop fetching frames from the camera P2P stream."""
-        from tuya_ipc_p2p_sdk import TuyaIpcP2pClient
-
         backoff = 2
         while self._running:
             try:
                 logger.info("Connecting to P2P video stream for %s...", self.device_id)
-                async with TuyaIpcP2pClient(
+                async with create_p2p_client(
                     email=self.email,
                     password=self.password,
                     country_code=self.country_code,
                     region=self.region,
+                    tuya_uid=self.tuya_uid,
+                    tuya_token=self.tuya_token,
+                    tuya_region=self.tuya_region,
                 ) as client:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
                     await stream.async_start()
