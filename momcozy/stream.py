@@ -834,13 +834,6 @@ class VideoStreamer:
                         break
                     continue
         finally:
-            if format == "mp3" and encoder:
-                try:
-                    flush_bytes = encoder.flush()
-                    if flush_bytes:
-                        yield flush_bytes
-                except Exception:
-                    pass
             self._audio_listeners.discard(queue)
             logger.info(
                 "Client unsubscribed from live audio stream (remaining listeners: %d, device: %s)",
