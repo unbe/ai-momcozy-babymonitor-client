@@ -31,8 +31,8 @@ RUN mkdir -p /config
 ENV PYTHONUNBUFFERED=1 \
     MOMCOZY_CONFIG=/config/.momcozy.json
 
-# Expose web dashboard & MJPEG stream port
-EXPOSE 8421
+# Expose web dashboard (8421) and Chromecast LAN streaming port (8420)
+EXPOSE 8420 8421
 
 # Health check to ensure the dashboard status API is responding (supports HTTP and HTTPS)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

@@ -35,6 +35,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <script>
     window.serverLanIp = '';
     window.serverPort = 8421;
+    window.serverHttpPort = 8420;
 
     window.addEventListener('error', function(e) {
       console.error('[Window Error]', e.message, 'at', e.filename, ':', e.lineno, e.error);
@@ -927,6 +928,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const d = await res.json();
         if (d.server_lan_ip) window.serverLanIp = d.server_lan_ip;
         if (d.server_port) window.serverPort = d.server_port;
+        if (d.server_http_port) window.serverHttpPort = d.server_http_port;
         const badge = document.getElementById('conn-badge');
         let banner = document.getElementById('status-error-banner');
 
@@ -1079,14 +1081,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         return;
       }
 
-      let host = window.location.host;
-      const hostname = window.location.hostname;
-      const isIp = /^(\\d{1,3}\\.){3}\\d{1,3}$/.test(hostname);
-      if (!isIp && window.serverLanIp && window.serverLanIp !== '127.0.0.1') {
-        const port = window.location.port ? (':' + window.location.port) : (window.serverPort ? (':' + window.serverPort) : '');
-        host = window.serverLanIp + port;
-      }
-      const streamUrl = `${window.location.protocol}//${host}/hls/stream.m3u8`;
+      // Chromecast strictly rejects self-signed HTTPS certificates.
+      // Therefore, always provide an HTTP stream URL for Chromecast over local LAN:
+      const castProto = 'http:';
+      const castPort = window.serverHttpPort ? (':' + window.serverHttpPort) : (window.location.protocol === 'http:' && window.location.port ? (':' + window.location.port) : ':8420');
+      const streamUrl = `${castProto}//${window.location.hostname}${castPort}/hls/stream.m3u8`;
       console.log("[Google Cast] Loading stream to receiver:", streamUrl);
 
       const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegurl');
@@ -1274,6 +1273,7 @@ class WebServer:
         streamer: Optional[VideoStreamer] = None,
         host: str = "0.0.0.0",
         port: int = 8421,
+        http_port: Optional[int] = None,
         ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         self.monitor = monitor
@@ -1281,6 +1281,10 @@ class WebServer:
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
+        if http_port is not None:
+            self.http_port = http_port
+        else:
+            self.http_port = 8420 if self.ssl_context else self.port
         self.hls: Optional[HlsTranscoder] = HlsTranscoder(streamer=self.streamer) if self.streamer else None
         self.app = web.Application()
         self._setup_routes()
@@ -1322,7 +1326,7 @@ class WebServer:
         lan_ip = self.get_local_lan_ip()
         html = HTML_DASHBOARD.replace(
             "window.serverLanIp = '';",
-            f"window.serverLanIp = '{lan_ip}'; window.serverPort = {self.port};",
+            f"window.serverLanIp = '{lan_ip}'; window.serverPort = {self.port}; window.serverHttpPort = {self.http_port};",
             1,
         )
         return web.Response(text=html, content_type="text/html")
@@ -1589,6 +1593,7 @@ class WebServer:
             "control_diagnostic": control_diagnostic,
             "server_lan_ip": self.get_local_lan_ip(),
             "server_port": self.port,
+            "server_http_port": self.http_port,
         }
         try:
             status = await asyncio.to_thread(self.monitor.get_status)
@@ -1730,6 +1735,15 @@ class WebServer:
         await site.start()
         proto = "https" if self.ssl_context else "http"
         logger.info("Momcozy Web Dashboard running at %s://%s:%d", proto, self.host, self.port)
+
+        if self.ssl_context and self.http_port and self.http_port != self.port:
+            try:
+                site_http = web.TCPSite(runner, self.host, self.http_port)
+                await site_http.start()
+                logger.info("Chromecast & LAN HTTP media endpoint running at http://%s:%d", self.host, self.http_port)
+            except Exception as e:
+                logger.warning("Could not bind HTTP media port %d: %s. Chromecast may fail on self-signed HTTPS.", self.http_port, e)
+
         try:
             while True:
                 await asyncio.sleep(3600)

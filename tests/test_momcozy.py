@@ -1101,6 +1101,23 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         ctx = create_ssl_context()
         self.assertIsInstance(ctx, ssl.SSLContext)
 
+    async def test_webserver_http_port_and_index_injection(self):
+        import ssl
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        # Test SSL enabled assigns default 8420
+        srv_ssl = WebServer(monitor=mock_monitor, port=8421, ssl_context=MagicMock(spec=ssl.SSLContext))
+        self.assertEqual(srv_ssl.http_port, 8420)
+
+        # Test index injection contains http_port
+        req = make_mocked_request("GET", "/")
+        resp = await srv_ssl.handle_index(req)
+        self.assertEqual(resp.status, 200)
+        self.assertIn("window.serverHttpPort = 8420;", resp.text)
+
 
 if __name__ == "__main__":
     unittest.main()

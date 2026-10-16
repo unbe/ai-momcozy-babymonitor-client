@@ -598,17 +598,29 @@ def cmd_serve(args: argparse.Namespace) -> None:
             print(f"Error configuring SSL: {e}", file=sys.stderr)
             sys.exit(1)
 
+    http_port = getattr(args, "http_port", 8420)
+    if not ssl_context:
+        http_port = args.port
+    elif os.environ.get("MOMCOZY_HTTP_PORT"):
+        try:
+            http_port = int(os.environ["MOMCOZY_HTTP_PORT"])
+        except ValueError:
+            pass
+
     server = WebServer(
         monitor=monitor,
         streamer=streamer,
         host=args.host,
         port=args.port,
+        http_port=http_port,
         ssl_context=ssl_context,
     )
     proto = "https" if ssl_context else "http"
     print(f"\n=======================================================")
     print(f" Momcozy BM04 Web Dashboard & Live Streaming Server")
     print(f" Dashboard:    {proto}://{args.host}:{args.port}")
+    if ssl_context and http_port != args.port:
+        print(f" Cast / HTTP:  http://{args.host}:{http_port}/hls/stream.m3u8")
     print(f" MJPEG Stream: {proto}://{args.host}:{args.port}/stream")
     print(f" Audio Stream: {proto}://{args.host}:{args.port}/audio")
     print(f" HLS Stream:   {proto}://{args.host}:{args.port}/hls/stream.m3u8")
@@ -915,6 +927,12 @@ real-time temperature and baby crying detection, and a modern Web UI."""
     p_serve.add_argument("--ssl", action="store_true", help="Enable HTTPS (auto-generates a self-signed certificate if none provided)")
     p_serve.add_argument("--ssl-cert", help="Path to custom SSL certificate PEM file for HTTPS")
     p_serve.add_argument("--ssl-key", help="Path to custom SSL private key PEM file for HTTPS")
+    p_serve.add_argument(
+        "--http-port",
+        type=int,
+        default=8420,
+        help="Plain HTTP port for Chromecast and LAN streaming when SSL is enabled (default: 8420)",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     # share
