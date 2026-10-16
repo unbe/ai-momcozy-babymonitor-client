@@ -1828,7 +1828,7 @@ class WebServer:
                 content_type="text/plain",
                 headers={"Access-Control-Allow-Origin": "*"},
             )
-        playlist = await self.hls.get_playlist(timeout_seconds=6.0)
+        playlist = await self.hls.get_playlist(timeout_seconds=10.0)
         if playlist is None:
             return web.Response(
                 status=503,
