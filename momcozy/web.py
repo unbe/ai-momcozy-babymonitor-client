@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Optional
 
 from aiohttp import web
@@ -202,9 +203,65 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       border: 1px solid var(--border);
       background: #fff;
     }
+
+    /* Video error overlay */
+    .video-error-overlay {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(15, 23, 42, 0.88);
+      backdrop-filter: blur(4px);
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      text-align: center;
+      z-index: 10;
+      gap: 10px;
+      transition: opacity 0.3s ease;
+    }
+    .video-error-overlay.hidden { display: none; }
+
+    /* Toast notifications */
+    #toast-container {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: 420px;
+      pointer-events: none;
+    }
+    .toast {
+      pointer-events: auto;
+      background: #FFFFFF;
+      border-left: 5px solid #E53E3E;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+      border-radius: 8px;
+      padding: 12px 16px;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-size: 0.88rem;
+      color: #2D3748;
+      animation: slideIn 0.3s ease-out;
+      transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+    }
+    .toast.error { border-left-color: #E53E3E; }
+    .toast.warn { border-left-color: #ED8936; }
+    .toast.info { border-left-color: #4299E1; }
+    .toast.success { border-left-color: #48BB78; }
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
   </style>
 </head>
 <body>
+  <div id="toast-container"></div>
   <div class="container">
     <header>
       <h1>🍼 Momcozy BM04 Monitor</h1>
@@ -212,8 +269,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </header>
 
     <div class="video-card">
-      <div class="video-overlay"><div class="live-dot"></div> LIVE STREAM</div>
+      <div class="video-overlay" id="video-overlay">
+        <div class="live-dot" id="live-dot"></div>
+        <span id="stream-badge">LIVE STREAM</span>
+      </div>
       <img id="stream-img" src="/stream" alt="Camera Stream">
+      <div id="video-error" class="video-error-overlay hidden">
+        <div style="font-size: 2.2rem;">⚠️</div>
+        <div id="video-error-title" style="font-weight: 700; font-size: 1.05rem;">Live Stream Offline</div>
+        <div id="video-error-detail" style="font-size: 0.85rem; color: #E2E8F0; max-width: 90%; line-height: 1.4;"></div>
+        <button class="btn primary" onclick="retryStream()" style="margin-top: 8px;">🔄 Retry Stream</button>
+      </div>
     </div>
 
     <div class="grid">
@@ -314,14 +380,40 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   </div>
 
   <script>
+    function showToast(message, type = 'error', duration = 5000) {
+      const container = document.getElementById('toast-container');
+      if (!container) return;
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      const icon = type === 'error' ? '❌' : (type === 'warn' ? '⚠️' : (type === 'success' ? '✓' : 'ℹ️'));
+      toast.innerHTML = `<span style="font-size:1.1rem; line-height:1;">${icon}</span><div style="flex:1;">${message}</div><button style="background:none;border:none;cursor:pointer;font-weight:bold;color:#718096;font-size:1rem;line-height:1;" onclick="this.parentElement.remove()">✕</button>`;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(20px)';
+        setTimeout(() => toast.remove(), 300);
+      }, duration);
+    }
+
     async function apiPost(action, data={}) {
       try {
-        await fetch('/api/control', {
+        const res = await fetch('/api/control', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({action, ...data})
         });
-      } catch(e) { console.error(e); }
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || json.status === 'error') {
+          const errDetail = json.error || `Server returned error (${res.status})`;
+          showToast(`Action failed: ${errDetail}`, 'error');
+          return false;
+        }
+        return true;
+      } catch(e) {
+        console.error(e);
+        showToast(`Request failed: ${e.message}`, 'error');
+        return false;
+      }
     }
 
     let ptzBusy = false;
@@ -338,19 +430,68 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     function ptz(dir) { apiPost('ptz_move', {direction: dir}); }
     function ptzStop() { apiPost('ptz_stop'); }
 
-    // Stream auto-reconnection guard
+    // Stream auto-reconnection and error overlays
     const streamImg = document.getElementById('stream-img');
     let streamRetryTimer = null;
+
+    function setStreamError(title, detail) {
+      const streamBadge = document.getElementById('stream-badge');
+      const liveDot = document.getElementById('live-dot');
+      if (streamBadge) streamBadge.innerText = 'STREAM ERROR';
+      if (liveDot) {
+        liveDot.style.background = '#E53E3E';
+        liveDot.style.animation = 'none';
+      }
+      const errOverlay = document.getElementById('video-error');
+      if (errOverlay) {
+        errOverlay.classList.remove('hidden');
+        const titleEl = document.getElementById('video-error-title');
+        const detailEl = document.getElementById('video-error-detail');
+        if (titleEl) titleEl.innerText = title;
+        if (detailEl) detailEl.innerText = detail;
+      }
+    }
+
+    function retryStream() {
+      const errOverlay = document.getElementById('video-error');
+      if (errOverlay) errOverlay.classList.add('hidden');
+      const streamBadge = document.getElementById('stream-badge');
+      const liveDot = document.getElementById('live-dot');
+      if (streamBadge) streamBadge.innerText = 'RECONNECTING...';
+      if (liveDot) {
+        liveDot.style.background = '#ED8936';
+        liveDot.style.animation = 'pulse 1s infinite';
+      }
+      if (streamImg) {
+        streamImg.src = '/stream?t=' + Date.now();
+      }
+      showToast('Reconnecting to video stream...', 'info', 2500);
+      updateStatus();
+    }
+
     if (streamImg) {
       streamImg.onerror = function() {
+        setStreamError('Live Stream Disconnected', 'Video feed connection lost. Reconnecting in 3s...');
         if (!streamRetryTimer) {
           streamRetryTimer = setTimeout(() => {
             streamRetryTimer = null;
-            streamImg.src = '/stream?t=' + Date.now();
-          }, 1500);
+            if (streamImg) streamImg.src = '/stream?t=' + Date.now();
+          }, 3000);
+        }
+      };
+      streamImg.onload = function() {
+        const errOverlay = document.getElementById('video-error');
+        if (errOverlay) errOverlay.classList.add('hidden');
+        const streamBadge = document.getElementById('stream-badge');
+        const liveDot = document.getElementById('live-dot');
+        if (streamBadge) streamBadge.innerText = 'LIVE STREAM';
+        if (liveDot) {
+          liveDot.style.background = '#48BB78';
+          liveDot.style.animation = 'pulse 1.5s infinite';
         }
       };
     }
+
     function setNightVision(mode) { apiPost('night_vision', {mode}); }
     function togglePrivacy() { apiPost('toggle_privacy'); }
     function toggleLed() { apiPost('toggle_led'); }
@@ -363,10 +504,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     function setLullabyVol(vol) { apiPost('lullaby_volume', {volume: parseInt(vol)}); }
     function changeLullaby() { toggleLullaby(true); }
 
+    let offlineFailures = 0;
     async function updateStatus() {
       try {
         const res = await fetch('/api/status');
-        if (!res.ok) return;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        offlineFailures = 0;
         const d = await res.json();
         const badge = document.getElementById('conn-badge');
         let banner = document.getElementById('status-error-banner');
@@ -376,7 +519,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             badge.className = 'badge';
             badge.style.background = '#FED7D7';
             badge.style.color = '#C53030';
-            badge.innerText = 'Offline / Key Needed';
+            badge.innerText = 'Offline / Communication Notice';
           }
           if (d.error && !banner) {
             banner = document.createElement('div');
@@ -388,22 +531,38 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             }
           }
           if (banner) {
-            banner.innerHTML = `⚠️ <strong>Device Connection Notice:</strong> ${d.error}<br><span style="color:#742A2A; font-size:0.82rem;">Note: If the camera is at this IP but not responding, provide its Tuya local encryption key via <code>--local-key &lt;KEY&gt;</code>.</span>`;
+            banner.innerHTML = `⚠️ <strong>Device Communication Notice:</strong> ${d.error}<br><span style="color:#742A2A; font-size:0.82rem;">Note: If the camera is at this IP but not responding, verify its local key or run <code>./momcozy.py login</code>.</span>`;
           }
-          return;
+        } else {
+          if (badge) {
+            badge.className = 'badge active';
+            badge.style.background = '#C6F6D5';
+            badge.style.color = '#22543D';
+            badge.innerText = 'Connected';
+          }
+          if (banner) {
+            banner.remove();
+          }
         }
 
-        if (badge) {
-          badge.className = 'badge active';
-          badge.style.background = '#C6F6D5';
-          badge.style.color = '#22543D';
-          badge.innerText = 'Connected';
-        }
-        if (banner) {
-          banner.remove();
+        // Live stream status inspection
+        if (d.stream_configured === false) {
+          setStreamError('Video Stream Not Configured', 'No Tuya cloud credentials found in ~/.momcozy.json. Run "./momcozy.py login" to link your credentials.');
+        } else if (d.stream_error) {
+          setStreamError('Video Stream Error', d.stream_error);
+        } else if (d.stream_connected) {
+          const errOverlay = document.getElementById('video-error');
+          if (errOverlay) errOverlay.classList.add('hidden');
+          const streamBadge = document.getElementById('stream-badge');
+          const liveDot = document.getElementById('live-dot');
+          if (streamBadge) streamBadge.innerText = 'LIVE STREAM';
+          if (liveDot) {
+            liveDot.style.background = '#48BB78';
+            liveDot.style.animation = 'pulse 1.5s infinite';
+          }
         }
 
-        if (d.temperature_c !== null) {
+        if (d.temperature_c !== null && d.temperature_c !== undefined) {
           document.getElementById('temp-val').innerHTML = `${d.temperature_c.toFixed(1)}°C <span>(${d.temperature_f.toFixed(1)}°F)</span>`;
         }
         document.getElementById('motion-stat').innerText = d.motion_switch ? "Active" : "Off";
@@ -411,7 +570,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('priv-stat').innerText = d.privacy_mode ? "ON" : "OFF";
         const nvMap = {"0": "Auto", "1": "Off", "2": "On"};
         document.getElementById('nv-stat').innerText = nvMap[d.night_vision] || d.night_vision;
-      } catch(e) {}
+      } catch(e) {
+        offlineFailures++;
+        if (offlineFailures >= 2) {
+          const badge = document.getElementById('conn-badge');
+          if (badge) {
+            badge.className = 'badge';
+            badge.style.background = '#FED7D7';
+            badge.style.color = '#C53030';
+            badge.innerText = 'Server Unreachable';
+          }
+          let banner = document.getElementById('status-error-banner');
+          if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'status-error-banner';
+            banner.style.cssText = 'background:#FFF5F5; border:1px solid #FEB2B2; color:#9B2C2C; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:0.88rem; line-height:1.4;';
+            const grid = document.querySelector('.grid');
+            if (grid && grid.parentNode) {
+              grid.parentNode.insertBefore(banner, grid);
+            }
+          }
+          if (banner) {
+            banner.innerHTML = `⚠️ <strong>Dashboard Server Connection Notice:</strong> ${e.message}. Reconnecting...`;
+          }
+        }
+      }
     }
 
     setInterval(updateStatus, 3000);
@@ -451,6 +634,24 @@ class WebServer:
 
     async def handle_stream(self, request: web.Request) -> web.StreamResponse:
         """Serve live video as multipart/x-mixed-replace MJPEG stream."""
+        if not self.streamer:
+            return web.Response(
+                status=503,
+                text="Live video stream is not configured: Missing Tuya credentials.",
+                content_type="text/plain",
+            )
+
+        if not self.streamer.is_running:
+            try:
+                await self.streamer.start()
+            except Exception as e:
+                logger.warning("Could not start live video streamer: %s", e)
+                return web.Response(
+                    status=502,
+                    text=f"Could not start video stream: {e}",
+                    content_type="text/plain",
+                )
+
         response = web.StreamResponse(
             status=200,
             reason="OK",
@@ -463,16 +664,6 @@ class WebServer:
             },
         )
         await response.prepare(request)
-
-        if not self.streamer:
-            return response
-
-        if not self.streamer.is_running:
-            try:
-                await self.streamer.start()
-            except Exception as e:
-                logger.warning("Could not start live video streamer: %s", e)
-                return response
 
         last_sent = 0.0
         min_interval = 0.065  # Target smooth ~15 FPS to prevent browser buffer saturation
@@ -509,6 +700,12 @@ class WebServer:
 
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
+        stream_info = {
+            "stream_configured": self.streamer is not None,
+            "stream_running": self.streamer.is_running if self.streamer else False,
+            "stream_connected": self.streamer.is_connected if self.streamer else False,
+            "stream_error": self.streamer.last_error if self.streamer else None,
+        }
         try:
             status = await asyncio.to_thread(self.monitor.get_status)
             return web.json_response({
@@ -528,6 +725,7 @@ class WebServer:
                 "lullaby_track": status.lullaby_track,
                 "master_volume": status.master_volume,
                 "sd_card_status": status.sd_card_status,
+                **stream_info,
             })
         except Exception as e:
             logger.debug("Could not read device status: %s", e)
@@ -549,6 +747,7 @@ class WebServer:
                 "lullaby_track": "0",
                 "master_volume": 50,
                 "sd_card_status": 1,
+                **stream_info,
             })
 
     async def handle_api_control(self, request: web.Request) -> web.Response:

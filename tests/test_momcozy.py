@@ -556,6 +556,73 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["status"], "ok")
         mock_monitor.ptz_step.assert_called_once_with("2", 0.4)
 
+    async def test_handle_api_status_includes_stream_info(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+        from momcozy.device import BM04Status
+
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = BM04Status(temperature_c=21.0, temperature_f=69.8)
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+        mock_streamer.is_connected = False
+        mock_streamer.last_error = "Signaling error: 135"
+
+        server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+        req = make_mocked_request("GET", "/api/status")
+        resp = await server.handle_api_status(req)
+
+        self.assertEqual(resp.status, 200)
+        import json
+        body = json.loads(resp.text)
+        self.assertTrue(body["stream_configured"])
+        self.assertTrue(body["stream_running"])
+        self.assertFalse(body["stream_connected"])
+        self.assertEqual(body["stream_error"], "Signaling error: 135")
+
+    async def test_handle_stream_not_configured(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        server = WebServer(monitor=mock_monitor, streamer=None)
+        req = make_mocked_request("GET", "/stream")
+        resp = await server.handle_stream(req)
+
+        self.assertEqual(resp.status, 503)
+        self.assertIn("not configured", resp.text)
+
+    async def test_handle_stream_start_failure(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = False
+        mock_streamer.start = AsyncMock(side_effect=RuntimeError("Broker auth failed"))
+
+        server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+        req = make_mocked_request("GET", "/stream")
+        resp = await server.handle_stream(req)
+
+        self.assertEqual(resp.status, 502)
+        self.assertIn("Broker auth failed", resp.text)
+
+    async def test_video_streamer_error_tracking(self):
+        from momcozy.stream import VideoStreamer
+        streamer = VideoStreamer("dev123", "localkey")
+        self.assertFalse(streamer.is_running)
+        self.assertFalse(streamer.is_connected)
+        self.assertIsNone(streamer.last_error)
+
+        # Simulate exception caught in streamer
+        streamer._last_error = "Connection refused"
+        self.assertEqual(streamer.last_error, "Connection refused")
+
     def test_tuya_gateway_publish_dps(self):
         from unittest.mock import MagicMock
         from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession

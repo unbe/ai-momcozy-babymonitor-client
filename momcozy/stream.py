@@ -312,6 +312,8 @@ class VideoStreamer:
         self.tuya_region = tuya_region
 
         self._running = False
+        self._connected = False
+        self._last_error: Optional[str] = None
         self._latest_frame: Optional[bytes] = None
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._stream_task: Optional[asyncio.Task] = None
@@ -320,6 +322,14 @@ class VideoStreamer:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._last_error
 
     @property
     def latest_frame(self) -> Optional[bytes]:
@@ -338,6 +348,7 @@ class VideoStreamer:
         """Stop background streaming task."""
         async with self._lock:
             self._running = False
+            self._connected = False
             if self._stream_task:
                 self._stream_task.cancel()
                 try:
@@ -369,6 +380,8 @@ class VideoStreamer:
                         async for jpeg_frame in stream.async_frames():
                             if not self._running:
                                 break
+                            self._connected = True
+                            self._last_error = None
                             self._latest_frame = jpeg_frame
                             for q in list(self._listeners):
                                 if q.full():
@@ -381,10 +394,14 @@ class VideoStreamer:
                                 except asyncio.QueueFull:
                                     pass
                     finally:
+                        self._connected = False
                         await stream.async_stop()
             except asyncio.CancelledError:
+                self._connected = False
                 break
             except Exception as e:
+                self._connected = False
+                self._last_error = str(e)
                 logger.error("P2P stream error: %s. Reconnecting in %ss...", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(30, backoff * 1.5)
@@ -411,9 +428,12 @@ class VideoStreamer:
         while time.time() - start_time < timeout_seconds:
             if self._latest_frame:
                 return self._latest_frame
+            if self._last_error and time.time() - start_time > 3.0:
+                raise RuntimeError(f"Camera stream error: {self._last_error}")
             await asyncio.sleep(0.1)
 
-        raise TimeoutError("Timed out waiting for video frame from camera")
+        err_suffix = f": {self._last_error}" if self._last_error else ""
+        raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
 
     async def record_clip(
         self,
