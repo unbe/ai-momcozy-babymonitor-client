@@ -882,21 +882,30 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (isFallbackActive) return;
       isFallbackActive = true;
       console.warn('[Stream] Fallback to MJPEG triggered:', reason);
+      if (reason && typeof showToast === 'function') {
+        showToast('HEVC decoding unavailable: ' + reason + '. Switched to standard stream.', 'warn', 6000);
+      }
       cleanupWebCodecs();
-      startMjpegStream();
+      startMjpegStream(reason);
     }
 
-    function startMjpegStream() {
+    function startMjpegStream(reason) {
       streamMode = 'mjpeg';
       if (streamCanvas) streamCanvas.style.display = 'none';
       if (streamImg) {
         streamImg.style.display = 'block';
         streamImg.src = '/stream?t=' + Date.now();
       }
+      const streamBadge = document.getElementById('stream-badge');
+      if (streamBadge) {
+        streamBadge.innerText = 'LIVE STREAM (MJPEG)';
+        streamBadge.title = reason ? `Standard MJPEG stream (Fallback: ${reason})` : 'Standard MJPEG stream';
+      }
     }
 
     async function checkHevcWebCodecsSupport() {
       if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
+        console.log('[WebCodecs] VideoDecoder or EncodedVideoChunk API not present in window.');
         return null;
       }
       const codecs = [
@@ -913,11 +922,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             codedWidth: 1920,
             codedHeight: 1080
           });
+          console.log(`[WebCodecs] Codec support probe for ${c}: supported=${res && res.supported}`);
           if (res && res.supported) {
             return c;
           }
         } catch (e) {
-          // continue checking
+          console.warn(`[WebCodecs] Probe ${c} threw:`, e);
         }
       }
       return null;
@@ -930,8 +940,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       let hasKeyframe = false;
       let frameCount = 0;
+      let chunksFed = 0;
       let decoderError = false;
+      let lastPts = 0;
 
+      console.log(`[WebCodecs] Initializing VideoDecoder with codec: ${codec}`);
       try {
         activeDecoder = new VideoDecoder({
           output: (frame) => {
@@ -949,6 +962,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             if (frameCount === 0) {
               streamRetryCount = 0;
+              console.log(`[WebCodecs] First video frame rendered successfully (${streamCanvas.width}x${streamCanvas.height})`);
               if (streamCanvas) streamCanvas.style.display = 'block';
               if (streamImg) {
                 streamImg.style.display = 'none';
@@ -958,7 +972,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               const liveDot = document.getElementById('live-dot');
               if (streamBadge) {
                 streamBadge.innerText = 'LIVE STREAM (HEVC)';
-                streamBadge.title = 'Hardware-accelerated HEVC stream (WebCodecs)';
+                streamBadge.title = `Hardware-accelerated HEVC stream (${codec})`;
               }
               if (liveDot) {
                 liveDot.style.background = '#48BB78';
@@ -970,9 +984,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             frameCount++;
           },
           error: (err) => {
-            console.error('[WebCodecs] Decoder error:', err);
+            const errName = err ? (err.name || 'Error') : 'UnknownError';
+            const errMsg = err ? (err.message || String(err)) : 'Unknown decoder error';
+            const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, qSize=${activeDecoder ? activeDecoder.decodeQueueSize : 'null'}, chunksFed=${chunksFed}, framesRendered=${frameCount}, hasKeyframe=${hasKeyframe}`;
+            console.error(`[WebCodecs] Decoder error (${errName}): ${errMsg}. Details: [${diag}]`, err);
             decoderError = true;
-            fallbackToMjpeg('Hardware decoder error: ' + (err.message || err));
+            fallbackToMjpeg(`Decoder error (${errName}: ${errMsg})`);
           }
         });
 
@@ -983,19 +1000,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           optimizeForLatency: true
         });
       } catch (err) {
-        console.error('[WebCodecs] Failed configuring decoder:', err);
-        fallbackToMjpeg('Decoder configuration failed: ' + err.message);
+        const errName = err ? (err.name || 'Error') : 'UnknownError';
+        const errMsg = err ? (err.message || String(err)) : 'Configuration exception';
+        console.error(`[WebCodecs] Failed configuring decoder (${errName}): ${errMsg}`, err);
+        fallbackToMjpeg(`Decoder config failed: ${errMsg}`);
         return;
       }
 
       const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
       const wsUrl = `${wsProto}//${location.host}/ws/stream`;
+      console.log(`[WebCodecs] Connecting WebSocket to ${wsUrl}`);
       const ws = new WebSocket(wsUrl);
       ws.binaryType = 'arraybuffer';
       activeWs = ws;
 
       ws.onopen = () => {
-        console.log('[WebCodecs] Connected to /ws/stream');
+        console.log('[WebCodecs] WebSocket connected to /ws/stream');
       };
 
       ws.onmessage = (event) => {
@@ -1007,19 +1027,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (!hasKeyframe) {
           if (!isKey) return; // Wait for first keyframe
           hasKeyframe = true;
+          console.log(`[WebCodecs] Received first keyframe Access Unit (${bytes.length - 1} bytes). Feeding decoder.`);
         }
         const chunkData = bytes.subarray(1);
-        const pts = Math.round(performance.now() * 1000);
+        let pts = Math.round(performance.now() * 1000);
+        if (pts <= lastPts) {
+          pts = lastPts + 1000;
+        }
+        lastPts = pts;
         try {
           const chunk = new EncodedVideoChunk({
             type: isKey ? 'key' : 'delta',
             timestamp: pts,
             data: chunkData
           });
+          chunksFed++;
           activeDecoder.decode(chunk);
         } catch (err) {
-          console.error('[WebCodecs] Chunk decode exception:', err);
-          fallbackToMjpeg('Chunk decode exception: ' + err.message);
+          const errName = err ? (err.name || 'Error') : 'Error';
+          const errMsg = err ? (err.message || String(err)) : 'Decode enqueue failed';
+          const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, chunksFed=${chunksFed}, isKey=${isKey}, size=${chunkData.byteLength}`;
+          console.error(`[WebCodecs] Chunk decode exception (${errName}): ${errMsg}. Details: [${diag}]`, err);
+          fallbackToMjpeg(`Chunk decode exception: ${errMsg}`);
         }
       };
 

@@ -212,12 +212,16 @@ class MomcozyHevcHandler:
         self._transcoding_active = False
         self._buffer = bytearray()
         self._fu_buffer = bytearray()
+        self._fu_is_key = False
+        self._param_buffer = bytearray()
+        self._latest_vps: Optional[bytes] = None
+        self._latest_sps: Optional[bytes] = None
+        self._latest_pps: Optional[bytes] = None
         self._codec = av.CodecContext.create("hevc", "r")
         self.frame_count = 0
 
     def feed_record(self, plaintext: bytes) -> None:
         self._buffer.extend(plaintext)
-        annexb_chunk = bytearray()
 
         while True:
             sync_idx = self._buffer.find(_SYNC_MARKER)
@@ -255,6 +259,8 @@ class MomcozyHevcHandler:
             nal_hdr = payload[0]
             nal_type = (nal_hdr >> 1) & 0x3F
 
+            completed_au: Optional[tuple[bytes, bool]] = None
+
             if nal_type == 49:  # FU (Fragmentation Unit)
                 if len(payload) < 3:
                     continue
@@ -268,58 +274,126 @@ class MomcozyHevcHandler:
                     b1 = payload[1]
                     self._fu_buffer.extend([b0, b1])
                     self._fu_buffer.extend(payload[3:])
+                    self._fu_is_key = (16 <= ftype <= 21)
                 else:
-                    self._fu_buffer.extend(payload[3:])
-                if e:
-                    annexb_chunk.extend(self._fu_buffer)
+                    if self._fu_buffer:
+                        self._fu_buffer.extend(payload[3:])
+
+                if e and self._fu_buffer:
+                    nalu_bytes = bytes(self._fu_buffer)
                     self._fu_buffer = bytearray()
+                    is_key = self._fu_is_key
+                    if is_key:
+                        prefix = bytearray(self._param_buffer)
+                        self._param_buffer = bytearray()
+                        if not prefix:
+                            if self._latest_vps:
+                                prefix.extend(self._latest_vps)
+                            if self._latest_sps:
+                                prefix.extend(self._latest_sps)
+                            if self._latest_pps:
+                                prefix.extend(self._latest_pps)
+                        completed_au = (bytes(prefix + nalu_bytes), True)
+                    else:
+                        completed_au = (nalu_bytes, False)
+
             elif nal_type == 48:  # AP (Aggregation Packet)
                 ap_off = 2
                 while ap_off + 2 <= len(payload):
                     nlen = struct.unpack(">H", payload[ap_off : ap_off + 2])[0]
                     ap_off += 2
-                    annexb_chunk.extend(b"\x00\x00\x00\x01")
-                    annexb_chunk.extend(payload[ap_off : ap_off + nlen])
+                    single_nal = payload[ap_off : ap_off + nlen]
                     ap_off += nlen
-            else:  # Single NALU (VPS, SPS, PPS, IDR, etc.)
-                annexb_chunk.extend(b"\x00\x00\x00\x01")
-                annexb_chunk.extend(payload)
+                    if not single_nal:
+                        continue
+                    single_type = (single_nal[0] >> 1) & 0x3F
+                    nalu_with_start = b"\x00\x00\x00\x01" + single_nal
+                    if single_type == 32:
+                        self._latest_vps = nalu_with_start
+                    elif single_type == 33:
+                        self._latest_sps = nalu_with_start
+                    elif single_type == 34:
+                        self._latest_pps = nalu_with_start
 
-        if annexb_chunk:
-            chunk_bytes = bytes(annexb_chunk)
-            is_key = is_hevc_keyframe(chunk_bytes)
-            if self._on_hevc:
-                try:
-                    self._on_hevc(chunk_bytes, is_key)
-                except Exception as exc:
-                    logger.debug("Error in on_hevc callback: %s", exc)
+                    if single_type >= 32:
+                        self._param_buffer.extend(nalu_with_start)
+                    else:
+                        is_key = (16 <= single_type <= 21)
+                        if is_key:
+                            prefix = bytearray(self._param_buffer)
+                            self._param_buffer = bytearray()
+                            if not prefix:
+                                if self._latest_vps:
+                                    prefix.extend(self._latest_vps)
+                                if self._latest_sps:
+                                    prefix.extend(self._latest_sps)
+                                if self._latest_pps:
+                                    prefix.extend(self._latest_pps)
+                            completed_au = (bytes(prefix + nalu_with_start), True)
+                        else:
+                            completed_au = (nalu_with_start, False)
 
-            needs_transcode = True
-            if self._is_transcoding_needed is not None:
-                try:
-                    needs_transcode = bool(self._is_transcoding_needed())
-                except Exception:
-                    needs_transcode = True
+            else:  # Single NAL unit
+                nalu_with_start = b"\x00\x00\x00\x01" + payload
+                if nal_type == 32:
+                    self._latest_vps = nalu_with_start
+                elif nal_type == 33:
+                    self._latest_sps = nalu_with_start
+                elif nal_type == 34:
+                    self._latest_pps = nalu_with_start
 
-            if needs_transcode:
-                if not self._transcoding_active:
-                    if not is_key:
-                        return
-                    self._transcoding_active = True
+                if nal_type >= 32:
+                    self._param_buffer.extend(nalu_with_start)
+                else:
+                    is_key = (16 <= nal_type <= 21)
+                    if is_key:
+                        prefix = bytearray(self._param_buffer)
+                        self._param_buffer = bytearray()
+                        if not prefix:
+                            if self._latest_vps:
+                                prefix.extend(self._latest_vps)
+                            if self._latest_sps:
+                                prefix.extend(self._latest_sps)
+                            if self._latest_pps:
+                                prefix.extend(self._latest_pps)
+                        completed_au = (bytes(prefix + nalu_with_start), True)
+                    else:
+                        completed_au = (nalu_with_start, False)
 
-                try:
-                    for packet in self._codec.parse(chunk_bytes):
-                        for frame in self._codec.decode(packet):
-                            arr = frame.to_ndarray(format="bgr24")
-                            _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                            jpg_bytes = enc.tobytes()
-                            self.frame_count += 1
-                            if self._on_frame:
-                                self._on_frame(jpg_bytes)
-                except Exception as exc:
-                    logger.warning("Error decoding camera HEVC video packet: %s", exc)
-            else:
-                self._transcoding_active = False
+            if completed_au:
+                au_bytes, is_key = completed_au
+                if self._on_hevc:
+                    try:
+                        self._on_hevc(au_bytes, is_key)
+                    except Exception as exc:
+                        logger.debug("Error in on_hevc callback: %s", exc)
+
+                needs_transcode = True
+                if self._is_transcoding_needed is not None:
+                    try:
+                        needs_transcode = bool(self._is_transcoding_needed())
+                    except Exception:
+                        needs_transcode = True
+
+                if needs_transcode:
+                    if not self._transcoding_active:
+                        if not is_key:
+                            continue
+                        self._transcoding_active = True
+
+                    try:
+                        for packet in self._codec.parse(au_bytes):
+                            for frame in self._codec.decode(packet):
+                                arr = frame.to_ndarray(format="bgr24")
+                                _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                                jpg_bytes = enc.tobytes()
+                                self.frame_count += 1
+                                if self._on_frame:
+                                    self._on_frame(jpg_bytes)
+                    except Exception as exc:
+                        logger.warning("Error decoding camera HEVC video packet: %s", exc)
+                else:
+                    self._transcoding_active = False
 
 
 def _patch_tuya_stream_session() -> None:
@@ -904,9 +978,6 @@ class VideoStreamer:
                     chunks_received = 0
                     initial_timeout = 20.0
                     cadence_timeout = 10.0
-                    vps = None
-                    sps = None
-                    pps = None
 
                     try:
                         while self._running:
@@ -946,34 +1017,8 @@ class VideoStreamer:
                             self._connected = True
                             self._last_error = None
 
-                            nalus = parse_hevc_nalus(chunk)
-                            has_irap = False
-                            has_vps = False
-                            has_sps = False
-                            has_pps = False
-                            for nal_type, nalu in nalus:
-                                if nal_type == 32:
-                                    vps = nalu
-                                    has_vps = True
-                                elif nal_type == 33:
-                                    sps = nalu
-                                    has_sps = True
-                                elif nal_type == 34:
-                                    pps = nalu
-                                    has_pps = True
-                                elif nal_type in (16, 17, 18, 19, 20, 21):
-                                    has_irap = True
-
-                            if has_irap or (has_vps and has_sps):
-                                prefix = b""
-                                if not has_vps and vps:
-                                    prefix += vps
-                                if not has_sps and sps:
-                                    prefix += sps
-                                if not has_pps and pps:
-                                    prefix += pps
-                                self._latest_hevc_keyframe = prefix + chunk
-                                is_key = True
+                            if is_key:
+                                self._latest_hevc_keyframe = chunk
 
                             for q in list(self._hevc_listeners):
                                 if q.full():
@@ -1075,8 +1120,6 @@ class VideoStreamer:
     async def subscribe_hevc(self) -> AsyncIterator[tuple[bytes, bool]]:
         """Subscribe to raw HEVC Annex B chunks (chunk_bytes, is_key)."""
         queue: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=30)
-        if self._latest_hevc_keyframe and self._connected:
-            queue.put_nowait((self._latest_hevc_keyframe, True))
         self._hevc_listeners.add(queue)
         self._cancel_idle_stop()
         logger.info(
@@ -1085,9 +1128,17 @@ class VideoStreamer:
             self.device_id,
         )
         try:
+            if self._latest_hevc_keyframe and self._connected:
+                yield self._latest_hevc_keyframe, True
+
+            started = False
             while self._running:
                 try:
                     chunk, is_key = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    if not started:
+                        if not is_key:
+                            continue
+                        started = True
                     yield chunk, is_key
                 except TimeoutError:
                     if not self._running:

@@ -1228,14 +1228,14 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         )
         handler._codec = MagicMock()
 
-        # Properly formatted Tuya packet
+        # Properly formatted Tuya packet with IDR slice (type 19) to complete the Access Unit
         from momcozy.stream import _SYNC_MARKER
         import struct
-        payload = b"\x00" * 12 + b"\x40\x01\x0c\x01"
+        payload = b"\x00" * 12 + b"\x26\x01\x0c\x01"
         record = _SYNC_MARKER + b"\x00" * 8 + struct.pack("<I", 0) + struct.pack("<I", 0) + struct.pack("<I", len(payload)) + payload
         handler.feed_record(record)
 
-        # HEVC callback should have been called
+        # HEVC callback should have been called with complete Access Unit
         self.assertTrue(mock_hevc_cb.called)
         # But codec.parse should NOT have been called because transcoding was not needed!
         self.assertFalse(handler._codec.parse.called)
