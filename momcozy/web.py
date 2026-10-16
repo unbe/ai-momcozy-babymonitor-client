@@ -101,21 +101,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
     .video-overlay {
       position: absolute;
-      top: 12px;
-      left: 12px;
+      top: 10px;
+      left: 10px;
       background: rgba(0,0,0,0.6);
       color: #fff;
-      padding: 6px 12px;
-      border-radius: 20px;
-      font-size: 0.85rem;
+      padding: 4px 9px;
+      border-radius: 14px;
+      font-size: 0.75rem;
       font-weight: 600;
+      letter-spacing: 0.3px;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
     }
     .live-dot {
-      width: 8px;
-      height: 8px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
       background: #E53E3E;
       animation: pulse 1.5s infinite;
@@ -304,7 +305,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div class="video-overlay" id="video-overlay">
         <div class="live-dot" id="live-dot"></div>
         <span id="stream-badge">LIVE STREAM</span>
-        <span id="stream-transport-badge" class="transport-pill cloud">☁️ Cloud Relay</span>
       </div>
       <img id="stream-img" src="/stream" alt="Camera Stream">
       <div id="video-error" class="video-error-overlay hidden">
@@ -603,19 +603,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (d.stream_transport) {
           const stEl = document.getElementById('hdr-stream-transport');
           if (stEl) stEl.innerText = d.stream_transport;
-          const stBadge = document.getElementById('stream-transport-badge');
-          if (stBadge) {
-            if (d.stream_mode === 'local') {
-              stBadge.className = 'transport-pill local';
-              stBadge.innerText = '🏠 Local Stream';
-            } else if (d.stream_mode === 'cloud_relay') {
-              stBadge.className = 'transport-pill cloud';
-              stBadge.innerText = '☁️ Cloud Relay';
-            } else {
-              stBadge.className = 'transport-pill';
-              stBadge.innerText = d.stream_transport;
-            }
-          }
         }
 
         if (d.temperature_c !== null && d.temperature_c !== undefined) {

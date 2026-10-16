@@ -215,7 +215,7 @@ Here is the breakdown of why and how each transport channel works:
 2. **Firmware ICE Role Incompatibility:** In Tuya's P2P WebRTC/ICE implementation, taking the controlling role locally causes the camera firmware to drop sessions almost immediately (`close_reason=6`). The open-source `tuya_ipc_p2p_sdk` relies on Tuya's managed `RelaySession` (`tcpRelay` cloud endpoints), where Tuya's cloud relay handles media packet routing reliably.
 3. **Transport Transparency:** The CLI (`./momcozy.py status`) and Web Dashboard provide real-time indicators:
    - **Control:** `Local LAN (<ip>:6668)` (or `Tuya Cloud Gateway` if IP is not set)
-   - **Stream:** `Cloud Relay (Tuya P2P)` badge (with `☁️ Cloud Relay` overlay on the player)
+   - **Stream:** `Cloud Relay (Tuya P2P)` (displayed in the dashboard header and CLI status)
 
 ---
 
