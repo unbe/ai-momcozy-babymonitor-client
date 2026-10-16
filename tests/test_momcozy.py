@@ -828,6 +828,18 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             existing.write_text("{}")
             self.assertEqual(normalize_config_path(tmp_path), existing)
 
+    def test_tuya_get_device_info_session_invalid(self):
+        from unittest.mock import MagicMock
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient()
+        session = TuyaSession(sid="sid_invalid", ecode="ecode", uid="uid")
+        client.call_api = MagicMock(side_effect=RuntimeError("Tuya API smartlife.m.device.get failed [USER_SESSION_INVALID]: USER_SESSION_INVALID"))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            client.get_device_info(session, "dev123")
+        self.assertIn("USER_SESSION_INVALID", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

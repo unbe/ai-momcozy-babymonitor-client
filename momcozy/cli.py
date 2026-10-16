@@ -190,14 +190,23 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             _dps_cache["session"] = t_session
         try:
             info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
-        except Exception:
-            t_session = t_client.login_with_uid(
-                country_code=api_inst.tuya_creds.region,
-                uid=api_inst.tuya_creds.uid,
-                token=api_inst.tuya_creds.token,
-            )
-            _dps_cache["session"] = t_session
-            info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+        except Exception as exc:
+            logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
+            info = None
+
+        if info is None:
+            try:
+                t_session = t_client.login_with_uid(
+                    country_code=api_inst.tuya_creds.region,
+                    uid=api_inst.tuya_creds.uid,
+                    token=api_inst.tuya_creds.token,
+                )
+                _dps_cache["session"] = t_session
+                info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+            except Exception as exc:
+                logger.debug("Tuya session refresh failed: %s", exc)
+                info = None
+
         if isinstance(info, dict) and info.get("dps"):
             _dps_cache["dps"] = info["dps"]
             _dps_cache["ts"] = now

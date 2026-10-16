@@ -445,6 +445,9 @@ class TuyaGatewayClient:
             except Exception as exc:
                 errors.append(f"{api_name} (v{ver}): {exc}")
                 logger.debug("Tuya device info API %s (v%s) failed: %s", api_name, ver, exc)
+        if any("USER_SESSION_INVALID" in err for err in errors):
+            logger.debug("Tuya get_device_info session invalid for %s: %s", dev_id, "; ".join(errors))
+            raise RuntimeError(f"USER_SESSION_INVALID: {'; '.join(errors)}")
         if errors:
             logger.warning("Tuya get_device_info for %s failed: %s", dev_id, "; ".join(errors))
         return None
