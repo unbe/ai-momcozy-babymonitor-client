@@ -394,6 +394,26 @@ class TuyaGatewayClient:
         )
         return bool(res)
 
+    def publish_dps(
+        self,
+        session: TuyaSession,
+        dev_id: str,
+        dps: Dict[str, Any],
+    ) -> bool:
+        """Publish DataPoints (dps) to device via Tuya Cloud Gateway."""
+        formatted_dps = {str(k): v for k, v in dps.items()}
+        res = self.call_api(
+            "smartlife.m.device.dp.publish",
+            "1.0",
+            {
+                "devId": dev_id,
+                "gwId": dev_id,
+                "dps": json.dumps(formatted_dps, separators=(",", ":")),
+            },
+            session=session,
+        )
+        return bool(res)
+
     @staticmethod
     def _normalize_device_dict(dev: Dict[str, Any], home_id: Optional[int] = None) -> Dict[str, Any]:
         """Ensure top-level 'dps' is populated from 'dataPointInfo.dps' if present."""

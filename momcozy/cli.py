@@ -155,6 +155,34 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             _dps_cache["ts"] = now
         return _dps_cache["dps"]
 
+    def _publish_cloud_dps(dps_dict: dict) -> bool:
+        if not config_path.exists():
+            return False
+        api_inst = MomcozyCloudApi.load_session(config_path)
+        if not api_inst or not api_inst.tuya_creds or not api_inst.tuya_creds.token:
+            return False
+        t_client = _dps_cache["client"] or api_inst.get_tuya_client()
+        _dps_cache["client"] = t_client
+        t_session = _dps_cache["session"]
+        if t_session is None:
+            t_session = t_client.login_with_uid(
+                country_code=api_inst.tuya_creds.region,
+                uid=api_inst.tuya_creds.uid,
+                token=api_inst.tuya_creds.token,
+            )
+            _dps_cache["session"] = t_session
+        try:
+            return t_client.publish_dps(t_session, dev_id, dps_dict)
+        except Exception as exc:
+            logger.debug("Cloud publish_dps failed, refreshing session: %s", exc)
+            t_session = t_client.login_with_uid(
+                country_code=api_inst.tuya_creds.region,
+                uid=api_inst.tuya_creds.uid,
+                token=api_inst.tuya_creds.token,
+            )
+            _dps_cache["session"] = t_session
+            return t_client.publish_dps(t_session, dev_id, dps_dict)
+
     return MomcozyMonitor(
         device_id=dev_id,
         local_key=local_key or "",
@@ -167,6 +195,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         stream_tuya_token=tuya_token,
         stream_tuya_region=str(tuya_reg) if tuya_reg else None,
         cloud_dps_provider=_fetch_cloud_dps if (tuya_uid and tuya_token) else None,
+        cloud_dp_publisher=_publish_cloud_dps if (tuya_uid and tuya_token) else None,
         initial_dps=saved.get("dps") if isinstance(saved.get("dps"), dict) else None,
     )
 

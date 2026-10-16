@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
 
 import tinytuya
 
@@ -123,6 +124,7 @@ class MomcozyMonitor:
         stream_tuya_token: Optional[str] = None,
         stream_tuya_region: Optional[str] = None,
         cloud_dps_provider: Optional[Any] = None,
+        cloud_dp_publisher: Optional[Callable[[Dict[str, Any]], bool]] = None,
         initial_dps: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.device_id = device_id
@@ -140,8 +142,11 @@ class MomcozyMonitor:
         self.stream_tuya_region = stream_tuya_region
 
         self.cloud_dps_provider = cloud_dps_provider
+        self.cloud_dp_publisher = cloud_dp_publisher
         self._cached_dps: Dict[str, Any] = dict(initial_dps) if initial_dps else {}
         self._lan_tcp_unavailable: bool = False
+        self._lan_status_unsupported: bool = False
+        self._lock = threading.Lock()
 
         self._device: Optional[tinytuya.Device] = None
         self._init_local_device()
@@ -155,8 +160,9 @@ class MomcozyMonitor:
                 version=self.version,
             )
             self._device.set_socketPersistent(True)
-            self._device.set_socketTimeout(2)
+            self._device.set_socketTimeout(1.0)
             self._lan_tcp_unavailable = False
+            self._lan_status_unsupported = False
 
     def set_ip(self, ip: str) -> None:
         """Update monitor IP address."""
@@ -245,26 +251,24 @@ class MomcozyMonitor:
         dps: Dict[str, Any] = {}
         data: Dict[str, Any] = {}
 
-        if (self._device is not None or not self.cloud_dps_provider) and not self._lan_tcp_unavailable:
+        if (
+            (self._device is not None or not self.cloud_dps_provider)
+            and not self._lan_tcp_unavailable
+            and not self._lan_status_unsupported
+            and self.ip
+        ):
             try:
-                dev = self._ensure_device()
-                data = dev.status() or {}
+                with self._lock:
+                    dev = self._ensure_device()
+                    data = dev.status() or {}
                 dps = data.get("dps", {}) if isinstance(data, dict) else {}
                 if not dps:
-                    err_str = str(data.get("Error", "")) if isinstance(data, dict) else ""
-                    if "Unable to Connect" in err_str or str(data.get("Err", "")) == "901":
-                        # TCP port 6668 is closed/unreachable on IPC camera; skip version retries
-                        self._lan_tcp_unavailable = True
-                    else:
-                        for v in [3.4, 3.5, 3.3]:
-                            dev.set_version(v)
-                            data = dev.status() or {}
-                            dps = data.get("dps", {}) if isinstance(data, dict) else {}
-                            if dps:
-                                self.version = v
-                                break
+                    # BM04 IPC camera does not respond to DP_QUERY over local TCP port 6668.
+                    # Flag as unsupported so future status polls don't hang on socket timeouts.
+                    self._lan_status_unsupported = True
             except Exception as exc:
                 logger.debug("Local TCP status query failed: %s", exc)
+                self._lan_status_unsupported = True
                 data = {"Error": str(exc)}
 
         if not dps and self.cloud_dps_provider:
@@ -296,18 +300,66 @@ class MomcozyMonitor:
         status = self.get_status()
         return status.temperature_c, status.temperature_f
 
-    def set_dp(self, dp_id: int | DP, value: Any) -> Dict[str, Any]:
+    def set_dp(self, dp_id: int | DP, value: Any, nowait: bool = False) -> Dict[str, Any]:
         """Send a single DataPoint command to the camera."""
-        dev = self._ensure_device()
         dp_key = int(dp_id)
         logger.debug("Setting DP %s = %r", dp_key, value)
-        return dev.set_value(dp_key, value)
+        last_error = None
 
-    def set_dps(self, dps_dict: Dict[int | DP | str, Any]) -> Dict[str, Any]:
+        if self.ip and not self._lan_tcp_unavailable:
+            try:
+                with self._lock:
+                    dev = self._ensure_device()
+                    res = dev.set_value(dp_key, value, nowait=nowait)
+                    self._cached_dps[str(dp_key)] = value
+                    return res or {"dps": {str(dp_key): value}}
+            except Exception as exc:
+                logger.warning("Local LAN set_dp failed for DP %s: %s", dp_key, exc)
+                last_error = exc
+
+        if self.cloud_dp_publisher:
+            try:
+                ok = self.cloud_dp_publisher({str(dp_key): value})
+                if ok:
+                    self._cached_dps[str(dp_key)] = value
+                    return {"dps": {str(dp_key): value}, "cloud": True}
+            except Exception as exc:
+                logger.warning("Cloud DP publisher failed for DP %s: %s", dp_key, exc)
+                last_error = exc
+
+        if last_error:
+            raise RuntimeError(f"Failed to set DP {dp_key} on device {self.device_id}: {last_error}")
+        return {"dps": {str(dp_key): value}}
+
+    def set_dps(self, dps_dict: Dict[int | DP | str, Any], nowait: bool = False) -> Dict[str, Any]:
         """Send multiple DataPoints in a single packet."""
-        dev = self._ensure_device()
         formatted = {str(int(k)): v for k, v in dps_dict.items()}
-        return dev.set_multiple_values(formatted)
+        last_error = None
+
+        if self.ip and not self._lan_tcp_unavailable:
+            try:
+                with self._lock:
+                    dev = self._ensure_device()
+                    res = dev.set_multiple_values(formatted, nowait=nowait)
+                    self._cached_dps.update(formatted)
+                    return res or {"dps": formatted}
+            except Exception as exc:
+                logger.warning("Local LAN set_dps failed: %s", exc)
+                last_error = exc
+
+        if self.cloud_dp_publisher:
+            try:
+                ok = self.cloud_dp_publisher(formatted)
+                if ok:
+                    self._cached_dps.update(formatted)
+                    return {"dps": formatted, "cloud": True}
+            except Exception as exc:
+                logger.warning("Cloud DP publisher failed: %s", exc)
+                last_error = exc
+
+        if last_error:
+            raise RuntimeError(f"Failed to set DPS on device {self.device_id}: {last_error}")
+        return {"dps": formatted}
 
     # --- Sensor & Alert Controls ---
 
@@ -361,13 +413,13 @@ class MomcozyMonitor:
     def ptz_move(self, direction: PtzDirection | str) -> None:
         """Start pan/tilt rotation (direction: '0'=up, '2'=right, '4'=down, '6'=left)."""
         val = direction.value if isinstance(direction, PtzDirection) else str(direction)
-        self.set_dp(DP.PTZ_CONTROL, val)
+        self.set_dp(DP.PTZ_CONTROL, val, nowait=True)
 
     def ptz_stop(self) -> None:
         """Stop camera movement."""
-        self.set_dp(DP.PTZ_STOP, True)
+        self.set_dp(DP.PTZ_STOP, True, nowait=True)
 
-    def ptz_step(self, direction: PtzDirection | str, duration_seconds: float = 0.5) -> None:
+    def ptz_step(self, direction: PtzDirection | str, duration_seconds: float = 0.35) -> None:
         """Rotate camera in a direction for a short duration and then stop."""
         self.ptz_move(direction)
         time.sleep(duration_seconds)

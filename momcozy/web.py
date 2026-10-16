@@ -179,6 +179,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       transition: all 0.2s;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
     }
     .btn:hover { background: #E2E8F0; }
     .btn:active { transform: scale(0.96); }
@@ -243,13 +246,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <h2>🕹️ Camera Pan & Tilt</h2>
         <div class="ptz-grid">
           <div></div>
-          <button class="btn" onmousedown="ptz('0')" onmouseup="ptzStop()" ontouchstart="ptz('0')" ontouchend="ptzStop()">▲</button>
+          <button class="btn" onpointerdown="ptzStart(event, '0')" onpointerup="ptzEnd(event, '0')" onpointercancel="ptzEnd(event, '0')">▲</button>
           <div></div>
-          <button class="btn" onmousedown="ptz('6')" onmouseup="ptzStop()" ontouchstart="ptz('6')" ontouchend="ptzStop()">◀</button>
+          <button class="btn" onpointerdown="ptzStart(event, '6')" onpointerup="ptzEnd(event, '6')" onpointercancel="ptzEnd(event, '6')">◀</button>
           <button class="btn" onclick="ptzStop()">⏹</button>
-          <button class="btn" onmousedown="ptz('2')" onmouseup="ptzStop()" ontouchstart="ptz('2')" ontouchend="ptzStop()">▶</button>
+          <button class="btn" onpointerdown="ptzStart(event, '2')" onpointerup="ptzEnd(event, '2')" onpointercancel="ptzEnd(event, '2')">▶</button>
           <div></div>
-          <button class="btn" onmousedown="ptz('4')" onmouseup="ptzStop()" ontouchstart="ptz('4')" ontouchend="ptzStop()">▼</button>
+          <button class="btn" onpointerdown="ptzStart(event, '4')" onpointerup="ptzEnd(event, '4')" onpointercancel="ptzEnd(event, '4')">▼</button>
           <div></div>
         </div>
         <div style="text-align: center; margin-top: 8px;">
@@ -321,8 +324,39 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       } catch(e) { console.error(e); }
     }
 
+    let ptzHoldTimer = null;
+    let ptzIsHolding = false;
+
+    function ptzStart(e, dir) {
+      if (e) {
+        if (e.pointerId && e.target && e.target.setPointerCapture) {
+          try { e.target.setPointerCapture(e.pointerId); } catch(_) {}
+        }
+      }
+      ptzIsHolding = false;
+      clearTimeout(ptzHoldTimer);
+      ptzHoldTimer = setTimeout(() => {
+        ptzIsHolding = true;
+        apiPost('ptz_move', {direction: dir});
+      }, 350);
+    }
+
+    function ptzEnd(e, dir) {
+      clearTimeout(ptzHoldTimer);
+      if (ptzIsHolding) {
+        ptzIsHolding = false;
+        ptzStop();
+      } else {
+        apiPost('ptz_step', {direction: dir, duration: 0.35});
+      }
+    }
+
     function ptz(dir) { apiPost('ptz_move', {direction: dir}); }
-    function ptzStop() { apiPost('ptz_stop'); }
+    function ptzStop() {
+      clearTimeout(ptzHoldTimer);
+      ptzIsHolding = false;
+      apiPost('ptz_stop');
+    }
     function setNightVision(mode) { apiPost('night_vision', {mode}); }
     function togglePrivacy() { apiPost('toggle_privacy'); }
     function toggleLed() { apiPost('toggle_led'); }
@@ -520,7 +554,11 @@ class WebServer:
             data = await request.json()
             action = data.get("action")
 
-            if action == "ptz_move":
+            if action == "ptz_step":
+                direction = data.get("direction", "0")
+                duration = float(data.get("duration", 0.35))
+                await asyncio.to_thread(self.monitor.ptz_step, direction, duration)
+            elif action == "ptz_move":
                 direction = data.get("direction", "0")
                 await asyncio.to_thread(self.monitor.ptz_move, direction)
             elif action == "ptz_stop":

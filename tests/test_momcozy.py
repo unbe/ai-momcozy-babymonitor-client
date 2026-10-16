@@ -539,6 +539,62 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["status"], "error")
         self.assertIn("Socket timeout", body["error"])
 
+    async def test_handle_api_control_ptz_step(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        server = WebServer(monitor=mock_monitor)
+        req = make_mocked_request("POST", "/api/control")
+        req._read_bytes = b'{"action": "ptz_step", "direction": "2", "duration": 0.4}'
+
+        resp = await server.handle_api_control(req)
+        self.assertEqual(resp.status, 200)
+        import json
+        body = json.loads(resp.text)
+        self.assertEqual(body["status"], "ok")
+        mock_monitor.ptz_step.assert_called_once_with("2", 0.4)
+
+    def test_tuya_gateway_publish_dps(self):
+        from unittest.mock import MagicMock
+        from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
+
+        client = TuyaGatewayClient(region="eu")
+        client.call_api = MagicMock(return_value=True)
+        session = TuyaSession(sid="sid1", ecode="ec1", uid="uid1")
+
+        ok = client.publish_dps(session, "dev123", {"119": "0"})
+        self.assertTrue(ok)
+        client.call_api.assert_called_once()
+        api_name, ver, payload = client.call_api.call_args[0][:3]
+        self.assertEqual(api_name, "smartlife.m.device.dp.publish")
+        self.assertEqual(ver, "1.0")
+        self.assertEqual(payload["devId"], "dev123")
+        self.assertIn('"119"', payload["dps"])
+
+    def test_monitor_ptz_step_and_cloud_fallback(self):
+        from unittest.mock import MagicMock
+        from momcozy.device import MomcozyMonitor
+
+        published_dps = []
+        def mock_cloud_pub(dps):
+            published_dps.append(dps)
+            return True
+
+        monitor = MomcozyMonitor(
+            device_id="dev123",
+            local_key="key123",
+            ip=None, # No local IP -> triggers cloud fallback
+            cloud_dp_publisher=mock_cloud_pub,
+        )
+
+        monitor.ptz_step("2", duration_seconds=0.01)
+        # Should have published DP 119 ("2") and then DP 116 (True)
+        self.assertEqual(len(published_dps), 2)
+        self.assertEqual(published_dps[0], {"119": "2"})
+        self.assertEqual(published_dps[1], {"116": True})
+
     def test_momcozy_hevc_handler(self):
         import struct
         from momcozy.stream import MomcozyHevcHandler, _SYNC_MARKER
