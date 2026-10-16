@@ -455,7 +455,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div style="font-size: 0.76rem; color: var(--text-muted); margin-top: 3px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
           <span>Control: <strong id="hdr-control-transport" style="color:var(--text);">Checking...</strong> <span id="hdr-control-diag" style="color:var(--text-muted); font-size:0.7rem; display:none;"></span></span>
           <span>&bull;</span>
-          <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong> <span id="hdr-stream-format" style="font-weight:600; font-size:0.72rem; color:#48BB78;" title="Hardware-accelerated HEVC pass-through (Zero transcoding)">(HEVC Pass-through)</span></span>
+          <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong></span>
         </div>
       </div>
       <span id="conn-badge" class="badge active">Connected</span>
@@ -901,12 +901,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         streamBadge.innerText = 'LIVE STREAM (MJPEG)';
         streamBadge.title = reason ? `Standard MJPEG stream (Fallback: ${reason})` : 'Standard MJPEG stream';
       }
-      const fmtEl = document.getElementById('hdr-stream-format');
-      if (fmtEl) {
-        fmtEl.innerText = '(MJPEG Transcoded)';
-        fmtEl.style.color = '#ED8936';
-        fmtEl.title = reason ? `Standard MJPEG stream (Transcoded: ${reason})` : 'Standard MJPEG stream (Transcoded on server)';
-      }
     }
 
     async function checkHevcWebCodecsSupport() {
@@ -979,12 +973,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               if (streamBadge) {
                 streamBadge.innerText = 'LIVE STREAM (HEVC)';
                 streamBadge.title = `Hardware-accelerated HEVC stream (${codec})`;
-              }
-              const fmtEl = document.getElementById('hdr-stream-format');
-              if (fmtEl) {
-                fmtEl.innerText = '(HEVC Pass-through)';
-                fmtEl.style.color = '#48BB78';
-                fmtEl.title = `Hardware-accelerated HEVC pass-through (${codec})`;
               }
               if (liveDot) {
                 liveDot.style.background = '#48BB78';
@@ -1289,26 +1277,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (d.stream_transport) {
           const stEl = document.getElementById('hdr-stream-transport');
           if (stEl) stEl.innerText = d.stream_transport;
-        }
-        const fmtEl = document.getElementById('hdr-stream-format');
-        if (fmtEl) {
-          if (!d.stream_connected && !d.stream_running) {
-            fmtEl.innerText = '(Idle)';
-            fmtEl.style.color = 'var(--text-muted)';
-            fmtEl.title = 'Camera stream idle';
-          } else if (streamMode === 'webcodecs') {
-            fmtEl.innerText = '(HEVC Pass-through)';
-            fmtEl.style.color = '#48BB78';
-            fmtEl.title = 'Hardware-accelerated HEVC pass-through (Zero transcoding)';
-          } else if (streamMode === 'mjpeg') {
-            fmtEl.innerText = '(MJPEG Transcoded)';
-            fmtEl.style.color = '#ED8936';
-            fmtEl.title = 'Standard MJPEG stream (Transcoded from HEVC)';
-          } else if (d.stream_format) {
-            fmtEl.innerText = `(${d.stream_format})`;
-            fmtEl.style.color = d.transcoding ? '#ED8936' : '#48BB78';
-            fmtEl.title = d.stream_format;
-          }
         }
 
         if (d.temperature_c !== null && d.temperature_c !== undefined) {
