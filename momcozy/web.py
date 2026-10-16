@@ -1542,6 +1542,8 @@ class WebServer:
         else:
             self.http_port = 8420 if self.ssl_context else self.port
         self.hls: Optional[HlsTranscoder] = HlsTranscoder(streamer=self.streamer) if self.streamer else None
+        self._cached_status: Optional[Any] = None
+        self._cached_status_time: float = 0.0
         self.app = web.Application()
         self._setup_routes()
 
@@ -1896,7 +1898,13 @@ class WebServer:
             "server_http_port": self.http_port,
         }
         try:
-            status = await asyncio.to_thread(self.monitor.get_status)
+            now = time.monotonic()
+            if self._cached_status is not None and (now - self._cached_status_time) < 1.5:
+                status = self._cached_status
+            else:
+                status = await asyncio.to_thread(self.monitor.get_status)
+                self._cached_status = status
+                self._cached_status_time = now
 
             raw_cmd = getattr(status, "latest_event_cmd", "")
             latest_event_cmd = str(raw_cmd) if isinstance(raw_cmd, str) else ""

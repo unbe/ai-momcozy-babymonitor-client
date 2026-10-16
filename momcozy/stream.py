@@ -222,37 +222,38 @@ class MomcozyHevcHandler:
 
     def feed_record(self, plaintext: bytes) -> None:
         self._buffer.extend(plaintext)
+        buf = self._buffer
 
         while True:
-            sync_idx = self._buffer.find(_SYNC_MARKER)
+            sync_idx = buf.find(_SYNC_MARKER)
             if sync_idx < 0:
-                if len(self._buffer) > 7:
-                    del self._buffer[:-7]
+                if len(buf) > 7:
+                    del buf[:-7]
                 break
             if sync_idx > 0:
-                del self._buffer[:sync_idx]
+                del buf[:sync_idx]
 
-            if len(self._buffer) < 28:
+            buf_len = len(buf)
+            if buf_len < 28:
                 break
 
-            ext = struct.unpack("<I", self._buffer[16:20])[0]
+            ext = struct.unpack_from("<I", buf, 16)[0]
             hdr_len = 36 if ext == 8 else 28
-            if len(self._buffer) < hdr_len:
+            if buf_len < hdr_len:
                 break
 
-            plen = struct.unpack("<I", self._buffer[hdr_len - 4 : hdr_len])[0]
+            plen = struct.unpack_from("<I", buf, hdr_len - 4)[0]
             total_len = hdr_len + plen
-            if len(self._buffer) < total_len:
+            if buf_len < total_len:
                 break
 
-            pkt = bytes(self._buffer[:total_len])
-            del self._buffer[:total_len]
-
-            rtp_pkt = pkt[hdr_len:]
-            if len(rtp_pkt) < 12:
+            if total_len < hdr_len + 12:
+                del buf[:total_len]
                 continue
 
-            payload = rtp_pkt[12:]
+            payload = buf[hdr_len + 12 : total_len]
+            del buf[:total_len]
+
             if not payload:
                 continue
 
@@ -402,36 +403,7 @@ def _patch_tuya_stream_session() -> None:
     from tuya_ipc_p2p_sdk.crypto import decrypt_record
     from tuya_ipc_p2p_sdk.stream_session import StreamSession
     from tuya_ipc_p2p_sdk.transport.kcp_segment import parse_segment
-    from tuya_ipc_p2p_sdk.transport.relay_session import RelaySession
-
-    if getattr(StreamSession, "_momcozy_patched", False):
-        return
-
-    # 1. Patch RelaySession to intercept conversation 2 (Audio)
-    orig_route = RelaySession._route
-
-    def momcozy_relay_route(self: Any, raw: bytes) -> None:
-        seg = parse_segment(raw)
-        if seg is not None and seg.conversation == 2:
-            conv2 = self._conversation(2)
-            if not getattr(conv2, "_momcozy_audio_handler_installed", False):
-                conv2._momcozy_audio_handler_installed = True
-
-                def on_audio_record(record: bytes) -> None:
-                    session = getattr(self, "_momcozy_session", None)
-                    if session and hasattr(session, "_momcozy_audio") and session._answer_key:
-                        try:
-                            pt = decrypt_record(session._answer_key, record)
-                            session._momcozy_audio.feed_record(pt)
-                        except Exception as exc:
-                            logger.debug("Failed decrypting audio record: %s", exc)
-
-                conv2.set_message_handler(on_audio_record)
-        orig_route(self, raw)
-
-    RelaySession._route = momcozy_relay_route
-
-    # 2. Patch StreamSession to manage video and audio handlers
+    # 1. Patch StreamSession to manage video and audio handlers
     orig_init = StreamSession.__init__
 
     def momcozy_session_init(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -461,6 +433,24 @@ def _patch_tuya_stream_session() -> None:
     async def momcozy_dial_relay(self: Any, token: Any, media_key: bytes) -> Any:
         relay = await orig_dial_relay(self, token, media_key)
         relay._momcozy_session = self
+        conv2 = relay._conversation(2)
+
+        def on_audio_record(record: bytes) -> None:
+            is_needed = getattr(self, "_is_audio_needed", None)
+            if is_needed is not None:
+                try:
+                    if not is_needed():
+                        return
+                except Exception:
+                    pass
+            if hasattr(self, "_momcozy_audio") and self._answer_key:
+                try:
+                    pt = decrypt_record(self._answer_key, record)
+                    self._momcozy_audio.feed_record(pt)
+                except Exception as exc:
+                    logger.debug("Failed decrypting audio record: %s", exc)
+
+        conv2.set_message_handler(on_audio_record)
         return relay
 
     StreamSession.__init__ = momcozy_session_init
@@ -475,6 +465,7 @@ def _patch_tuya_stream_session() -> None:
         self._audio_subscribers: Set[asyncio.Queue[bytes]] = set()
         self._hevc_subscribers: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._is_transcoding_needed: Optional[Callable[[], bool]] = None
+        self._is_audio_needed: Optional[Callable[[], bool]] = None
 
     def momcozy_on_audio(self: Any, pcm: bytes) -> None:
         for subscriber in list(self._audio_subscribers):
@@ -525,6 +516,7 @@ def _patch_tuya_stream_session() -> None:
         session._on_pcm = self._on_audio
         session._on_hevc = self._on_hevc
         session._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
+        session._is_audio_needed = getattr(self, "_is_audio_needed", None)
         if hasattr(session, "_momcozy_hevc"):
             session._momcozy_hevc._on_hevc = self._on_hevc
             session._momcozy_hevc._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
@@ -588,6 +580,10 @@ def _configure_tuya_p2p_sdk() -> None:
         ]:
             if hasattr(mod, attr):
                 setattr(mod, attr, val)
+
+    import hmac
+    import tuya_ipc_p2p_sdk.crypto as sdk_crypto
+    sdk_crypto.hmac_sha1 = lambda key, message: hmac.digest(key, message, "sha1")
 
 
 def create_p2p_client(
@@ -768,6 +764,10 @@ class VideoStreamer:
         """Return True only if an active listener or pending snapshot requires JPEG transcoding."""
         return len(self._listeners) > 0 or self._snapshot_requested
 
+    def is_audio_needed(self) -> bool:
+        """Return True only if an active listener is consuming audio."""
+        return len(self._audio_listeners) > 0
+
     @property
     def last_error(self) -> Optional[str]:
         return self._last_error
@@ -908,6 +908,7 @@ class VideoStreamer:
                 ) as client:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
                     stream._is_transcoding_needed = self.is_transcoding_needed
+                    stream._is_audio_needed = self.is_audio_needed
 
                     def on_state():
                         if getattr(stream, "needs_power_cycle", False):
@@ -932,6 +933,8 @@ class VideoStreamer:
                             async for pcm in stream.async_audio():
                                 if not self._running:
                                     break
+                                if not self._audio_listeners:
+                                    continue
                                 for q in list(self._audio_listeners):
                                     if q.full():
                                         try:
@@ -957,6 +960,8 @@ class VideoStreamer:
                                 self._latest_frame = jpeg_frame
                                 if not self._latest_detection_snapshot:
                                     self.capture_detection_snapshot(trigger="Session Baseline Snapshot")
+                                if not self._listeners:
+                                    continue
                                 for q in list(self._listeners):
                                     if q.full():
                                         try:
