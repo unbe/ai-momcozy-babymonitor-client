@@ -6,6 +6,7 @@ Provides MJPEG live streaming, snapshot taking, and video recording to MP4.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import struct
@@ -32,6 +33,118 @@ from .tuya_cloud import (
 logger = logging.getLogger(__name__)
 
 _SYNC_MARKER = b"\x03\x00\x01\x00\x00\x00\x00\x00"
+_AUDIO_SYNC_MARKER = b"\x05\x00\x01\x00\x00\x00\x00\x00"
+
+
+def _alaw_to_linear(a: int) -> int:
+    """Expand one ITU-T G.711 A-law byte to signed 16-bit linear PCM."""
+    a ^= 0x55
+    t = (a & 0x0F) << 4
+    seg = (a & 0x70) >> 4
+    if seg == 0:
+        t += 8
+    else:
+        t += 0x108
+        if seg > 1:
+            t <<= (seg - 1)
+    return -t if (a & 0x80) == 0 else t
+
+
+ALAW_LUT = np.array([_alaw_to_linear(i) for i in range(256)], dtype=np.int16)
+
+
+class MomcozyAudioHandler:
+    """Reassembles and decodes BM04 8000Hz G.711 A-law audio stream into 16-bit linear PCM."""
+
+    def __init__(self, on_pcm: Any = None) -> None:
+        self._on_pcm = on_pcm
+        self.packet_count = 0
+
+    def feed_record(self, plaintext: bytes) -> None:
+        """Parse decrypted media record from conversation 2 and emit 16-bit PCM."""
+        if len(plaintext) < 48 or plaintext[:4] != b"\x05\x00\x01\x00":
+            return
+        ext = struct.unpack("<I", plaintext[16:20])[0]
+        hdr_len = 36 if ext == 8 else 28
+        if len(plaintext) < hdr_len + 12:
+            return
+        rtp_pkt = plaintext[hdr_len:]
+        payload = rtp_pkt[12:]
+        if not payload:
+            return
+        self.packet_count += 1
+        pcm_bytes = ALAW_LUT[np.frombuffer(payload, dtype=np.uint8)].tobytes()
+        if self._on_pcm:
+            self._on_pcm(pcm_bytes)
+
+
+class StreamingMp3Encoder:
+    """Encodes continuous 16-bit 8000Hz PCM stream into live MP3 (audio/mpeg) frames."""
+
+    def __init__(self, sample_rate: int = 8000, bit_rate: int = 32000) -> None:
+        try:
+            import av
+        except ImportError as e:
+            raise ImportError("Audio streaming requires 'av'. Install with pip install av") from e
+
+        self.sample_rate = sample_rate
+        self._buf = io.BytesIO()
+        self._read_pos = 0
+        self._container = av.open(self._buf, mode="w", format="mp3")
+        self._stream = self._container.add_stream("mp3", rate=sample_rate)
+        self._stream.bit_rate = bit_rate
+
+    def encode(self, pcm_bytes: bytes) -> bytes:
+        if not pcm_bytes:
+            return b""
+        import av
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = self.sample_rate
+        for packet in self._stream.encode(frame):
+            self._container.mux(packet)
+        curr = self._buf.tell()
+        self._buf.seek(self._read_pos)
+        out = self._buf.read()
+        self._read_pos = curr
+        self._buf.seek(curr)
+        return out
+
+    def flush(self) -> bytes:
+        try:
+            for packet in self._stream.encode():
+                self._container.mux(packet)
+            self._container.close()
+        except Exception:
+            pass
+        curr = self._buf.tell()
+        self._buf.seek(self._read_pos)
+        out = self._buf.read()
+        self._read_pos = curr
+        return out
+
+
+def make_wav_header(sample_rate: int = 8000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Generate 44-byte WAV header for streaming PCM (0x7FFFFFFF data size)."""
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0x7FFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        0x7FFFFFFF,
+    )
+
 
 
 class MomcozyHevcHandler:
@@ -136,18 +249,47 @@ class MomcozyHevcHandler:
 
 
 def _patch_tuya_stream_session() -> None:
-    """Monkey-patch tuya_ipc_p2p_sdk StreamSession to handle BM04 HEVC stream format."""
+    """Monkey-patch tuya_ipc_p2p_sdk to handle BM04 HEVC video and G.711 A-law audio."""
+    from tuya_ipc_p2p_sdk.camera_stream import CameraStream
     from tuya_ipc_p2p_sdk.crypto import decrypt_record
     from tuya_ipc_p2p_sdk.stream_session import StreamSession
+    from tuya_ipc_p2p_sdk.transport.kcp_segment import parse_segment
+    from tuya_ipc_p2p_sdk.transport.relay_session import RelaySession
 
     if getattr(StreamSession, "_momcozy_patched", False):
         return
 
+    # 1. Patch RelaySession to intercept conversation 2 (Audio)
+    orig_route = RelaySession._route
+
+    def momcozy_relay_route(self: Any, raw: bytes) -> None:
+        seg = parse_segment(raw)
+        if seg is not None and seg.conversation == 2:
+            conv2 = self._conversation(2)
+            if not getattr(conv2, "_momcozy_audio_handler_installed", False):
+                conv2._momcozy_audio_handler_installed = True
+
+                def on_audio_record(record: bytes) -> None:
+                    session = getattr(self, "_momcozy_session", None)
+                    if session and hasattr(session, "_momcozy_audio") and session._answer_key:
+                        try:
+                            pt = decrypt_record(session._answer_key, record)
+                            session._momcozy_audio.feed_record(pt)
+                        except Exception as exc:
+                            logger.debug("Failed decrypting audio record: %s", exc)
+
+                conv2.set_message_handler(on_audio_record)
+        orig_route(self, raw)
+
+    RelaySession._route = momcozy_relay_route
+
+    # 2. Patch StreamSession to manage video and audio handlers
     orig_init = StreamSession.__init__
 
     def momcozy_session_init(self: Any, *args: Any, **kwargs: Any) -> None:
         orig_init(self, *args, **kwargs)
         self._momcozy_hevc = MomcozyHevcHandler(self._on_frame)
+        self._momcozy_audio = MomcozyAudioHandler(getattr(self, "_on_pcm", None))
 
     def momcozy_on_media_record(self: Any, record: bytes) -> None:
         try:
@@ -162,8 +304,74 @@ def _patch_tuya_stream_session() -> None:
             except Exception as exc:
                 logger.warning("Error processing HEVC media packet: %s", exc)
 
+    orig_dial_relay = StreamSession._async_dial_relay
+
+    async def momcozy_dial_relay(self: Any, token: Any, media_key: bytes) -> Any:
+        relay = await orig_dial_relay(self, token, media_key)
+        relay._momcozy_session = self
+        return relay
+
     StreamSession.__init__ = momcozy_session_init
     StreamSession._on_media_record = momcozy_on_media_record
+    StreamSession._async_dial_relay = momcozy_dial_relay
+
+    # 3. Patch CameraStream to expose async_audio()
+    orig_cam_init = CameraStream.__init__
+
+    def momcozy_cam_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_cam_init(self, *args, **kwargs)
+        self._audio_subscribers: Set[asyncio.Queue[bytes]] = set()
+
+    def momcozy_on_audio(self: Any, pcm: bytes) -> None:
+        for subscriber in list(self._audio_subscribers):
+            if subscriber.full():
+                try:
+                    subscriber.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                subscriber.put_nowait(pcm)
+            except asyncio.QueueFull:
+                pass
+
+    orig_run_one_session = CameraStream._async_run_one_session
+
+    async def momcozy_run_one_session(self: Any) -> bool:
+        config = await self._client.async_stream_config(self._device_id, self._local_key)
+        identity = await self._client.async_mqtt_identity()
+        uid = await self._client.async_uid()
+        session = StreamSession(config, identity, uid, self._on_frame)
+        session._on_pcm = self._on_audio
+        if hasattr(session, "_momcozy_audio"):
+            session._momcozy_audio._on_pcm = self._on_audio
+        self._session = session
+        try:
+            await session.async_start()
+            self._notify_state()
+            reason = await session.async_wait_closed()
+            return session.frame_count > 0
+        finally:
+            self._session = None
+            self._last_frame_at = 0.0
+            self._first_frame.clear()
+            self._motion.reset()
+            self._notify_state()
+            await session.async_close()
+
+    async def momcozy_async_audio(self: Any) -> AsyncIterator[bytes]:
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+        self._audio_subscribers.add(queue)
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            self._audio_subscribers.discard(queue)
+
+    CameraStream.__init__ = momcozy_cam_init
+    CameraStream._on_audio = momcozy_on_audio
+    CameraStream._async_run_one_session = momcozy_run_one_session
+    CameraStream.async_audio = momcozy_async_audio
+
     StreamSession._momcozy_patched = True
 
 
@@ -330,6 +538,7 @@ class VideoStreamer:
         self._last_error: Optional[str] = None
         self._latest_frame: Optional[bytes] = None
         self._listeners: Set[asyncio.Queue[bytes]] = set()
+        self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -344,8 +553,18 @@ class VideoStreamer:
 
     @property
     def listener_count(self) -> int:
-        """Number of active client queues subscribing to the stream."""
+        """Number of active client queues subscribing to the video stream."""
         return len(self._listeners)
+
+    @property
+    def audio_listener_count(self) -> int:
+        """Number of active client queues subscribing to the audio stream."""
+        return len(self._audio_listeners)
+
+    @property
+    def total_listener_count(self) -> int:
+        """Total active listeners across video and audio."""
+        return len(self._listeners) + len(self._audio_listeners)
 
     @property
     def last_error(self) -> Optional[str]:
@@ -370,6 +589,8 @@ class VideoStreamer:
             return
         if self._idle_task and not self._idle_task.done():
             return
+        if self.total_listener_count > 0:
+            return
         try:
             loop = asyncio.get_running_loop()
             self._idle_task = loop.create_task(self._idle_stop_timer())
@@ -393,7 +614,7 @@ class VideoStreamer:
                 int(self.idle_timeout),
             )
             await asyncio.sleep(self.idle_timeout)
-            if not self._listeners and self._running:
+            if not self._listeners and not self._audio_listeners and self._running:
                 logger.info(
                     "No stream clients connected for %d minutes (%ds). Disconnecting cloud video stream to conserve resources.",
                     int(self.idle_timeout // 60),
@@ -411,7 +632,7 @@ class VideoStreamer:
             self._running = True
             self._stream_task = asyncio.create_task(self._stream_loop())
             logger.info("Video streamer started for device %s", self.device_id)
-        if not self._listeners and self.idle_timeout > 0:
+        if not self._listeners and not self._audio_listeners and self.idle_timeout > 0:
             self._schedule_idle_stop()
 
     async def stop(self) -> None:
@@ -459,8 +680,30 @@ class VideoStreamer:
 
                     stream.add_state_listener(on_state)
                     await stream.async_start()
-                    logger.info("P2P stream initiated for %s. Awaiting video frames...", self.device_id)
+                    logger.info("P2P stream initiated for %s. Awaiting media frames...", self.device_id)
                     backoff = 2
+
+                    async def audio_worker():
+                        try:
+                            async for pcm in stream.async_audio():
+                                if not self._running:
+                                    break
+                                for q in list(self._audio_listeners):
+                                    if q.full():
+                                        try:
+                                            q.get_nowait()
+                                        except asyncio.QueueEmpty:
+                                            pass
+                                    try:
+                                        q.put_nowait(pcm)
+                                    except asyncio.QueueFull:
+                                        pass
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:
+                            logger.debug("Audio consumer worker exited: %s", exc)
+
+                    audio_task = asyncio.create_task(audio_worker())
 
                     frame_iter = stream.async_frames()
                     frames_received = 0
@@ -516,6 +759,9 @@ class VideoStreamer:
                                     pass
                     finally:
                         self._connected = False
+                        audio_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await audio_task
                         await stream.async_stop()
             except asyncio.CancelledError:
                 self._connected = False
@@ -555,7 +801,53 @@ class VideoStreamer:
                 len(self._listeners),
                 self.device_id,
             )
-            if not self._listeners and self._running and self.idle_timeout > 0:
+            if not self._listeners and not self._audio_listeners and self._running and self.idle_timeout > 0:
+                self._schedule_idle_stop()
+
+    async def subscribe_audio(self, format: str = "mp3") -> AsyncIterator[bytes]:
+        """Subscribe to live audio stream from the camera microphone."""
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=150)
+        self._audio_listeners.add(queue)
+        self._cancel_idle_stop()
+        logger.info(
+            "Client subscribed to live audio stream (active listeners: %d, format: %s, device: %s)",
+            len(self._audio_listeners),
+            format,
+            self.device_id,
+        )
+        encoder = StreamingMp3Encoder(sample_rate=8000, bit_rate=32000) if format == "mp3" else None
+        try:
+            if format == "wav":
+                yield make_wav_header(sample_rate=8000, channels=1, bits_per_sample=16)
+
+            while self._running:
+                try:
+                    pcm_chunk = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    if format == "mp3" and encoder:
+                        mp3_bytes = encoder.encode(pcm_chunk)
+                        if mp3_bytes:
+                            yield mp3_bytes
+                    else:
+                        yield pcm_chunk
+                except TimeoutError:
+                    if not self._running:
+                        break
+                    continue
+        finally:
+            if format == "mp3" and encoder:
+                try:
+                    flush_bytes = encoder.flush()
+                    if flush_bytes:
+                        yield flush_bytes
+                except Exception:
+                    pass
+            self._audio_listeners.discard(queue)
+            logger.info(
+                "Client unsubscribed from live audio stream (remaining listeners: %d, device: %s)",
+                len(self._audio_listeners),
+                self.device_id,
+            )
+            if not self._listeners and not self._audio_listeners and self._running and self.idle_timeout > 0:
                 self._schedule_idle_stop()
 
     async def get_snapshot(self, timeout_seconds: float = 10.0) -> bytes:

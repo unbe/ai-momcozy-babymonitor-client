@@ -840,6 +840,139 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             client.get_device_info(session, "dev123")
         self.assertIn("USER_SESSION_INVALID", str(ctx.exception))
 
+    def test_alaw_lut_conversion(self):
+        from momcozy.stream import _alaw_to_linear, ALAW_LUT
+
+        # Verify all 256 byte mappings match precomputed LUT
+        for b in range(256):
+            self.assertEqual(_alaw_to_linear(b), int(ALAW_LUT[b]))
+
+        # In G.711 A-law with even-bit inversion (0x55), 0x55 and 0xD5 are center quant levels
+        self.assertEqual(_alaw_to_linear(0x55), -8)
+        self.assertEqual(_alaw_to_linear(0xD5), 8)
+
+    def test_make_wav_header(self):
+        import struct
+        from momcozy.stream import make_wav_header
+
+        hdr = make_wav_header(sample_rate=8000, channels=1, bits_per_sample=16)
+        self.assertEqual(len(hdr), 44)
+        self.assertTrue(hdr.startswith(b"RIFF"))
+        self.assertIn(b"WAVEfmt ", hdr)
+        self.assertIn(b"data", hdr)
+
+        # Check sample rate at offset 24
+        rate = struct.unpack("<I", hdr[24:28])[0]
+        self.assertEqual(rate, 8000)
+
+        # Check channels at offset 22
+        channels = struct.unpack("<H", hdr[22:24])[0]
+        self.assertEqual(channels, 1)
+
+    def test_momcozy_audio_handler(self):
+        import struct
+        from momcozy.stream import MomcozyAudioHandler, _AUDIO_SYNC_MARKER
+
+        received_pcm = []
+        handler = MomcozyAudioHandler(lambda pcm: received_pcm.append(pcm))
+
+        # Build mock audio record: 36-byte header, 12-byte RTP (PT 8 = PCMA), 10 bytes payload
+        header = bytearray(_AUDIO_SYNC_MARKER)  # 8 bytes
+        header.extend(b"\x00" * 8)              # 8 bytes
+        header.extend(struct.pack("<I", 8))      # ext=8
+        header.extend(b"\x00" * 12)             # 12 bytes
+        header.extend(struct.pack("<I", 12 + 10))  # plen = 22 (12 bytes RTP + 10 bytes payload)
+
+        rtp_hdr = b"\x80\x08\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01"  # PT=8 (PCMA)
+        payload = b"\x55" * 10  # 10 bytes of silence
+
+        record = bytes(header + rtp_hdr + payload)
+        handler.feed_record(record)
+
+        self.assertEqual(len(received_pcm), 1)
+        # 10 bytes of A-law -> 20 bytes of 16-bit linear PCM
+        self.assertEqual(len(received_pcm[0]), 20)
+        self.assertEqual(received_pcm[0], struct.pack("<h", -8) * 10)
+
+    def test_streaming_mp3_encoder(self):
+        from momcozy.stream import StreamingMp3Encoder
+
+        encoder = StreamingMp3Encoder(sample_rate=8000, bit_rate=32000)
+        pcm_chunk = b"\x00" * 1600  # 800 samples of 16-bit PCM = 0.1s
+        out1 = encoder.encode(pcm_chunk)
+        out2 = encoder.flush()
+        total_mp3 = out1 + out2
+        self.assertGreater(len(total_mp3), 0)
+
+    async def test_handle_audio_not_configured(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        server = WebServer(monitor=mock_monitor, streamer=None)
+        req = make_mocked_request("GET", "/audio")
+        resp = await server.handle_audio(req)
+
+        self.assertEqual(resp.status, 503)
+        self.assertIn("not configured", resp.text)
+
+    async def test_handle_audio_streaming(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+
+        async def mock_sub_audio(format="mp3"):
+            yield b"MOCK_AUDIO_DATA"
+
+        mock_streamer.subscribe_audio = mock_sub_audio
+
+        server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+
+        # Test MP3 format
+        req_mp3 = make_mocked_request("GET", "/audio?format=mp3")
+        resp_mp3 = await server.handle_audio(req_mp3)
+        self.assertEqual(resp_mp3.status, 200)
+        self.assertEqual(resp_mp3.content_type, "audio/mpeg")
+
+        # Test WAV format
+        req_wav = make_mocked_request("GET", "/audio?format=wav")
+        resp_wav = await server.handle_audio(req_wav)
+        self.assertEqual(resp_wav.status, 200)
+        self.assertEqual(resp_wav.content_type, "audio/wav")
+
+    async def test_audio_listener_idle_management(self):
+        import asyncio
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer("dev123", "localkey", idle_timeout=0.08)
+        streamer._running = True
+        streamer._connected = True
+
+        # Initially no listeners -> idle stop scheduled
+        streamer._schedule_idle_stop()
+        self.assertIsNotNone(streamer._idle_task)
+
+        # Subscribing to audio cancels idle stop
+        sub_iter = streamer.subscribe_audio(format="wav")
+        header = await sub_iter.__anext__()
+        self.assertEqual(len(header), 44)
+        self.assertEqual(streamer.audio_listener_count, 1)
+        self.assertEqual(streamer.total_listener_count, 1)
+        self.assertIsNone(streamer._idle_task)
+
+        # Closing audio subscription reschedules idle stop
+        await sub_iter.aclose()
+        self.assertEqual(streamer.audio_listener_count, 0)
+        self.assertEqual(streamer.total_listener_count, 0)
+        self.assertIsNotNone(streamer._idle_task)
+        await streamer.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

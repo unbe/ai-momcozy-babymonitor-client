@@ -120,10 +120,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       z-index: 10;
       pointer-events: none;
     }
-    .video-ctrl-btn {
+    .video-ctrls-group {
       position: absolute;
       bottom: 12px;
       right: 12px;
+      display: flex;
+      gap: 6px;
+      z-index: 10;
+    }
+    .video-ctrl-btn {
       background: rgba(0,0,0,0.65);
       backdrop-filter: blur(4px);
       -webkit-backdrop-filter: blur(4px);
@@ -138,7 +143,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       font-size: 0.72rem;
       font-weight: 600;
       transition: background 0.15s, transform 0.15s;
-      z-index: 10;
       line-height: 1;
     }
     .video-ctrl-btn:hover {
@@ -147,6 +151,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
     .video-ctrl-btn:active {
       transform: scale(0.95);
+    }
+    .video-ctrl-btn.active {
+      background: rgba(72, 187, 120, 0.75);
+      border-color: rgba(72, 187, 120, 0.9);
+      color: #fff;
     }
     /* Fullscreen styling for standard API and CSS fallback (iOS) */
     .video-card:fullscreen,
@@ -367,12 +376,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="live-dot" id="live-dot"></div>
         <span id="stream-badge">LIVE STREAM</span>
       </div>
-      <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
-        <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
-        <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
-        <span id="fs-btn-text">Fullscreen</span>
-      </button>
+      <div class="video-ctrls-group">
+        <button class="video-ctrl-btn" id="audio-btn" onclick="toggleAudio()" title="Live Audio">
+          <svg id="audio-off-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+          <svg id="audio-on-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+          <span id="audio-btn-text">Audio</span>
+        </button>
+        <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
+          <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+          <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
+          <span id="fs-btn-text">Fullscreen</span>
+        </button>
+      </div>
       <img id="stream-img" src="/stream" alt="Camera Stream">
+      <audio id="live-audio" preload="none"></audio>
       <div id="video-error" class="video-error-overlay hidden">
         <div style="font-size: 2.2rem;">⚠️</div>
         <div id="video-error-title" style="font-weight: 700; font-size: 1.05rem;">Live Stream Offline</div>
@@ -615,6 +632,63 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
       }
     });
+
+    // Live Audio streaming
+    let audioActive = false;
+    const audioElement = document.getElementById('live-audio');
+
+    async function toggleAudio() {
+      const audioBtn = document.getElementById('audio-btn');
+      const offIcon = document.getElementById('audio-off-icon');
+      const onIcon = document.getElementById('audio-on-icon');
+      const audioText = document.getElementById('audio-btn-text');
+      if (!audioElement) return;
+
+      if (!audioActive) {
+        audioElement.src = '/audio?t=' + Date.now();
+        try {
+          await audioElement.play();
+          audioActive = true;
+          if (audioBtn) audioBtn.classList.add('active');
+          if (offIcon) offIcon.style.display = 'none';
+          if (onIcon) onIcon.style.display = 'block';
+          if (audioText) audioText.innerText = 'Listening';
+          showToast('Live audio unmuted', 'info', 2000);
+        } catch (e) {
+          console.error('Audio play error:', e);
+          showToast('Audio playback failed: ' + e.message, 'error');
+        }
+      } else {
+        audioElement.pause();
+        audioElement.removeAttribute('src');
+        audioElement.load();
+        audioActive = false;
+        if (audioBtn) audioBtn.classList.remove('active');
+        if (offIcon) offIcon.style.display = 'block';
+        if (onIcon) onIcon.style.display = 'none';
+        if (audioText) audioText.innerText = 'Audio';
+        showToast('Live audio muted', 'info', 2000);
+      }
+    }
+
+    if (audioElement) {
+      audioElement.onerror = function() {
+        if (audioActive) {
+          console.warn('Audio stream error, stopping playback');
+          audioElement.pause();
+          audioActive = false;
+          const audioBtn = document.getElementById('audio-btn');
+          const offIcon = document.getElementById('audio-off-icon');
+          const onIcon = document.getElementById('audio-on-icon');
+          const audioText = document.getElementById('audio-btn-text');
+          if (audioBtn) audioBtn.classList.remove('active');
+          if (offIcon) offIcon.style.display = 'block';
+          if (onIcon) onIcon.style.display = 'none';
+          if (audioText) audioText.innerText = 'Audio';
+          showToast('Live audio disconnected', 'warn', 3000);
+        }
+      };
+    }
 
     // Stream auto-reconnection, double-click fullscreen, and error overlays
     const streamImg = document.getElementById('stream-img');
@@ -885,6 +959,7 @@ class WebServer:
         self.app.router.add_get("/", self.handle_index)
         self.app.router.add_get("/favicon.ico", self.handle_favicon)
         self.app.router.add_get("/stream", self.handle_stream)
+        self.app.router.add_get("/audio", self.handle_audio)
         self.app.router.add_get("/snapshot", self.handle_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_post("/api/control", self.handle_api_control)
@@ -952,12 +1027,65 @@ class WebServer:
                     b"Content-Length: " + str(len(frame)).encode("ascii") + b"\r\n\r\n"
                 )
                 await response.write(header + frame + b"\r\n")
-                await response.drain()
                 frames_sent += 1
         except (asyncio.CancelledError, ConnectionResetError):
             logger.info("Client %s disconnected from /stream (sent %d frames)", client_ip, frames_sent)
         except Exception as e:
             logger.warning("Client %s /stream write error: %s (sent %d frames)", client_ip, e, frames_sent)
+
+        return response
+
+    async def handle_audio(self, request: web.Request) -> web.StreamResponse:
+        """Serve live microphone audio stream (MP3 or WAV)."""
+        client_ip = request.remote or "unknown"
+        if not self.streamer:
+            logger.warning("Rejected /audio from %s: Streamer is not configured", client_ip)
+            return web.Response(
+                status=503,
+                text="Live audio stream is not configured: Missing Tuya credentials.",
+                content_type="text/plain",
+            )
+
+        fmt = request.query.get("format", "mp3").lower()
+        if fmt not in ("mp3", "wav"):
+            fmt = "mp3"
+
+        if not self.streamer.is_running:
+            logger.info("Incoming /audio request from %s: Starting streamer on demand...", client_ip)
+            try:
+                await self.streamer.start()
+            except Exception as e:
+                logger.error("Could not start streamer for /audio from %s: %s", client_ip, e)
+                return web.Response(
+                    status=502,
+                    text=f"Could not start audio stream: {e}",
+                    content_type="text/plain",
+                )
+
+        content_type = "audio/mpeg" if fmt == "mp3" else "audio/wav"
+        logger.info("Serving /audio stream (%s) to client %s", fmt, client_ip)
+        response = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": content_type,
+                "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Connection": "close",
+            },
+        )
+        await response.prepare(request)
+
+        bytes_sent = 0
+        try:
+            async for chunk in self.streamer.subscribe_audio(format=fmt):
+                await response.write(chunk)
+                bytes_sent += len(chunk)
+        except (asyncio.CancelledError, ConnectionResetError):
+            logger.info("Client %s disconnected from /audio (sent %d bytes)", client_ip, bytes_sent)
+        except Exception as e:
+            logger.warning("Client %s /audio write error: %s (sent %d bytes)", client_ip, e, bytes_sent)
 
         return response
 
@@ -991,6 +1119,9 @@ class WebServer:
         raw_lc = getattr(self.streamer, "listener_count", 0) if self.streamer else 0
         stream_listeners = int(raw_lc) if isinstance(raw_lc, (int, float)) else 0
 
+        raw_al = getattr(self.streamer, "audio_listener_count", 0) if self.streamer else 0
+        audio_listeners = int(raw_al) if isinstance(raw_al, (int, float)) else 0
+
         raw_it = getattr(self.streamer, "idle_timeout", 0.0) if self.streamer else 0.0
         stream_idle_timeout = float(raw_it) if isinstance(raw_it, (int, float)) else 0.0
 
@@ -1002,6 +1133,8 @@ class WebServer:
             "stream_running": bool(getattr(self.streamer, "is_running", False)) if self.streamer else False,
             "stream_connected": bool(getattr(self.streamer, "is_connected", False)) if self.streamer else False,
             "stream_listeners": stream_listeners,
+            "audio_available": True,
+            "audio_listeners": audio_listeners,
             "stream_idle_timeout": stream_idle_timeout,
             "stream_error": stream_error,
             "stream_mode": stream_mode,
