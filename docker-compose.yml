@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    pull_policy: build
     image: momcozy-client:latest
     container_name: momcozy-monitor
     restart: unless-stopped

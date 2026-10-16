@@ -104,8 +104,8 @@ The fastest way to deploy the web dashboard and streaming server without install
 ### 1. Using Docker Compose (Recommended)
 
 ```bash
-# Start the web dashboard and streaming server
-docker compose up -d
+# Build and start the web dashboard and streaming server
+docker compose up --build -d
 
 # Check logs
 docker compose logs -f
