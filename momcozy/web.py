@@ -14,8 +14,10 @@ from typing import Optional
 
 from aiohttp import web
 
+from .chromecast import ChromecastManager, get_local_ip
 from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection
 from .device import MomcozyMonitor
+from .hls import HlsTranscoder
 from .stream import VideoStreamer
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Momcozy BM04 Baby Monitor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
   <style>
     :root {
       --primary: #FF7E98;
@@ -155,6 +158,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .video-ctrl-btn.active {
       background: rgba(72, 187, 120, 0.75);
       border-color: rgba(72, 187, 120, 0.9);
+      color: #fff;
+    }
+    .video-ctrl-btn.casting {
+      background: rgba(66, 153, 225, 0.85);
+      border-color: rgba(66, 153, 225, 1);
       color: #fff;
     }
     /* Fullscreen styling for standard API and CSS fallback (iOS) */
@@ -382,6 +390,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <svg id="audio-on-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
           <span id="audio-btn-text">Audio</span>
         </button>
+        <button class="video-ctrl-btn" id="cast-btn" onclick="scrollToCastCard()" title="Cast to Chromecast / TV">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
+          <span id="cast-btn-text">Cast</span>
+        </button>
         <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
           <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
@@ -515,6 +527,33 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div style="display:flex; gap:8px; margin-top:12px;">
           <button class="btn" style="flex:1; font-size:0.82rem;" onclick="viewFullDetectSnapshot()">🔍 Full Size</button>
           <button class="btn primary" style="flex:1; font-size:0.82rem;" onclick="captureLiveSnapshot()">📷 Capture Now</button>
+        </div>
+      </div>
+
+      <!-- Chromecast Controls -->
+      <div class="card" id="chromecast-card">
+        <h2>📺 Chromecast / TV <span class="badge" id="cast-status-badge">Idle</span></h2>
+        <div style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 12px; line-height: 1.4;">
+          Stream live video to your TV or Google Nest Hub, or cast audio to your Google Home / Nest speakers.
+        </div>
+        <div class="control-row">
+          <span>Target Device</span>
+          <select id="cast-device-select" style="max-width: 175px;">
+            <option value="">Searching for devices...</option>
+          </select>
+        </div>
+        <div class="control-row" style="margin-top: 6px;">
+          <span>Custom Host / IP</span>
+          <input type="text" id="cast-custom-ip" placeholder="e.g. 192.168.1.50" style="padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.82rem; width: 165px;">
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap;">
+          <button class="btn primary" style="flex: 1; font-size: 0.82rem;" onclick="startChromecast('video')">📺 Cast Video</button>
+          <button class="btn" style="flex: 1; font-size: 0.82rem;" onclick="startChromecast('audio')">🔊 Cast Audio</button>
+          <button class="btn" style="font-size: 0.82rem; color: #E53E3E;" onclick="stopChromecast()">⏹️ Stop</button>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 12px; font-size: 0.75rem; color: var(--text-muted);">
+          <span id="cast-active-desc">Ready to cast</span>
+          <button class="btn" style="padding: 3px 8px; font-size: 0.72rem;" onclick="refreshChromecastDevices()">🔄 Scan Devices</button>
         </div>
       </div>
     </div>
@@ -973,8 +1012,172 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    // Google Cast framework initialization for supported browsers (Chrome, Edge, Android)
+    window['__onGCastApiAvailable'] = function(isAvailable) {
+      if (isAvailable && window.cast && window.cast.framework) {
+        try {
+          cast.framework.CastContext.getInstance().setOptions({
+            receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+            autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+          });
+          const castContext = cast.framework.CastContext.getInstance();
+          castContext.addEventListener(
+            cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
+            function(event) {
+              const session = castContext.getCurrentSession();
+              const badge = document.getElementById('cast-status-badge');
+              const castBtn = document.getElementById('cast-btn');
+              if (session) {
+                if (badge) {
+                  badge.textContent = 'Browser Cast';
+                  badge.className = 'badge active';
+                }
+                if (castBtn) castBtn.classList.add('casting');
+                const streamUrl = window.location.origin + '/hls/stream.m3u8';
+                const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegURL');
+                mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
+                mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
+                mediaInfo.metadata.title = 'Momcozy Baby Monitor Live';
+                const request = new chrome.cast.media.LoadRequest(mediaInfo);
+                session.loadMedia(request);
+              } else {
+                if (badge && !activeServerCast) {
+                  badge.textContent = 'Idle';
+                  badge.className = 'badge';
+                }
+                if (castBtn && !activeServerCast) castBtn.classList.remove('casting');
+              }
+            }
+          );
+        } catch(e) {
+          console.debug('Google Cast SDK setup notice:', e);
+        }
+      }
+    };
+
+    function scrollToCastCard() {
+      const card = document.getElementById('chromecast-card');
+      if (card) {
+        card.scrollIntoView({ behavior: 'smooth' });
+        card.style.borderColor = 'var(--primary)';
+        card.style.boxShadow = '0 0 0 3px rgba(255, 126, 152, 0.3)';
+        setTimeout(() => {
+          card.style.borderColor = 'var(--border)';
+          card.style.boxShadow = 'none';
+        }, 1500);
+      }
+      if (window.cast && window.cast.framework) {
+        try {
+          cast.framework.CastContext.getInstance().requestSession();
+        } catch(e) {}
+      }
+    }
+
+    let activeServerCast = null;
+    let knownCastDevices = [];
+    async function refreshChromecastDevices() {
+      try {
+        const res = await fetch('/api/chromecast/devices');
+        const data = await res.json();
+        const sel = document.getElementById('cast-device-select');
+        if (!sel) return;
+        sel.innerHTML = '';
+        knownCastDevices = data.devices || [];
+        if (knownCastDevices.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = data.available ? 'No devices found (enter IP below)' : 'Discovery idle (enter IP below)';
+          sel.appendChild(opt);
+        } else {
+          knownCastDevices.forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d.name;
+            opt.textContent = `${d.name} (${d.model_name}${d.host ? ' - ' + d.host : ''})`;
+            sel.appendChild(opt);
+          });
+        }
+      } catch(e) {
+        console.debug('Failed loading Chromecast devices:', e);
+      }
+    }
+
+    async function startChromecast(mediaType) {
+      const sel = document.getElementById('cast-device-select');
+      const customIp = document.getElementById('cast-custom-ip').value.trim();
+      const target = customIp || (sel ? sel.value : '');
+
+      if (!target) {
+        showToast('Please select a Chromecast or enter an IP address', 'warn');
+        return;
+      }
+
+      showToast(`Connecting to ${target} (${mediaType})...`, 'info', 3000);
+      try {
+        const res = await fetch('/api/chromecast/cast', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({target, type: mediaType})
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+          activeServerCast = target;
+          showToast(`Now casting ${mediaType} to ${data.device || target}!`, 'success', 4000);
+          const badge = document.getElementById('cast-status-badge');
+          if (badge) {
+            badge.textContent = `Casting ${mediaType}`;
+            badge.className = 'badge active';
+          }
+          const desc = document.getElementById('cast-active-desc');
+          if (desc) desc.textContent = `Streaming ${mediaType} to ${data.device || target}`;
+          const castBtn = document.getElementById('cast-btn');
+          if (castBtn) castBtn.classList.add('casting');
+        } else {
+          showToast(`Cast failed: ${data.error || 'Unknown error'}`, 'error', 5000);
+        }
+      } catch(e) {
+        showToast(`Cast error: ${e.message}`, 'error', 5000);
+      }
+    }
+
+    async function stopChromecast() {
+      const sel = document.getElementById('cast-device-select');
+      const customIp = document.getElementById('cast-custom-ip').value.trim();
+      const target = customIp || (sel ? sel.value : '');
+      if (!target) {
+        showToast('Please select a device to stop', 'warn');
+        return;
+      }
+      try {
+        const res = await fetch('/api/chromecast/stop', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({target})
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+          activeServerCast = null;
+          showToast(`Stopped casting on ${target}`, 'info', 3000);
+          const badge = document.getElementById('cast-status-badge');
+          if (badge) {
+            badge.textContent = 'Idle';
+            badge.className = 'badge';
+          }
+          const desc = document.getElementById('cast-active-desc');
+          if (desc) desc.textContent = 'Ready to cast';
+          const castBtn = document.getElementById('cast-btn');
+          if (castBtn) castBtn.classList.remove('casting');
+        } else {
+          showToast(`Stop failed: ${data.error || 'Unknown error'}`, 'error');
+        }
+      } catch(e) {
+        showToast(`Stop error: ${e.message}`, 'error');
+      }
+    }
+
     setInterval(updateStatus, 3000);
     updateStatus();
+    refreshChromecastDevices();
+    setInterval(refreshChromecastDevices, 10000);
   </script>
 </body>
 </html>
@@ -1015,6 +1218,8 @@ class WebServer:
         self.streamer = streamer
         self.host = host
         self.port = port
+        self.hls: Optional[HlsTranscoder] = HlsTranscoder(streamer=self.streamer) if self.streamer else None
+        self.chromecast = ChromecastManager(default_port=self.port)
         self.app = web.Application()
         self._setup_routes()
 
@@ -1023,11 +1228,18 @@ class WebServer:
         self.app.router.add_get("/favicon.ico", self.handle_favicon)
         self.app.router.add_get("/stream", self.handle_stream)
         self.app.router.add_get("/audio", self.handle_audio)
+        self.app.router.add_get("/audio.mp3", self.handle_audio)
+        self.app.router.add_get("/hls/stream.m3u8", self.handle_hls_playlist)
+        self.app.router.add_get("/hls/{segment}", self.handle_hls_segment)
         self.app.router.add_get("/snapshot", self.handle_snapshot)
         self.app.router.add_get("/detection_snapshot.jpg", self.handle_detection_snapshot)
         self.app.router.add_get("/api/detection_snapshot", self.handle_detection_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_post("/api/control", self.handle_api_control)
+        self.app.router.add_get("/api/chromecast/devices", self.handle_api_chromecast_devices)
+        self.app.router.add_post("/api/chromecast/cast", self.handle_api_chromecast_cast)
+        self.app.router.add_post("/api/chromecast/stop", self.handle_api_chromecast_stop)
+        self.app.router.add_get("/api/chromecast/status", self.handle_api_chromecast_status)
 
     async def handle_favicon(self, request: web.Request) -> web.Response:
         return web.Response(
@@ -1183,6 +1395,163 @@ class WebServer:
             )
         except Exception as e:
             return web.Response(status=504, text=f"Detection snapshot error: {e}")
+
+    async def handle_hls_playlist(self, request: web.Request) -> web.Response:
+        """Serve live HLS playlist (.m3u8) for Chromecast and smart displays."""
+        if not self.hls:
+            return web.Response(
+                status=503,
+                text="Live video streamer is not configured: Missing Tuya credentials.",
+                content_type="text/plain",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        if not self.hls.is_available:
+            return web.Response(
+                status=501,
+                text="FFmpeg is not installed on this host. Install FFmpeg to enable HLS streaming.",
+                content_type="text/plain",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        playlist = await self.hls.get_playlist(timeout_seconds=6.0)
+        if playlist is None:
+            return web.Response(
+                status=503,
+                text="HLS stream is starting up or unavailable. Please retry in a moment.",
+                content_type="text/plain",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        return web.Response(
+            text=playlist,
+            content_type="application/vnd.apple.mpegurl",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
+    async def handle_hls_segment(self, request: web.Request) -> web.Response:
+        """Serve live MPEG-TS HLS chunk (.ts)."""
+        if not self.hls:
+            return web.Response(status=503, text="HLS not configured", headers={"Access-Control-Allow-Origin": "*"})
+        segment_name = request.match_info.get("segment", "")
+        chunk = self.hls.get_segment(segment_name)
+        if chunk is None:
+            return web.Response(status=404, text=f"Segment {segment_name} not found", headers={"Access-Control-Allow-Origin": "*"})
+        return web.Response(
+            body=chunk,
+            content_type="video/MP2T",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    async def handle_api_chromecast_devices(self, request: web.Request) -> web.Response:
+        """List discovered Chromecast devices."""
+        devices = self.chromecast.get_devices()
+        return web.json_response({
+            "status": "ok",
+            "available": self.chromecast.is_available,
+            "devices": devices,
+            "count": len(devices),
+        }, headers={"Access-Control-Allow-Origin": "*"})
+
+    async def handle_api_chromecast_cast(self, request: web.Request) -> web.Response:
+        """Command a Chromecast to cast video (HLS) or audio (MP3)."""
+        data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+
+        target = str(data.get("target") or data.get("device") or "").strip()
+        media_type = str(data.get("type") or data.get("media") or "video").lower()
+        if media_type not in ("video", "audio"):
+            media_type = "video"
+
+        if not target:
+            return web.json_response(
+                {"status": "error", "error": "Target device name or IP is required"},
+                status=400,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Resolve host IP that the Chromecast can reach
+        host_arg = str(data.get("host_ip") or "").strip()
+        if not host_arg:
+            req_host = request.host.split(":")[0]
+            if req_host and req_host not in ("localhost", "127.0.0.1", "0.0.0.0"):
+                host_arg = req_host
+            else:
+                host_arg = get_local_ip()
+
+        if media_type == "audio":
+            media_url = f"http://{host_arg}:{self.port}/audio.mp3"
+            content_type = "audio/mp3"
+        else:
+            media_url = f"http://{host_arg}:{self.port}/hls/stream.m3u8"
+            content_type = "application/x-mpegURL"
+            # Pre-warm HLS pipeline
+            if self.hls:
+                self.hls.touch()
+                if not self.hls.is_running:
+                    asyncio.create_task(self.hls.start())
+
+        thumb_url = f"http://{host_arg}:{self.port}/detection_snapshot.jpg"
+
+        try:
+            res = await asyncio.to_thread(
+                self.chromecast.cast_media,
+                target,
+                media_url,
+                content_type=content_type,
+                title="Momcozy BM04 Baby Monitor",
+                thumb_url=thumb_url,
+                media_type=media_type,
+            )
+            return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+        except Exception as exc:
+            logger.warning("Chromecast cast error for target '%s': %s", target, exc)
+            return web.json_response(
+                {"status": "error", "error": str(exc)},
+                status=502,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+    async def handle_api_chromecast_stop(self, request: web.Request) -> web.Response:
+        """Stop Chromecast playback."""
+        data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+        target = str(data.get("target") or data.get("device") or "").strip()
+        if not target:
+            return web.json_response(
+                {"status": "error", "error": "Target device name or IP is required"},
+                status=400,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        try:
+            res = await asyncio.to_thread(self.chromecast.stop_cast, target)
+            return web.json_response(res, headers={"Access-Control-Allow-Origin": "*"})
+        except Exception as exc:
+            return web.json_response(
+                {"status": "error", "error": str(exc)},
+                status=502,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+    async def handle_api_chromecast_status(self, request: web.Request) -> web.Response:
+        """Return active cast status."""
+        return web.json_response({
+            "status": "ok",
+            "available": self.chromecast.is_available,
+            "active_casts": self.chromecast._active_casts,
+            "devices": self.chromecast.get_devices(),
+        }, headers={"Access-Control-Allow-Origin": "*"})
 
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
@@ -1383,6 +1752,9 @@ class WebServer:
             except Exception as e:
                 logger.warning("Could not auto-start live video streamer: %s", e)
 
+        # Start background Chromecast device discovery
+        self.chromecast.start_discovery()
+
         runner = web.AppRunner(self.app)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
@@ -1392,5 +1764,9 @@ class WebServer:
             while True:
                 await asyncio.sleep(3600)
         finally:
+            if self.hls:
+                await self.hls.stop()
+            self.chromecast.stop_all()
             if self.streamer:
                 await self.streamer.stop()
+            await runner.cleanup()

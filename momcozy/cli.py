@@ -593,15 +593,98 @@ def cmd_serve(args: argparse.Namespace) -> None:
         port=args.port,
     )
     print(f"\n=======================================================")
-    print(f" Momcozy BM04 Web Dashboard & MJPEG Streaming Server")
-    print(f" Dashboard:  http://{args.host}:{args.port}")
-    print(f" Live Stream: http://{args.host}:{args.port}/stream")
-    print(f" Snapshot:   http://{args.host}:{args.port}/snapshot")
+    print(f" Momcozy BM04 Web Dashboard & Live Streaming Server")
+    print(f" Dashboard:   http://{args.host}:{args.port}")
+    print(f" MJPEG Stream: http://{args.host}:{args.port}/stream")
+    print(f" Audio Stream: http://{args.host}:{args.port}/audio")
+    print(f" HLS Stream:   http://{args.host}:{args.port}/hls/stream.m3u8")
+    print(f" Snapshot:     http://{args.host}:{args.port}/snapshot")
+    print(f" Chromecast:   Supported (Web UI / Cast Web Sender / CLI)")
     print(f"=======================================================\n")
     try:
         asyncio.run(server.run())
     except KeyboardInterrupt:
         print("\nServer stopped.")
+
+
+def cmd_chromecast(args: argparse.Namespace) -> None:
+    """Discover, list, cast to, or stop Google Chromecast devices."""
+    from .chromecast import ChromecastManager, get_local_ip
+
+    mgr = ChromecastManager(default_port=getattr(args, "port", 8421))
+    if not mgr.is_available:
+        print("pychromecast is not installed. Install with: pip install pychromecast", file=sys.stderr)
+        sys.exit(1)
+
+    ip_arg = getattr(args, "ip", None)
+    if ip_arg:
+        mgr.add_known_host(ip_arg)
+
+    if getattr(args, "stop", None):
+        target = args.stop
+        print(f"Stopping Chromecast playback on '{target}'...")
+        try:
+            res = mgr.stop_cast(target)
+            print(f"✓ Cast stopped on '{res.get('device')}'")
+        except Exception as e:
+            print(f"Error stopping cast: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if getattr(args, "cast", None):
+        target = args.cast
+        media_type = (getattr(args, "type", "video") or "video").lower()
+        host_ip = getattr(args, "host_ip", None) or get_local_ip()
+        port = getattr(args, "port", 8421)
+
+        if media_type == "audio":
+            url = f"http://{host_ip}:{port}/audio.mp3"
+            content_type = "audio/mp3"
+        else:
+            url = f"http://{host_ip}:{port}/hls/stream.m3u8"
+            content_type = "application/x-mpegURL"
+
+        print(f"Connecting to Chromecast '{target}' to stream {media_type} from {url}...")
+        try:
+            res = mgr.cast_media(
+                target=target,
+                media_url=url,
+                content_type=content_type,
+                title="Momcozy BM04 Baby Monitor",
+                media_type=media_type,
+            )
+            print(f"✓ Now casting {media_type} to '{res.get('device')}' ({res.get('host')})")
+        except Exception as e:
+            print(f"Error casting: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Default: Scan and list devices
+    print("Scanning local network for Google Cast / Chromecast devices (waiting 3s)...")
+    import pychromecast
+    casts, browser = pychromecast.get_chromecasts(
+        timeout=3,
+        known_hosts=[ip_arg] if ip_arg else None,
+    )
+    pychromecast.discovery.stop_discovery(browser)
+    if not casts:
+        print("No Chromecast devices discovered on the network.")
+        print("Tip: If running across subnets or Docker, specify device IP using: momcozy chromecast --ip <DEVICE_IP>")
+        return
+
+    print(f"\nDiscovered {len(casts)} Google Cast device(s):")
+    print(f"  {'NAME':<24} {'MODEL':<22} {'IP ADDRESS':<16} {'TYPE'}")
+    print("  " + "-" * 70)
+    for c in casts:
+        host = getattr(getattr(c, "cast_info", None), "host", "unknown")
+        print(f"  {c.name:<24} {c.model_name:<22} {host:<16} {c.cast_type}")
+
+    print("\nTo cast live camera video to a Chromecast, run:")
+    print(f"  momcozy chromecast --cast \"{casts[0].name}\"")
+    print("To cast live microphone audio to a smart speaker:")
+    print(f"  momcozy chromecast --cast \"{casts[0].name}\" --type audio")
+    print("To stop casting:")
+    print(f"  momcozy chromecast --stop \"{casts[0].name}\"")
 
 
 def cmd_share(args: argparse.Namespace) -> None:
@@ -894,6 +977,22 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         help="Inactivity timeout in seconds before disconnecting cloud video stream when no clients are watching (default: 900 = 15 min, 0 to disable)",
     )
     p_serve.set_defaults(func=cmd_serve)
+
+    # chromecast / cast
+    p_chromecast = sub.add_parser(
+        "chromecast",
+        aliases=["cast"],
+        help="Discover, cast live stream to, or stop Google Chromecast",
+        description="Discover Chromecast devices on your local network, cast live camera video (HLS) or audio (MP3), or stop active casts.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_chromecast.add_argument("--cast", "-c", metavar="DEVICE", help="Chromecast device friendly name, UUID, or IP to cast to")
+    p_chromecast.add_argument("--type", "-t", choices=["video", "audio"], default="video", help="Stream type to cast ('video' for HLS, 'audio' for MP3; default: video)")
+    p_chromecast.add_argument("--stop", "-s", metavar="DEVICE", help="Stop playback on target Chromecast device")
+    p_chromecast.add_argument("--ip", help="Manual IP of a Chromecast device (useful if mDNS is blocked across subnets)")
+    p_chromecast.add_argument("--host-ip", help="Host IP of this server to give to Chromecast (default: auto-detected LAN IP)")
+    p_chromecast.add_argument("--port", "-p", type=int, default=8421, help="Web server port (default: 8421)")
+    p_chromecast.set_defaults(func=cmd_chromecast)
 
     # share
     p_share = sub.add_parser(

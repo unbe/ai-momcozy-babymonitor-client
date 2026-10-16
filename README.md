@@ -265,7 +265,7 @@ momcozy record --duration 15 -o nursery_clip.mp4
 
 ### 7. Launch Web Dashboard & Streaming Server
 
-Start the local web server hosting the live MJPEG stream and web interface:
+Start the local web server hosting the live MJPEG stream, HLS pipeline, and web interface:
 
 ```bash
 momcozy serve --host 0.0.0.0 --port 8421
@@ -274,12 +274,52 @@ momcozy serve --host 0.0.0.0 --port 8421
 Now open `http://localhost:8421` in any browser:
 - **Web Dashboard:** `http://localhost:8421/`
 - **Raw MJPEG Video Stream:** `http://localhost:8421/stream`
+- **Live Microphone Audio Stream:** `http://localhost:8421/audio` or `http://localhost:8421/audio.mp3`
+- **Live HLS Stream (Chromecast / Smart TVs):** `http://localhost:8421/hls/stream.m3u8`
 - **Snapshot Endpoint:** `http://localhost:8421/snapshot`
+- **Latest Detection Snapshot:** `http://localhost:8421/detection_snapshot.jpg`
 - **JSON Telemetry API:** `http://localhost:8421/api/status`
 - **Control API:** `POST http://localhost:8421/api/control`
-- **PTZ API:** `POST http://localhost:8421/api/ptz`
+- **Chromecast API:** `GET /api/chromecast/devices`, `POST /api/chromecast/cast`, `POST /api/chromecast/stop`
 
-### 8. Device Sharing
+### 8. Google Chromecast & Smart TV Streaming
+
+Cast your baby monitor's live camera feed or microphone audio directly to any **Google Chromecast**, **Chromecast with Google TV**, **Google Nest Hub**, or **Google Home / Nest Audio speaker**.
+
+#### A. Web UI Casting (One-Click)
+- Open the dashboard at `http://localhost:8421`.
+- The dashboard automatically scans your local Wi-Fi for Chromecast devices.
+- In the **📺 Chromecast / TV** card:
+  - Click **📺 Cast Video** to cast the live camera video stream (via HLS) to your TV or Nest Hub.
+  - Click **🔊 Cast Audio** to stream live baby nursery audio (via MP3) to a Google Home or Nest Mini speaker.
+  - Click **⏹️ Stop** anytime to end the cast session.
+- In Chrome / Edge / Brave browsers, you can also use the native **Cast button** directly on the video player overlay.
+
+#### B. Command-Line (CLI) Casting
+Discover devices on your network:
+```bash
+momcozy chromecast
+# Or: momcozy cast
+```
+
+Cast live camera video to a Chromecast by name or IP:
+```bash
+momcozy cast --device "Living Room TV"
+# Or cast directly to an IP:
+momcozy cast --device "192.168.1.100"
+```
+
+Cast live nursery audio to a smart speaker:
+```bash
+momcozy cast --device "Bedroom Speaker" --type audio
+```
+
+Stop casting on a device:
+```bash
+momcozy cast --stop "Living Room TV"
+```
+
+### 9. Device Sharing
 
 Share your baby monitor access with other Momcozy/Tuya accounts:
 
