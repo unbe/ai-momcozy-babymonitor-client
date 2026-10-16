@@ -1,0 +1,19 @@
+services:
+  momcozy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: momcozy-client:latest
+    container_name: momcozy-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount configuration file from repository root:
+      - ./.momcozy.json:/config/momcozy.json
+    environment:
+      - MOMCOZY_CONFIG=/config/momcozy.json
+      # Optional environment overrides:
+      # - MOMCOZY_PASSWORD=your_password_here
+    # For optimal local LAN device control and lowest latency on Linux:
+    # network_mode: host

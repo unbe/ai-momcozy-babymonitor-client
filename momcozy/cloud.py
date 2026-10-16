@@ -33,7 +33,16 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG_PATH = Path.home() / ".momcozy.json"
+def _resolve_default_config_path() -> Path:
+    env_cfg = os.environ.get("MOMCOZY_CONFIG")
+    if env_cfg:
+        return Path(env_cfg).resolve()
+    # Next to the main script (repo / project root)
+    script_dir = Path(__file__).resolve().parent.parent
+    return script_dir / ".momcozy.json"
+
+
+DEFAULT_CONFIG_PATH = _resolve_default_config_path()
 
 
 def hash_password(plain_password: str) -> str:

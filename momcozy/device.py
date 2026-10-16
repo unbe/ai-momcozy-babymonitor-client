@@ -203,7 +203,7 @@ class MomcozyMonitor:
                     f"Device IP for {self.device_id} was not auto-discovered on the local subnet via UDP broadcast.\n"
                     f"Please provide the monitor's local Wi-Fi IP address (e.g., from your router or DHCP leases):\n"
                     f"    ./momcozy.py status --ip <CAMERA_IP>\n"
-                    f"(Once provided with --ip, it will be automatically saved to ~/.momcozy.json)"
+                    f"(Once provided with --ip, it will be automatically saved to .momcozy.json)"
                 )
         return self._device
 

@@ -653,8 +653,8 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", help="Path to credentials file (default: ~/.momcozy.json)")
-    parser.add_argument("--device-id", help="Target device ID (overrides ~/.momcozy.json)")
+    parser.add_argument("--config", help="Path to credentials file (default: .momcozy.json next to script)")
+    parser.add_argument("--device-id", help="Target device ID (overrides .momcozy.json)")
     parser.add_argument("--local-key", help="Device local 16-character AES encryption key (overrides config)")
     parser.add_argument("--ip", help="Device IP on local Wi-Fi (overrides config)")
 
@@ -706,7 +706,7 @@ real-time temperature and baby crying detection, and a modern Web UI."""
     p_sync = sub.add_parser(
         "sync",
         help="Synchronize device encryption keys & IP from cloud",
-        description="Fetch camera local IP addresses and 16-character AES local encryption keys from Tuya Cloud, saving them to ~/.momcozy.json for local LAN control.",
+        description="Fetch camera local IP addresses and 16-character AES local encryption keys from Tuya Cloud, saving them to .momcozy.json for local LAN control.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_sync.set_defaults(func=cmd_sync)

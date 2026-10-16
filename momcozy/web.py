@@ -580,7 +580,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         // Live stream status inspection
         if (d.stream_configured === false) {
-          setStreamError('Video Stream Not Configured', 'No Tuya cloud credentials found in ~/.momcozy.json. Run "./momcozy.py login" to link your credentials.');
+          setStreamError('Video Stream Not Configured', 'No Tuya cloud credentials found in .momcozy.json. Run "./momcozy.py login" to link your credentials.');
         } else if (d.stream_error) {
           setStreamError('Video Stream Error', d.stream_error);
         } else if (d.stream_connected) {

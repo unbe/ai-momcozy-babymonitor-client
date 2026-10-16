@@ -89,7 +89,9 @@ def main():
     key = scan_for_key(device_id)
     if key:
         print(f"\n FOUND LOCAL KEY: {key}")
-        config_path = Path.home() / ".momcozy.json"
+        from .cloud import DEFAULT_CONFIG_PATH
+
+        config_path = DEFAULT_CONFIG_PATH
         if config_path.exists():
             data = json.loads(config_path.read_text())
             data["local_key"] = key

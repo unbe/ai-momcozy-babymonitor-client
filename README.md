@@ -97,6 +97,56 @@ sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 ffmpeg
 
 ---
 
+## 🐳 Docker Deployment
+
+The fastest way to deploy the web dashboard and streaming server without installing local dependencies is using Docker:
+
+### 1. Using Docker Compose (Recommended)
+
+```bash
+# Start the web dashboard and streaming server
+docker compose up -d
+
+# Check logs
+docker compose logs -f
+```
+
+The web dashboard is now live at [**http://localhost:8080**](http://localhost:8080).
+
+To authenticate from Docker or pass an existing host session:
+```bash
+# Option A: Mount your local config
+docker run -d \
+  --name momcozy-monitor \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v $(pwd)/.momcozy.json:/config/momcozy.json \
+  momcozy-client:latest
+
+# Option B: Run login interactively inside container
+docker compose run --rm momcozy login
+```
+
+### 2. Using Docker CLI
+
+```bash
+# Build the image
+docker build -t momcozy-client .
+
+# Run the streaming server
+docker run -d \
+  --name momcozy-monitor \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v $(pwd)/.momcozy.json:/config/momcozy.json \
+  momcozy-client
+
+# Run any CLI command (e.g. status)
+docker run --rm -v $(pwd)/.momcozy.json:/config/momcozy.json momcozy-client status
+```
+
+---
+
 ## 🚀 Command-Line Usage
 
 The package provides a unified CLI named `momcozy`.
@@ -107,7 +157,7 @@ Log in with your existing Momcozy mobile app account to retrieve device IDs and 
 ```bash
 momcozy login
 ```
-*Your session is safely stored in `~/.momcozy.json` for subsequent commands.*
+*Your session is safely stored in `.momcozy.json` (next to `momcozy.py`) for subsequent commands.*
 
 ### 2. View Telemetry & Status
 Read current room temperature, alarm limits, night vision, and sensor states:
