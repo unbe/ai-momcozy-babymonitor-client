@@ -419,9 +419,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <button class="btn" onclick="ptzStep('4')">▼</button>
           <div></div>
         </div>
-        <div style="text-align: center; margin-top: 8px; display: flex; justify-content: center; gap: 8px;">
+        <div style="text-align: center; margin-top: 8px;">
           <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;">📷 Snapshot</a>
-          <button class="btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">⛶ Fullscreen</button>
         </div>
       </div>
 
