@@ -1160,14 +1160,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       // 3. Cast SDK not initialized: log why and show actionable user error
       console.error("[Google Cast] Cast framework is not available.");
       if (!window.isSecureContext) {
-        const origin = window.location.origin;
-        console.error(`[Google Cast] INSECURE ORIGIN: Chrome strictly disables browser-side Cast on HTTP (${origin}).`);
-        console.error(`[Google Cast] To enable Cast in Chrome on Android / LAN:\n` +
-          `1. Open chrome://flags/#unsafely-treat-insecure-origin-as-secure in Chrome\n` +
-          `2. Enable the flag and add '${origin}' to the text field\n` +
-          `3. Relaunch Chrome\n` +
-          `OR access via HTTPS (e.g. run server with SSL).`);
-        showToast(`Google Cast requires HTTPS. Chrome blocks casting on HTTP (${origin}). Check browser console for setup.`, 'error', 8000);
+        const httpsPort = window.serverPort ? (':' + window.serverPort) : (window.location.port ? (':' + window.location.port) : '');
+        const httpsUrl = `https://${window.location.hostname}${httpsPort}/`;
+        console.error(`[Google Cast] INSECURE ORIGIN: Chrome strictly disables browser-side Cast on HTTP (${window.location.origin}).`);
+        console.error(`[Google Cast] Switch to HTTPS dashboard at: ${httpsUrl}`);
+        showToast(`Google Cast requires HTTPS. Open <a href="${httpsUrl}" style="color:#2B6CB0; text-decoration:underline; font-weight:bold;">${httpsUrl}</a> to cast.`, 'error', 12000);
       } else if (!window.cast) {
         console.error("[Google Cast] Google Cast Web SDK (cast_sender.js) did not load. Check network connection or script blockers.");
         showToast("Google Cast script could not be reached. Check network connection.", "error", 5000);
