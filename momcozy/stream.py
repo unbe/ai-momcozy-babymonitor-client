@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import struct
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional, Set
@@ -30,6 +31,128 @@ from .tuya_cloud import (
 
 logger = logging.getLogger(__name__)
 
+_SYNC_MARKER = b"\x03\x00\x01\x00\x00\x00\x00\x00"
+
+
+class MomcozyHevcHandler:
+    """Reassembles and decodes BM04 1080p HEVC video streams into JPEG frames."""
+
+    def __init__(self, on_frame: Any) -> None:
+        import av
+
+        self._on_frame = on_frame
+        self._buffer = bytearray()
+        self._fu_buffer = bytearray()
+        self._codec = av.CodecContext.create("hevc", "r")
+        self.frame_count = 0
+
+    def feed_record(self, plaintext: bytes) -> None:
+        self._buffer.extend(plaintext)
+        annexb_chunk = bytearray()
+
+        while True:
+            sync_idx = self._buffer.find(_SYNC_MARKER)
+            if sync_idx < 0:
+                if len(self._buffer) > 7:
+                    del self._buffer[:-7]
+                break
+            if sync_idx > 0:
+                del self._buffer[:sync_idx]
+
+            if len(self._buffer) < 28:
+                break
+
+            ext = struct.unpack("<I", self._buffer[16:20])[0]
+            hdr_len = 36 if ext == 8 else 28
+            if len(self._buffer) < hdr_len:
+                break
+
+            plen = struct.unpack("<I", self._buffer[hdr_len - 4 : hdr_len])[0]
+            total_len = hdr_len + plen
+            if len(self._buffer) < total_len:
+                break
+
+            pkt = bytes(self._buffer[:total_len])
+            del self._buffer[:total_len]
+
+            rtp_pkt = pkt[hdr_len:]
+            if len(rtp_pkt) < 12:
+                continue
+
+            payload = rtp_pkt[12:]
+            if not payload:
+                continue
+
+            nal_hdr = payload[0]
+            nal_type = (nal_hdr >> 1) & 0x3F
+
+            if nal_type == 49:  # FU (Fragmentation Unit)
+                if len(payload) < 3:
+                    continue
+                fu_hdr = payload[2]
+                s = bool(fu_hdr & 0x80)
+                e = bool(fu_hdr & 0x40)
+                ftype = fu_hdr & 0x3F
+                if s:
+                    self._fu_buffer = bytearray(b"\x00\x00\x00\x01")
+                    b0 = (payload[0] & 0x81) | (ftype << 1)
+                    b1 = payload[1]
+                    self._fu_buffer.extend([b0, b1])
+                    self._fu_buffer.extend(payload[3:])
+                else:
+                    self._fu_buffer.extend(payload[3:])
+                if e:
+                    annexb_chunk.extend(self._fu_buffer)
+                    self._fu_buffer = bytearray()
+            elif nal_type == 48:  # AP (Aggregation Packet)
+                ap_off = 2
+                while ap_off + 2 <= len(payload):
+                    nlen = struct.unpack(">H", payload[ap_off : ap_off + 2])[0]
+                    ap_off += 2
+                    annexb_chunk.extend(b"\x00\x00\x00\x01")
+                    annexb_chunk.extend(payload[ap_off : ap_off + nlen])
+                    ap_off += nlen
+            else:  # Single NALU (VPS, SPS, PPS, IDR, etc.)
+                annexb_chunk.extend(b"\x00\x00\x00\x01")
+                annexb_chunk.extend(payload)
+
+        if annexb_chunk:
+            for packet in self._codec.parse(bytes(annexb_chunk)):
+                for frame in self._codec.decode(packet):
+                    arr = frame.to_ndarray(format="bgr24")
+                    _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    jpg_bytes = enc.tobytes()
+                    self.frame_count += 1
+                    self._on_frame(jpg_bytes)
+
+
+def _patch_tuya_stream_session() -> None:
+    """Monkey-patch tuya_ipc_p2p_sdk StreamSession to handle BM04 HEVC stream format."""
+    from tuya_ipc_p2p_sdk.crypto import decrypt_record
+    from tuya_ipc_p2p_sdk.stream_session import StreamSession
+
+    if getattr(StreamSession, "_momcozy_patched", False):
+        return
+
+    orig_init = StreamSession.__init__
+
+    def momcozy_session_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_init(self, *args, **kwargs)
+        self._momcozy_hevc = MomcozyHevcHandler(self._on_frame)
+
+    def momcozy_on_media_record(self: Any, record: bytes) -> None:
+        try:
+            pt = decrypt_record(self._answer_key, record)
+        except Exception:
+            return
+        if hasattr(self, "_momcozy_hevc"):
+            self._momcozy_hevc.feed_record(pt)
+            self._frames = self._momcozy_hevc.frame_count
+
+    StreamSession.__init__ = momcozy_session_init
+    StreamSession._on_media_record = momcozy_on_media_record
+    StreamSession._momcozy_patched = True
+
 
 def _configure_tuya_p2p_sdk() -> None:
     """Configure tuya_ipc_p2p_sdk module constants with Momcozy OEM credentials."""
@@ -38,26 +161,20 @@ def _configure_tuya_p2p_sdk() -> None:
     import tuya_ipc_p2p_sdk.gateway.identity as sdk_gw_identity
 
     for mod in (sdk_const, sdk_gw_client, sdk_gw_identity):
-        if hasattr(mod, "PACKAGE_NAME"):
-            mod.PACKAGE_NAME = PACKAGE_NAME
-        if hasattr(mod, "CERT_SHA256"):
-            mod.CERT_SHA256 = CERT_SHA256
-        if hasattr(mod, "DERIVED_KEY"):
-            mod.DERIVED_KEY = DERIVED_KEY
-        if hasattr(mod, "APP_SECRET"):
-            mod.APP_SECRET = APP_SECRET
-        if hasattr(mod, "COMPOSITE_KEY"):
-            mod.COMPOSITE_KEY = COMPOSITE_KEY
-        if hasattr(mod, "CLIENT_ID"):
-            mod.CLIENT_ID = CLIENT_ID
-        if hasattr(mod, "CH_KEY"):
-            mod.CH_KEY = CH_KEY
-        if hasattr(mod, "APP_VERSION"):
-            mod.APP_VERSION = APP_VERSION
-        if hasattr(mod, "SDK_VERSION"):
-            mod.SDK_VERSION = SDK_VERSION
-        if hasattr(mod, "TTID"):
-            mod.TTID = TTID
+        for attr, val in [
+            ("PACKAGE_NAME", PACKAGE_NAME),
+            ("CERT_SHA256", CERT_SHA256),
+            ("DERIVED_KEY", DERIVED_KEY),
+            ("APP_SECRET", APP_SECRET),
+            ("COMPOSITE_KEY", COMPOSITE_KEY),
+            ("CLIENT_ID", CLIENT_ID),
+            ("CH_KEY", CH_KEY),
+            ("APP_VERSION", APP_VERSION),
+            ("SDK_VERSION", SDK_VERSION),
+            ("TTID", TTID),
+        ]:
+            if hasattr(mod, attr):
+                setattr(mod, attr, val)
 
 
 def create_p2p_client(
@@ -71,7 +188,9 @@ def create_p2p_client(
 ) -> Any:
     """Create a TuyaIpcP2pClient configured with Momcozy OEM gateway credentials."""
     _configure_tuya_p2p_sdk()
+    _patch_tuya_stream_session()
     from tuya_ipc_p2p_sdk import TuyaIpcP2pClient
+    from tuya_ipc_p2p_sdk.const import BROKER_PORT, broker_host
     from tuya_ipc_p2p_sdk.crypto import md5_hex
     from tuya_ipc_p2p_sdk.exceptions import (
         TuyaIpcP2pAuthenticationError,
@@ -79,12 +198,28 @@ def create_p2p_client(
     )
     from tuya_ipc_p2p_sdk.gateway.client import GatewayClient, _encrypt_password
     from tuya_ipc_p2p_sdk.json_types import require_str
-    from tuya_ipc_p2p_sdk.models import AccountSession
+    from tuya_ipc_p2p_sdk.models import AccountSession, MqttIdentity
 
     class MomcozyGatewayClient(GatewayClient):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             kwargs.setdefault("composite_key", COMPOSITE_KEY)
             super().__init__(*args, **kwargs)
+
+        def mqtt_identity(self, session: AccountSession) -> MqttIdentity:
+            app_key = CLIENT_ID
+            tail = md5_hex(md5_hex(app_key) + session.ecode)[16:32]
+            username = f"p1000018_v1_{app_key}_{CH_KEY}_mb_{session.sid}{tail}"
+            password = md5_hex(md5_hex(COMPOSITE_KEY) + session.ecode)[8:24]
+            salt = "sdkfasodifca"
+            h = md5_hex(session.uid + salt)
+            client_id = f"{PACKAGE_NAME}_mb_{session.device_fingerprint}_{h}_DEFAULT"
+            return MqttIdentity(
+                host=broker_host(self._region),
+                port=BROKER_PORT,
+                client_id=client_id,
+                username=username,
+                password=password,
+            )
 
         async def async_login(self, email_arg: str, password_arg: str, cc_arg: str) -> AccountSession:
             if tuya_uid and tuya_token:

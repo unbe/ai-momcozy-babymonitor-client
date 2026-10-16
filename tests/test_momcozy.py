@@ -539,7 +539,49 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["status"], "error")
         self.assertIn("Socket timeout", body["error"])
 
+    def test_momcozy_hevc_handler(self):
+        import struct
+        from momcozy.stream import MomcozyHevcHandler, _SYNC_MARKER
+
+        frames = []
+        handler = MomcozyHevcHandler(lambda f: frames.append(f))
+
+        # Build mock record with 36-byte header and mock RTP packet (12 bytes RTP + 1 byte NAL)
+        # ext=8, plen=13
+        header = bytearray(_SYNC_MARKER) # 8 bytes
+        header.extend(b"\x00" * 8) # 8 bytes (offset 8..15)
+        header.extend(struct.pack("<I", 8)) # offset 16..19: ext=8
+        header.extend(b"\x00" * 12) # offset 20..31: 4 res + 8 codec/dims
+        header.extend(struct.pack("<I", 13)) # offset 32..35: plen=13
+
+        # RTP header (12 bytes)
+        rtp_hdr = b"\x80\x5f\x00\x01\x00\x00\x00\x00\x00\x00\x00\x0a"
+        # NAL unit: Single NALU (e.g. VPS = 32 << 1 = 64 = 0x40)
+        nal_payload = b"\x40"
+
+        record = bytes(header + rtp_hdr + nal_payload)
+        handler.feed_record(record)
+        # Should parse RTP packet without error
+        self.assertEqual(len(handler._buffer), 0)
+
+    def test_create_p2p_client_mqtt_identity(self):
+        from momcozy.stream import create_p2p_client
+        from momcozy.tuya_cloud import CLIENT_ID, PACKAGE_NAME
+        from unittest.mock import MagicMock
+
+        client = create_p2p_client(tuya_uid="test_uid", tuya_token="test_tok", tuya_region="33")
+        mock_session = MagicMock()
+        mock_session.ecode = "ecode123"
+        mock_session.sid = "sid456"
+        mock_session.uid = "uid789"
+        mock_session.device_fingerprint = "fp000"
+
+        identity = client._gateway.mqtt_identity(mock_session)
+        self.assertIn(CLIENT_ID, identity.username)
+        self.assertIn(PACKAGE_NAME, identity.client_id)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
