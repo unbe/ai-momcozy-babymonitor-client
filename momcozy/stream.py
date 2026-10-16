@@ -300,6 +300,7 @@ class VideoStreamer:
         tuya_uid: Optional[str] = None,
         tuya_token: Optional[str] = None,
         tuya_region: Optional[str] = None,
+        idle_timeout: float = 900.0,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
@@ -310,6 +311,7 @@ class VideoStreamer:
         self.tuya_uid = tuya_uid
         self.tuya_token = tuya_token
         self.tuya_region = tuya_region
+        self.idle_timeout = float(idle_timeout)
 
         self._running = False
         self._connected = False
@@ -317,6 +319,7 @@ class VideoStreamer:
         self._latest_frame: Optional[bytes] = None
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._stream_task: Optional[asyncio.Task] = None
+        self._idle_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
     @property
@@ -326,6 +329,11 @@ class VideoStreamer:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def listener_count(self) -> int:
+        """Number of active client queues subscribing to the stream."""
+        return len(self._listeners)
 
     @property
     def last_error(self) -> Optional[str]:
@@ -345,6 +353,44 @@ class VideoStreamer:
         """Human-readable description of video stream transport."""
         return "Cloud Relay (Tuya P2P)"
 
+    def _schedule_idle_stop(self) -> None:
+        if self.idle_timeout <= 0:
+            return
+        if self._idle_task and not self._idle_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._idle_task = loop.create_task(self._idle_stop_timer())
+        except RuntimeError:
+            pass
+
+    def _cancel_idle_stop(self) -> None:
+        if self._idle_task and not self._idle_task.done():
+            try:
+                curr = asyncio.current_task()
+            except RuntimeError:
+                curr = None
+            if self._idle_task is not curr:
+                self._idle_task.cancel()
+        self._idle_task = None
+
+    async def _idle_stop_timer(self) -> None:
+        try:
+            logger.info(
+                "No stream clients connected. Starting idle timer (%ds) before disconnecting cloud stream.",
+                int(self.idle_timeout),
+            )
+            await asyncio.sleep(self.idle_timeout)
+            if not self._listeners and self._running:
+                logger.info(
+                    "No stream clients connected for %d minutes (%ds). Disconnecting cloud video stream to conserve resources.",
+                    int(self.idle_timeout // 60),
+                    int(self.idle_timeout),
+                )
+                await self.stop()
+        except asyncio.CancelledError:
+            pass
+
     async def start(self) -> None:
         """Start background streaming task."""
         async with self._lock:
@@ -353,9 +399,12 @@ class VideoStreamer:
             self._running = True
             self._stream_task = asyncio.create_task(self._stream_loop())
             logger.info("Video streamer started for device %s", self.device_id)
+        if not self._listeners and self.idle_timeout > 0:
+            self._schedule_idle_stop()
 
     async def stop(self) -> None:
         """Stop background streaming task."""
+        self._cancel_idle_stop()
         async with self._lock:
             self._running = False
             self._connected = False
@@ -422,17 +471,23 @@ class VideoStreamer:
         if self._latest_frame:
             queue.put_nowait(self._latest_frame)
         self._listeners.add(queue)
+        self._cancel_idle_stop()
         try:
             while self._running:
                 frame = await queue.get()
                 yield frame
         finally:
             self._listeners.discard(queue)
+            if not self._listeners and self._running and self.idle_timeout > 0:
+                self._schedule_idle_stop()
 
     async def get_snapshot(self, timeout_seconds: float = 10.0) -> bytes:
         """Capture a single frame as JPEG."""
         if not self._running:
             await self.start()
+        elif not self._listeners and self.idle_timeout > 0:
+            self._cancel_idle_stop()
+            self._schedule_idle_stop()
 
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:

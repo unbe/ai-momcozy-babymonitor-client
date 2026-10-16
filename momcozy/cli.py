@@ -555,6 +555,11 @@ def cmd_record(args: argparse.Namespace) -> None:
 def cmd_serve(args: argparse.Namespace) -> None:
     """Run Web Dashboard and MJPEG stream server."""
     monitor = _get_configured_device(args)
+    idle_timeout = float(
+        getattr(args, "idle_timeout", None)
+        if getattr(args, "idle_timeout", None) is not None
+        else (os.environ.get("MOMCOZY_IDLE_TIMEOUT") or 900.0)
+    )
     streamer = None
     if (monitor.stream_tuya_uid and monitor.stream_tuya_token) or (
         monitor.stream_email and monitor.stream_password
@@ -569,6 +574,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             tuya_uid=monitor.stream_tuya_uid,
             tuya_token=monitor.stream_tuya_token,
             tuya_region=monitor.stream_tuya_region,
+            idle_timeout=idle_timeout,
         )
 
     server = WebServer(
@@ -872,6 +878,12 @@ real-time temperature and baby crying detection, and a modern Web UI."""
     )
     p_serve.add_argument("--host", default="0.0.0.0", help="Network interface host IP to bind (default: 0.0.0.0, accessible on LAN)")
     p_serve.add_argument("--port", "-p", type=int, default=8421, help="TCP port to listen on (default: 8421)")
+    p_serve.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=900.0,
+        help="Inactivity timeout in seconds before disconnecting cloud video stream when no clients are watching (default: 900 = 15 min, 0 to disable)",
+    )
     p_serve.set_defaults(func=cmd_serve)
 
     # share

@@ -682,6 +682,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           liveDot.style.animation = 'pulse 1.5s infinite';
         }
       };
+
+      // Disconnect stream when page is unloaded or hidden to conserve bandwidth and trigger server idle timeout
+      window.addEventListener('beforeunload', () => {
+        if (streamImg) streamImg.src = '';
+      });
+      window.addEventListener('pagehide', () => {
+        if (streamImg) streamImg.src = '';
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          if (streamImg) streamImg.src = '';
+        } else if (document.visibilityState === 'visible') {
+          if (streamImg && !streamImg.src.includes('/stream')) {
+            streamImg.src = '/stream?t=' + Date.now();
+          }
+          updateStatus();
+        }
+      });
     }
 
     function setNightVision(mode) { apiPost('night_vision', {mode}); }
@@ -932,11 +950,22 @@ class WebServer:
         raw_cd = getattr(self.monitor, "control_diagnostic", "")
         control_diagnostic = raw_cd if isinstance(raw_cd, str) else ""
 
+        raw_lc = getattr(self.streamer, "listener_count", 0) if self.streamer else 0
+        stream_listeners = int(raw_lc) if isinstance(raw_lc, (int, float)) else 0
+
+        raw_it = getattr(self.streamer, "idle_timeout", 0.0) if self.streamer else 0.0
+        stream_idle_timeout = float(raw_it) if isinstance(raw_it, (int, float)) else 0.0
+
+        raw_le = getattr(self.streamer, "last_error", None) if self.streamer else None
+        stream_error = str(raw_le) if isinstance(raw_le, str) else None
+
         stream_info = {
             "stream_configured": self.streamer is not None,
-            "stream_running": self.streamer.is_running if self.streamer else False,
-            "stream_connected": self.streamer.is_connected if self.streamer else False,
-            "stream_error": self.streamer.last_error if self.streamer else None,
+            "stream_running": bool(getattr(self.streamer, "is_running", False)) if self.streamer else False,
+            "stream_connected": bool(getattr(self.streamer, "is_connected", False)) if self.streamer else False,
+            "stream_listeners": stream_listeners,
+            "stream_idle_timeout": stream_idle_timeout,
+            "stream_error": stream_error,
             "stream_mode": stream_mode,
             "stream_transport": stream_transport,
             "control_mode": control_mode,

@@ -641,6 +641,67 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         streamer._last_error = "Connection refused"
         self.assertEqual(streamer.last_error, "Connection refused")
 
+    async def test_video_streamer_idle_timeout(self):
+        import asyncio
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer("dev123", "localkey", idle_timeout=0.05)
+        self.assertEqual(streamer.idle_timeout, 0.05)
+        self.assertEqual(streamer.listener_count, 0)
+
+        # Start streamer with mock stream loop
+        async def mock_loop():
+            try:
+                while streamer.is_running:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pass
+
+        streamer._stream_loop = mock_loop
+        await streamer.start()
+        self.assertTrue(streamer.is_running)
+        self.assertIsNotNone(streamer._idle_task)
+
+        # Wait for the 0.05s idle timeout to fire
+        await asyncio.sleep(0.08)
+        self.assertFalse(streamer.is_running)
+        self.assertIsNone(streamer._idle_task)
+
+    async def test_video_streamer_idle_timeout_cancelled_by_listener(self):
+        import asyncio
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer("dev123", "localkey", idle_timeout=0.08)
+        streamer._running = True
+        streamer._latest_frame = b"fake_jpeg"
+
+        # When a listener subscribes, idle stop is cancelled
+        streamer._schedule_idle_stop()
+        self.assertIsNotNone(streamer._idle_task)
+
+        # Subscribing and receiving initial frame cancels idle stop
+        sub_iter = streamer.subscribe()
+        frame = await sub_iter.__anext__()
+        self.assertEqual(frame, b"fake_jpeg")
+        self.assertEqual(streamer.listener_count, 1)
+        self.assertIsNone(streamer._idle_task)
+
+        # Cleaning up listener reschedules idle stop
+        await sub_iter.aclose()
+        self.assertEqual(streamer.listener_count, 0)
+        self.assertIsNotNone(streamer._idle_task)
+        await streamer.stop()
+
+    def test_serve_idle_timeout_cli_arg(self):
+        from momcozy.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--idle-timeout", "600"])
+        self.assertEqual(args.idle_timeout, 600.0)
+
+        default_args = parser.parse_args(["serve"])
+        self.assertEqual(default_args.idle_timeout, 900.0)
+
     def test_tuya_gateway_publish_dps(self):
         from unittest.mock import MagicMock
         from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
