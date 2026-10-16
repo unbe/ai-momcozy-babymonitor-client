@@ -615,16 +615,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     });
 
-    // Stream auto-reconnection and error overlays
+    // Stream auto-reconnection, double-click fullscreen, and error overlays
     const streamImg = document.getElementById('stream-img');
     let streamRetryTimer = null;
-
-    if (streamImg) {
-      streamImg.addEventListener('dblclick', (e) => {
-        e.preventDefault();
-        toggleFullscreen();
-      });
-    }
+    let streamRetryCount = 0;
 
     function setStreamError(title, detail) {
       const streamBadge = document.getElementById('stream-badge');
@@ -661,10 +655,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       updateStatus();
     }
 
-    let streamRetryTimer = null;
-    let streamRetryCount = 0;
-
     if (streamImg) {
+      streamImg.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        toggleFullscreen();
+      });
+
       streamImg.onerror = function() {
         streamRetryCount++;
         const delay = Math.min(10, 2 * streamRetryCount);
@@ -676,6 +672,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           }, delay * 1000);
         }
       };
+
       streamImg.onload = function() {
         streamRetryCount = 0;
         const errOverlay = document.getElementById('video-error');
@@ -865,10 +862,14 @@ class WebServer:
 
     def _setup_routes(self) -> None:
         self.app.router.add_get("/", self.handle_index)
+        self.app.router.add_get("/favicon.ico", self.handle_favicon)
         self.app.router.add_get("/stream", self.handle_stream)
         self.app.router.add_get("/snapshot", self.handle_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_post("/api/control", self.handle_api_control)
+
+    async def handle_favicon(self, request: web.Request) -> web.Response:
+        return web.Response(status=204)
 
     async def handle_index(self, request: web.Request) -> web.Response:
         return web.Response(text=HTML_DASHBOARD, content_type="text/html")
