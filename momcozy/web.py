@@ -455,7 +455,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div style="font-size: 0.76rem; color: var(--text-muted); margin-top: 3px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
           <span>Control: <strong id="hdr-control-transport" style="color:var(--text);">Checking...</strong> <span id="hdr-control-diag" style="color:var(--text-muted); font-size:0.7rem; display:none;"></span></span>
           <span>&bull;</span>
-          <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong></span>
+          <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong> <span id="hdr-stream-format" style="font-weight:600; font-size:0.72rem; color:#48BB78;" title="Hardware-accelerated HEVC pass-through (Zero transcoding)">(HEVC Pass-through)</span></span>
         </div>
       </div>
       <span id="conn-badge" class="badge active">Connected</span>
@@ -901,6 +901,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         streamBadge.innerText = 'LIVE STREAM (MJPEG)';
         streamBadge.title = reason ? `Standard MJPEG stream (Fallback: ${reason})` : 'Standard MJPEG stream';
       }
+      const fmtEl = document.getElementById('hdr-stream-format');
+      if (fmtEl) {
+        fmtEl.innerText = '(MJPEG Transcoded)';
+        fmtEl.style.color = '#ED8936';
+        fmtEl.title = reason ? `Standard MJPEG stream (Transcoded: ${reason})` : 'Standard MJPEG stream (Transcoded on server)';
+      }
     }
 
     async function checkHevcWebCodecsSupport() {
@@ -973,6 +979,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               if (streamBadge) {
                 streamBadge.innerText = 'LIVE STREAM (HEVC)';
                 streamBadge.title = `Hardware-accelerated HEVC stream (${codec})`;
+              }
+              const fmtEl = document.getElementById('hdr-stream-format');
+              if (fmtEl) {
+                fmtEl.innerText = '(HEVC Pass-through)';
+                fmtEl.style.color = '#48BB78';
+                fmtEl.title = `Hardware-accelerated HEVC pass-through (${codec})`;
               }
               if (liveDot) {
                 liveDot.style.background = '#48BB78';
@@ -1231,7 +1243,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           if (errOverlay) errOverlay.classList.add('hidden');
           const streamBadge = document.getElementById('stream-badge');
           const liveDot = document.getElementById('live-dot');
-          if (streamBadge) streamBadge.innerText = 'LIVE STREAM';
+          if (streamBadge) {
+            if (streamMode === 'webcodecs') {
+              streamBadge.innerText = 'LIVE STREAM (HEVC)';
+            } else if (streamMode === 'mjpeg') {
+              streamBadge.innerText = 'LIVE STREAM (MJPEG)';
+            } else {
+              streamBadge.innerText = 'LIVE STREAM';
+            }
+          }
           if (liveDot) {
             liveDot.style.background = '#48BB78';
             liveDot.style.animation = 'pulse 1.5s infinite';
@@ -1269,6 +1289,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (d.stream_transport) {
           const stEl = document.getElementById('hdr-stream-transport');
           if (stEl) stEl.innerText = d.stream_transport;
+        }
+        const fmtEl = document.getElementById('hdr-stream-format');
+        if (fmtEl) {
+          if (!d.stream_connected && !d.stream_running) {
+            fmtEl.innerText = '(Idle)';
+            fmtEl.style.color = 'var(--text-muted)';
+            fmtEl.title = 'Camera stream idle';
+          } else if (streamMode === 'webcodecs') {
+            fmtEl.innerText = '(HEVC Pass-through)';
+            fmtEl.style.color = '#48BB78';
+            fmtEl.title = 'Hardware-accelerated HEVC pass-through (Zero transcoding)';
+          } else if (streamMode === 'mjpeg') {
+            fmtEl.innerText = '(MJPEG Transcoded)';
+            fmtEl.style.color = '#ED8936';
+            fmtEl.title = 'Standard MJPEG stream (Transcoded from HEVC)';
+          } else if (d.stream_format) {
+            fmtEl.innerText = `(${d.stream_format})`;
+            fmtEl.style.color = d.transcoding ? '#ED8936' : '#48BB78';
+            fmtEl.title = d.stream_format;
+          }
         }
 
         if (d.temperature_c !== null && d.temperature_c !== undefined) {
@@ -1869,6 +1909,17 @@ class WebServer:
             )
         )
 
+        raw_sf = getattr(self.streamer, "stream_format", "None") if self.streamer else "None"
+        stream_format = raw_sf if isinstance(raw_sf, str) else "None"
+
+        raw_tc = False
+        if self.streamer and callable(getattr(self.streamer, "is_transcoding_needed", None)):
+            try:
+                tc_val = self.streamer.is_transcoding_needed()
+                raw_tc = bool(tc_val) if isinstance(tc_val, (bool, int)) else False
+            except Exception:
+                raw_tc = False
+
         stream_info = {
             "stream_configured": self.streamer is not None,
             "stream_running": bool(getattr(self.streamer, "is_running", False)) if self.streamer else False,
@@ -1890,6 +1941,8 @@ class WebServer:
             "stream_error": stream_error,
             "stream_mode": stream_mode,
             "stream_transport": stream_transport,
+            "stream_format": stream_format,
+            "transcoding": raw_tc,
             "control_mode": control_mode,
             "control_transport": control_transport,
             "control_diagnostic": control_diagnostic,

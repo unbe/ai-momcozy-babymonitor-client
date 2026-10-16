@@ -597,6 +597,8 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["stream_error"], "Signaling error: 135")
         self.assertEqual(body["stream_mode"], "cloud_relay")
         self.assertEqual(body["stream_transport"], "Cloud Relay (Tuya P2P)")
+        self.assertEqual(body["stream_format"], "None")
+        self.assertFalse(body["transcoding"])
         self.assertEqual(body["control_mode"], "local_lan")
         self.assertEqual(body["control_transport"], "Local LAN (192.168.1.50:6668)")
 
@@ -1212,6 +1214,17 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         # Disconnect JPEG listener: False even though HEVC listener is still connected
         streamer._listeners.discard(q_jpeg)
         self.assertFalse(streamer.is_transcoding_needed())
+
+        # Test stream_format property
+        self.assertEqual(streamer.stream_format, "Idle")
+        streamer._connected = True
+        self.assertEqual(streamer.stream_format, "HEVC (Pass-through)")
+        streamer._listeners.add(q_jpeg)
+        self.assertEqual(streamer.stream_format, "MJPEG (Transcoded)")
+        streamer._listeners.discard(q_jpeg)
+        streamer._hevc_listeners.discard(q_hevc)
+        self.assertEqual(streamer.stream_format, "HEVC (Native)")
+        streamer._connected = False
 
         # Snapshot requested: True
         streamer._snapshot_requested = True

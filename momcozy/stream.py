@@ -823,6 +823,17 @@ class VideoStreamer:
         """Human-readable description of video stream transport."""
         return "Cloud Relay (Tuya P2P)"
 
+    @property
+    def stream_format(self) -> str:
+        """Format and transcoding status of the video stream."""
+        if not self._connected:
+            return "Idle"
+        if self.is_transcoding_needed():
+            return "MJPEG (Transcoded)"
+        if self._hevc_listeners:
+            return "HEVC (Pass-through)"
+        return "HEVC (Native)"
+
     def _schedule_idle_stop(self) -> None:
         if self.idle_timeout <= 0:
             return
