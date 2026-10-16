@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import socket
 import ssl
 import subprocess
 import time
@@ -32,6 +33,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <title>Momcozy BM04 Baby Monitor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
   <script>
+    window.serverLanIp = '';
+    window.serverPort = 8421;
+
     window.addEventListener('error', function(e) {
       console.error('[Window Error]', e.message, 'at', e.filename, ':', e.lineno, e.error);
     });
@@ -55,19 +59,43 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
             function(event) {
               console.log("[Google Cast] Session state changed:", event.sessionState);
-              const session = castContext.getCurrentSession();
               const castBtn = document.getElementById('cast-btn');
               const castText = document.getElementById('cast-btn-text');
-              if (session) {
-                if (castBtn) castBtn.classList.add('active');
-                if (castText) castText.innerText = 'Casting';
-                showToast('Connected to Cast device!', 'success', 3000);
-                if (typeof window.loadStreamToCastSession === 'function') {
-                  window.loadStreamToCastSession(session);
+
+              switch (event.sessionState) {
+                case cast.framework.SessionState.SESSION_STARTED:
+                case cast.framework.SessionState.SESSION_RESUMED: {
+                  if (castBtn) castBtn.classList.add('active');
+                  if (castText) castText.innerText = 'Casting';
+                  showToast('Connected to Cast device!', 'success', 3000);
+                  const session = castContext.getCurrentSession();
+                  if (session && typeof window.loadStreamToCastSession === 'function') {
+                    window.loadStreamToCastSession(session);
+                  }
+                  break;
                 }
-              } else {
-                if (castBtn) castBtn.classList.remove('active');
-                if (castText) castText.innerText = 'Cast';
+                case cast.framework.SessionState.SESSION_STARTING: {
+                  if (castBtn) castBtn.classList.remove('active');
+                  if (castText) castText.innerText = 'Connecting...';
+                  break;
+                }
+                case cast.framework.SessionState.SESSION_ENDING: {
+                  if (castBtn) castBtn.classList.remove('active');
+                  if (castText) castText.innerText = 'Disconnecting...';
+                  break;
+                }
+                case cast.framework.SessionState.SESSION_ENDED:
+                case cast.framework.SessionState.NO_SESSION: {
+                  if (castBtn) castBtn.classList.remove('active');
+                  if (castText) castText.innerText = 'Cast';
+                  break;
+                }
+                case cast.framework.SessionState.SESSION_START_FAILED: {
+                  if (castBtn) castBtn.classList.remove('active');
+                  if (castText) castText.innerText = 'Cast';
+                  showToast('Failed to connect to Cast device.', 'error', 4000);
+                  break;
+                }
               }
             }
           );
@@ -897,6 +925,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         offlineFailures = 0;
         const d = await res.json();
+        if (d.server_lan_ip) window.serverLanIp = d.server_lan_ip;
+        if (d.server_port) window.serverPort = d.server_port;
         const badge = document.getElementById('conn-badge');
         let banner = document.getElementById('status-error-banner');
 
@@ -1043,16 +1073,29 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         console.warn("[Google Cast] loadStreamToCastSession called without active session.");
         return;
       }
-      const streamUrl = window.location.origin + '/hls/stream.m3u8';
+      const state = session.getSessionState ? session.getSessionState() : null;
+      if (state && state !== cast.framework.SessionState.SESSION_STARTED && state !== cast.framework.SessionState.SESSION_RESUMED) {
+        console.log("[Google Cast] Session not ready for media load (state=" + state + ").");
+        return;
+      }
+
+      let host = window.location.host;
+      const hostname = window.location.hostname;
+      const isIp = /^(\\d{1,3}\\.){3}\\d{1,3}$/.test(hostname);
+      if (!isIp && window.serverLanIp && window.serverLanIp !== '127.0.0.1') {
+        const port = window.location.port ? (':' + window.location.port) : (window.serverPort ? (':' + window.serverPort) : '');
+        host = window.serverLanIp + port;
+      }
+      const streamUrl = `${window.location.protocol}//${host}/hls/stream.m3u8`;
       console.log("[Google Cast] Loading stream to receiver:", streamUrl);
-      const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegURL');
+
+      const mediaInfo = new chrome.cast.media.MediaInfo(streamUrl, 'application/x-mpegurl');
       mediaInfo.streamType = chrome.cast.media.StreamType.LIVE;
       mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
+      mediaInfo.metadata.metadataType = chrome.cast.media.MetadataType.GENERIC;
       mediaInfo.metadata.title = 'Momcozy BM04 Baby Monitor';
       mediaInfo.metadata.subtitle = 'Live Camera Feed';
-      if (window.location.origin) {
-        mediaInfo.metadata.images = [new chrome.cast.Image(window.location.origin + '/detection_snapshot.jpg')];
-      }
+
       const request = new chrome.cast.media.LoadRequest(mediaInfo);
       request.autoplay = true;
 
@@ -1076,6 +1119,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
 
       console.log("[Google Cast] Cast button clicked. isSecureContext:", window.isSecureContext, "googleCastInitialized:", !!window.googleCastInitialized);
+
+      // Pre-warm HLS pipeline so stream chunks are ready when TV connects
+      fetch('/hls/stream.m3u8').catch(() => {});
 
       // 1. If currently in a Cast session, clicking ends session
       if (window.googleCastInitialized && window.cast && window.cast.framework) {
@@ -1260,8 +1306,26 @@ class WebServer:
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    @staticmethod
+    def get_local_lan_ip() -> str:
+        """Determine primary local LAN IP address so LAN devices (like Chromecast) can reach the server."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
     async def handle_index(self, request: web.Request) -> web.Response:
-        return web.Response(text=HTML_DASHBOARD, content_type="text/html")
+        lan_ip = self.get_local_lan_ip()
+        html = HTML_DASHBOARD.replace(
+            "window.serverLanIp = '';",
+            f"window.serverLanIp = '{lan_ip}'; window.serverPort = {self.port};",
+            1,
+        )
+        return web.Response(text=html, content_type="text/html")
 
     async def handle_stream(self, request: web.Request) -> web.StreamResponse:
         """Serve live video as multipart/x-mixed-replace MJPEG stream."""
@@ -1523,6 +1587,8 @@ class WebServer:
             "control_mode": control_mode,
             "control_transport": control_transport,
             "control_diagnostic": control_diagnostic,
+            "server_lan_ip": self.get_local_lan_ip(),
+            "server_port": self.port,
         }
         try:
             status = await asyncio.to_thread(self.monitor.get_status)
