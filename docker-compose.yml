@@ -6,10 +6,10 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mount configuration file from repository root:
-      - ./.momcozy.json:/config/momcozy.json
+      # Mount directory so .momcozy.json is saved directly next to momcozy.py:
+      - .:/config
     environment:
-      - MOMCOZY_CONFIG=/config/momcozy.json
+      - MOMCOZY_CONFIG=/config/.momcozy.json
       # Optional environment overrides:
       # - MOMCOZY_PASSWORD=your_password_here
     # For optimal local LAN device control and lowest latency on Linux:

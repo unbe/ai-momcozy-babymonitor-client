@@ -113,18 +113,13 @@ docker compose logs -f
 
 The web dashboard is now live at [**http://localhost:8080**](http://localhost:8080).
 
-To authenticate from Docker or pass an existing host session:
+To log in and save credentials directly next to `momcozy.py`:
 ```bash
-# Option A: Mount your local config
-docker run -d \
-  --name momcozy-monitor \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  -v $(pwd)/.momcozy.json:/config/momcozy.json \
-  momcozy-client:latest
-
-# Option B: Run login interactively inside container
+# Interactive login (prompts for email and password securely):
 docker compose run --rm momcozy login
+
+# Or non-interactive login with arguments:
+docker compose run --rm momcozy login --email you@example.com --password "secret" --country US
 ```
 
 ### 2. Using Docker CLI

@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 def _resolve_default_config_path() -> Path:
     env_cfg = os.environ.get("MOMCOZY_CONFIG")
     if env_cfg:
-        return Path(env_cfg).resolve()
+        p = Path(env_cfg).resolve()
+        if p.is_dir():
+            return p / ".momcozy.json"
+        return p
     # Next to the main script (repo / project root)
     script_dir = Path(__file__).resolve().parent.parent
     return script_dir / ".momcozy.json"
