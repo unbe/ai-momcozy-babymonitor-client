@@ -1164,11 +1164,37 @@ def create_ssl_context(certfile: Optional[str] = None, keyfile: Optional[str] = 
     """Create an SSL context for HTTPS.
 
     If certfile and keyfile are omitted, automatically creates a self-signed
-    certificate in ~/.momcozy_ssl for seamless HTTPS on local networks.
+    certificate in the config directory (or ~/.momcozy_ssl) for seamless HTTPS.
     """
     if not certfile or not keyfile:
-        ssl_dir = Path.home() / ".momcozy_ssl"
-        ssl_dir.mkdir(parents=True, exist_ok=True)
+        from .cloud import DEFAULT_CONFIG_PATH
+        config_dir = DEFAULT_CONFIG_PATH.parent
+
+        # Check candidate locations for existing certificates
+        candidate_dirs = [
+            config_dir / "ssl",
+            config_dir / ".momcozy_ssl",
+            Path.home() / ".momcozy_ssl",
+        ]
+        ssl_dir = None
+        for d in candidate_dirs:
+            try:
+                if (d / "cert.pem").exists() and (d / "key.pem").exists():
+                    ssl_dir = d
+                    break
+            except Exception:
+                continue
+
+        if ssl_dir is None:
+            # Prefer config_dir/ssl if writable, fallback to home directory
+            try:
+                target_dir = config_dir / "ssl"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                ssl_dir = target_dir
+            except Exception:
+                ssl_dir = Path.home() / ".momcozy_ssl"
+                ssl_dir.mkdir(parents=True, exist_ok=True)
+
         cert_path = ssl_dir / "cert.pem"
         key_path = ssl_dir / "key.pem"
 

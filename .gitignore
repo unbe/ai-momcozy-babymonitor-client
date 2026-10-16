@@ -31,3 +31,6 @@ ENV/
 *.jpeg
 .momcozy.json
 androguard.db*
+*.pem
+ssl/
+.momcozy_ssl/
