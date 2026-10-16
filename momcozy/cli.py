@@ -586,20 +586,34 @@ def cmd_serve(args: argparse.Namespace) -> None:
             idle_timeout=idle_timeout,
         )
 
+    ssl_context = None
+    ssl_flag = getattr(args, "ssl", False) or bool(os.environ.get("MOMCOZY_SSL"))
+    ssl_cert = getattr(args, "ssl_cert", None) or os.environ.get("MOMCOZY_SSL_CERT")
+    ssl_key = getattr(args, "ssl_key", None) or os.environ.get("MOMCOZY_SSL_KEY")
+    if ssl_flag or ssl_cert or ssl_key:
+        from .web import create_ssl_context
+        try:
+            ssl_context = create_ssl_context(certfile=ssl_cert, keyfile=ssl_key)
+        except Exception as e:
+            print(f"Error configuring SSL: {e}", file=sys.stderr)
+            sys.exit(1)
+
     server = WebServer(
         monitor=monitor,
         streamer=streamer,
         host=args.host,
         port=args.port,
+        ssl_context=ssl_context,
     )
+    proto = "https" if ssl_context else "http"
     print(f"\n=======================================================")
     print(f" Momcozy BM04 Web Dashboard & Live Streaming Server")
-    print(f" Dashboard:   http://{args.host}:{args.port}")
-    print(f" MJPEG Stream: http://{args.host}:{args.port}/stream")
-    print(f" Audio Stream: http://{args.host}:{args.port}/audio")
-    print(f" HLS Stream:   http://{args.host}:{args.port}/hls/stream.m3u8")
-    print(f" Snapshot:     http://{args.host}:{args.port}/snapshot")
-    print(f" Web Casting:  Supported (Google Cast Web Sender)")
+    print(f" Dashboard:    {proto}://{args.host}:{args.port}")
+    print(f" MJPEG Stream: {proto}://{args.host}:{args.port}/stream")
+    print(f" Audio Stream: {proto}://{args.host}:{args.port}/audio")
+    print(f" HLS Stream:   {proto}://{args.host}:{args.port}/hls/stream.m3u8")
+    print(f" Snapshot:     {proto}://{args.host}:{args.port}/snapshot")
+    print(f" Web Casting:  Supported (Google Cast Web Sender in browser)")
     print(f"=======================================================\n")
     try:
         asyncio.run(server.run())
@@ -898,6 +912,9 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         default=900.0,
         help="Inactivity timeout in seconds before disconnecting cloud video stream when no clients are watching (default: 900 = 15 min, 0 to disable)",
     )
+    p_serve.add_argument("--ssl", action="store_true", help="Enable HTTPS (auto-generates a self-signed certificate if none provided)")
+    p_serve.add_argument("--ssl-cert", help="Path to custom SSL certificate PEM file for HTTPS")
+    p_serve.add_argument("--ssl-key", help="Path to custom SSL private key PEM file for HTTPS")
     p_serve.set_defaults(func=cmd_serve)
 
     # share

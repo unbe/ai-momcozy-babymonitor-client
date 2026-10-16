@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
+import ssl
+import subprocess
 import time
 from typing import Optional
 
@@ -1157,6 +1160,39 @@ BABY_FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64
 </svg>"""
 
 
+def create_ssl_context(certfile: Optional[str] = None, keyfile: Optional[str] = None) -> ssl.SSLContext:
+    """Create an SSL context for HTTPS.
+
+    If certfile and keyfile are omitted, automatically creates a self-signed
+    certificate in ~/.momcozy_ssl for seamless HTTPS on local networks.
+    """
+    if not certfile or not keyfile:
+        ssl_dir = Path.home() / ".momcozy_ssl"
+        ssl_dir.mkdir(parents=True, exist_ok=True)
+        cert_path = ssl_dir / "cert.pem"
+        key_path = ssl_dir / "key.pem"
+
+        if not cert_path.exists() or not key_path.exists():
+            logger.info("Generating self-signed SSL certificate in %s for HTTPS...", ssl_dir)
+            cmd = [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "3650", "-subj", "/CN=momcozy",
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                key_path.chmod(0o600)
+            except Exception:
+                pass
+
+        certfile = str(cert_path)
+        keyfile = str(key_path)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    return ctx
+
+
 class WebServer:
     """Embedded aiohttp server hosting the BM04 web dashboard and MJPEG stream."""
 
@@ -1166,11 +1202,13 @@ class WebServer:
         streamer: Optional[VideoStreamer] = None,
         host: str = "0.0.0.0",
         port: int = 8421,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         self.monitor = monitor
         self.streamer = streamer
         self.host = host
         self.port = port
+        self.ssl_context = ssl_context
         self.hls: Optional[HlsTranscoder] = HlsTranscoder(streamer=self.streamer) if self.streamer else None
         self.app = web.Application()
         self._setup_routes()
@@ -1596,9 +1634,10 @@ class WebServer:
 
         runner = web.AppRunner(self.app)
         await runner.setup()
-        site = web.TCPSite(runner, self.host, self.port)
+        site = web.TCPSite(runner, self.host, self.port, ssl_context=self.ssl_context)
         await site.start()
-        logger.info("Momcozy Web Dashboard running at http://%s:%d", self.host, self.port)
+        proto = "https" if self.ssl_context else "http"
+        logger.info("Momcozy Web Dashboard running at %s://%s:%d", proto, self.host, self.port)
         try:
             while True:
                 await asyncio.sleep(3600)

@@ -1094,6 +1094,14 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp_seg.body, b"TS_SEGMENT_BYTES")
         self.assertEqual(resp_seg.headers.get("Access-Control-Allow-Origin"), "*")
 
+    def test_create_ssl_context_self_signed(self):
+        import ssl
+        from momcozy.web import create_ssl_context
+
+        ctx = create_ssl_context()
+        self.assertIsInstance(ctx, ssl.SSLContext)
+
+
 if __name__ == "__main__":
     unittest.main()
 
