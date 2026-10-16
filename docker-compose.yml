@@ -4,7 +4,7 @@ services:
     container_name: momcozy-monitor
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8421:8421"
     volumes:
       # Mount single config file (ensure `touch .momcozy.json` exists before running)
       - ./.momcozy.json:/config/.momcozy.json

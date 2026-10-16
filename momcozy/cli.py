@@ -423,9 +423,10 @@ def cmd_ptz(args: argparse.Namespace) -> None:
         monitor.ptz_stop()
         print("✓ Camera PTZ stopped")
     elif action in dir_map:
-        if args.duration and args.duration > 0:
-            monitor.ptz_step(dir_map[action], duration_seconds=args.duration)
-            print(f"✓ Panned {action} for {args.duration}s")
+        dur = args.duration if args.duration is not None else 0.175
+        if dur > 0:
+            monitor.ptz_step(dir_map[action], duration_seconds=dur)
+            print(f"✓ Moved {action} for {dur}s")
         else:
             monitor.ptz_move(dir_map[action])
             print(f"✓ Moving {action} (call 'ptz stop' to halt)")
@@ -630,7 +631,7 @@ real-time temperature and baby crying detection, and a modern Web UI."""
   ./momcozy.py status
   ./momcozy.py temperature -f
 
-  # 3. Launch Web UI dashboard & live video stream (http://localhost:8080)
+  # 3. Launch Web UI dashboard & live video stream (http://localhost:8421)
   ./momcozy.py serve
 
   # 4. Pan / tilt camera
@@ -770,7 +771,7 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_ptz.add_argument("action", choices=["up", "down", "left", "right", "stop"], help="PTZ action ('up', 'down', 'left', 'right', or 'stop')")
-    p_ptz.add_argument("--duration", "-d", type=float, default=0.5, help="Step movement duration in seconds (default: 0.5; continuous if 0)")
+    p_ptz.add_argument("--duration", "-d", type=float, default=0.175, help="Step movement duration in seconds (default: 0.175; continuous if 0)")
     p_ptz.set_defaults(func=cmd_ptz)
 
     # lullaby
@@ -821,7 +822,7 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_serve.add_argument("--host", default="0.0.0.0", help="Network interface host IP to bind (default: 0.0.0.0, accessible on LAN)")
-    p_serve.add_argument("--port", "-p", type=int, default=8080, help="TCP port to listen on (default: 8080)")
+    p_serve.add_argument("--port", "-p", type=int, default=8421, help="TCP port to listen on (default: 8421)")
     p_serve.set_defaults(func=cmd_serve)
 
     # share

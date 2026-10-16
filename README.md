@@ -120,7 +120,7 @@ docker compose up -d
 docker compose logs -f
 ```
 
-The web dashboard is now live at [**http://localhost:8080**](http://localhost:8080).
+The web dashboard is now live at [**http://localhost:8421**](http://localhost:8421).
 
 ### 2. Using Docker CLI
 
@@ -138,7 +138,7 @@ docker run -it --rm -v $(pwd)/.momcozy.json:/config/.momcozy.json momcozy-client
 docker run -d \
   --name momcozy-monitor \
   --restart unless-stopped \
-  -p 8080:8080 \
+  -p 8421:8421 \
   -v $(pwd)/.momcozy.json:/config/.momcozy.json \
   momcozy-client
 
@@ -268,16 +268,16 @@ momcozy record --duration 15 -o nursery_clip.mp4
 Start the local web server hosting the live MJPEG stream and web interface:
 
 ```bash
-momcozy serve --host 0.0.0.0 --port 8080
+momcozy serve --host 0.0.0.0 --port 8421
 ```
 
-Now open `http://localhost:8080` in any browser:
-- **Web Dashboard:** `http://localhost:8080/`
-- **Raw MJPEG Video Stream:** `http://localhost:8080/stream`
-- **Snapshot Endpoint:** `http://localhost:8080/snapshot`
-- **JSON Telemetry API:** `http://localhost:8080/api/status`
-- **Control API:** `POST http://localhost:8080/api/control`
-- **PTZ API:** `POST http://localhost:8080/api/ptz`
+Now open `http://localhost:8421` in any browser:
+- **Web Dashboard:** `http://localhost:8421/`
+- **Raw MJPEG Video Stream:** `http://localhost:8421/stream`
+- **Snapshot Endpoint:** `http://localhost:8421/snapshot`
+- **JSON Telemetry API:** `http://localhost:8421/api/status`
+- **Control API:** `POST http://localhost:8421/api/control`
+- **PTZ API:** `POST http://localhost:8421/api/ptz`
 
 ### 8. Device Sharing
 
@@ -364,14 +364,14 @@ asyncio.run(stream_frames())
 You can easily integrate your Momcozy BM04 with Home Assistant without any custom component!
 
 ### 1. MJPEG Camera Entity
-Run `momcozy serve --port 8080` (e.g., in a systemd service, Docker, or sidecar container), then add to `configuration.yaml`:
+Run `momcozy serve --port 8421` (e.g., in a systemd service, Docker, or sidecar container), then add to `configuration.yaml`:
 
 ```yaml
 camera:
   - platform: mjpeg
     name: "Baby Monitor"
-    mjpeg_url: http://192.168.1.100:8080/stream
-    still_image_url: http://192.168.1.100:8080/snapshot
+    mjpeg_url: http://192.168.1.100:8421/stream
+    still_image_url: http://192.168.1.100:8421/snapshot
 ```
 
 ### 2. REST Temperature & Status Sensor
@@ -379,7 +379,7 @@ camera:
 sensor:
   - platform: rest
     name: "Nursery Temperature"
-    resource: http://192.168.1.100:8080/api/status
+    resource: http://192.168.1.100:8421/api/status
     value_template: "{{ value_json.temperature_c }}"
     unit_of_measurement: "°C"
     device_class: temperature
@@ -387,7 +387,7 @@ sensor:
 binary_sensor:
   - platform: rest
     name: "Baby Crying"
-    resource: http://192.168.1.100:8080/api/status
+    resource: http://192.168.1.100:8421/api/status
     value_template: "{{ value_json.cry_detection_switch }}"
 ```
 

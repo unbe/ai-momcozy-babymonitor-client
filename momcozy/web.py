@@ -454,9 +454,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (ptzBusy) return;
       ptzBusy = true;
       try {
-        await apiPost('ptz_step', {direction: dir, duration: 0.35});
+        await apiPost('ptz_step', {direction: dir, duration: 0.175});
       } finally {
-        setTimeout(() => { ptzBusy = false; }, 350);
+        setTimeout(() => { ptzBusy = false; }, 175);
       }
     }
 
@@ -656,7 +656,7 @@ class WebServer:
         monitor: MomcozyMonitor,
         streamer: Optional[VideoStreamer] = None,
         host: str = "0.0.0.0",
-        port: int = 8080,
+        port: int = 8421,
     ) -> None:
         self.monitor = monitor
         self.streamer = streamer
@@ -818,7 +818,7 @@ class WebServer:
 
             if action == "ptz_step":
                 direction = data.get("direction", "0")
-                duration = float(data.get("duration", 0.35))
+                duration = float(data.get("duration", 0.175))
                 await asyncio.to_thread(self.monitor.ptz_step, direction, duration)
             elif action == "ptz_move":
                 direction = data.get("direction", "0")

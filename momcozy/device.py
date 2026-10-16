@@ -433,8 +433,8 @@ class MomcozyMonitor:
         """Stop camera movement."""
         self.set_dp(DP.PTZ_STOP, True)
 
-    def ptz_step(self, direction: PtzDirection | str, duration_seconds: float = 0.35) -> None:
-        """Rotate camera in a direction for a short duration and then stop."""
+    def ptz_step(self, direction: PtzDirection | str, duration_seconds: float = 0.175) -> None:
+        """Rotate camera in a direction for a short duration and then stop (default: 0.175s)."""
         with self._lock:
             val = direction.value if isinstance(direction, PtzDirection) else str(direction)
             self.set_dp(DP.PTZ_CONTROL, val)

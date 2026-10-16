@@ -31,12 +31,12 @@ ENV PYTHONUNBUFFERED=1 \
     MOMCOZY_CONFIG=/config/.momcozy.json
 
 # Expose web dashboard & MJPEG stream port
-EXPOSE 8080
+EXPOSE 8421
 
 # Health check to ensure the dashboard status API is responding
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/api/status || exit 1
+    CMD curl -f http://localhost:8421/api/status || exit 1
 
-# Default entrypoint and command: run web server on 0.0.0.0:8080
+# Default entrypoint and command: run web server on 0.0.0.0:8421
 ENTRYPOINT ["python3", "/app/momcozy.py"]
-CMD ["serve", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8421"]

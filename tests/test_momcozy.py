@@ -546,6 +546,8 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
 
         mock_monitor = MagicMock()
         server = WebServer(monitor=mock_monitor)
+        self.assertEqual(server.port, 8421)
+
         req = make_mocked_request("POST", "/api/control")
         req._read_bytes = b'{"action": "ptz_step", "direction": "2", "duration": 0.4}'
 
@@ -555,6 +557,14 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertEqual(body["status"], "ok")
         mock_monitor.ptz_step.assert_called_once_with("2", 0.4)
+
+        # Omitted duration should default to 0.175s
+        mock_monitor.reset_mock()
+        req2 = make_mocked_request("POST", "/api/control")
+        req2._read_bytes = b'{"action": "ptz_step", "direction": "0"}'
+        resp2 = await server.handle_api_control(req2)
+        self.assertEqual(resp2.status, 200)
+        mock_monitor.ptz_step.assert_called_once_with("0", 0.175)
 
     async def test_handle_api_status_includes_stream_info(self):
         from unittest.mock import MagicMock
