@@ -718,7 +718,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args.idle_timeout, 600.0)
 
         default_args = parser.parse_args(["serve"])
-        self.assertEqual(default_args.idle_timeout, 900.0)
+        self.assertEqual(default_args.idle_timeout, 300.0)
 
     def test_tuya_gateway_publish_dps(self):
         from unittest.mock import MagicMock

@@ -703,7 +703,7 @@ class VideoStreamer:
         tuya_uid: Optional[str] = None,
         tuya_token: Optional[str] = None,
         tuya_region: Optional[str] = None,
-        idle_timeout: float = 900.0,
+        idle_timeout: float = 300.0,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key

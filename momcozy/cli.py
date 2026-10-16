@@ -567,7 +567,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     idle_timeout = float(
         getattr(args, "idle_timeout", None)
         if getattr(args, "idle_timeout", None) is not None
-        else (os.environ.get("MOMCOZY_IDLE_TIMEOUT") or 900.0)
+        else (os.environ.get("MOMCOZY_IDLE_TIMEOUT") or 300.0)
     )
     streamer = None
     if (monitor.stream_tuya_uid and monitor.stream_tuya_token) or (
@@ -921,8 +921,8 @@ real-time temperature and baby crying detection, and a modern Web UI."""
     p_serve.add_argument(
         "--idle-timeout",
         type=float,
-        default=900.0,
-        help="Inactivity timeout in seconds before disconnecting cloud video stream when no clients are watching (default: 900 = 15 min, 0 to disable)",
+        default=300.0,
+        help="Inactivity timeout in seconds before disconnecting cloud video stream when no clients are watching (default: 300 = 5 min, 0 to disable)",
     )
     p_serve.add_argument("--ssl", action="store_true", help="Enable HTTPS (auto-generates a self-signed certificate if none provided)")
     p_serve.add_argument("--ssl-cert", help="Path to custom SSL certificate PEM file for HTTPS")
