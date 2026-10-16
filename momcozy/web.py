@@ -181,7 +181,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       justify-content: center;
       box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
-    .video-card img {
+    .video-card img,
+    .video-card canvas {
       width: 100%;
       height: 100%;
       object-fit: contain;
@@ -265,7 +266,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
     .video-card:fullscreen img,
     .video-card:-webkit-full-screen img,
-    .video-card.is-fullscreen img {
+    .video-card.is-fullscreen img,
+    .video-card:fullscreen canvas,
+    .video-card:-webkit-full-screen canvas,
+    .video-card.is-fullscreen canvas {
       width: 100%;
       height: 100%;
       object-fit: contain;
@@ -481,7 +485,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <span id="fs-btn-text">Fullscreen</span>
         </button>
       </div>
-      <img id="stream-img" src="/stream" alt="Camera Stream">
+      <canvas id="stream-canvas" style="display:none;"></canvas>
+      <img id="stream-img" alt="Camera Stream" style="display:none;">
       <audio id="live-audio" preload="none"></audio>
       <div id="video-error" class="video-error-overlay hidden">
         <div style="font-size: 2.2rem;">⚠️</div>
@@ -825,10 +830,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       };
     }
 
-    // Stream auto-reconnection, double-click fullscreen, and error overlays
+    // Stream player: WebCodecs (HEVC hardware pass-through) with automatic MJPEG fallback
     const streamImg = document.getElementById('stream-img');
+    const streamCanvas = document.getElementById('stream-canvas');
+    let streamMode = 'none'; // 'webcodecs' | 'mjpeg' | 'none'
     let streamRetryTimer = null;
     let streamRetryCount = 0;
+    let activeWs = null;
+    let activeDecoder = null;
+    let supportedHevcCodec = null;
+    let isFallbackActive = false;
 
     function setStreamError(title, detail) {
       const streamBadge = document.getElementById('stream-badge');
@@ -848,6 +859,204 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    function cleanupWebCodecs() {
+      if (activeWs) {
+        try {
+          activeWs.onopen = null;
+          activeWs.onmessage = null;
+          activeWs.onerror = null;
+          activeWs.onclose = null;
+          activeWs.close();
+        } catch (e) {}
+        activeWs = null;
+      }
+      if (activeDecoder) {
+        try {
+          activeDecoder.close();
+        } catch (e) {}
+        activeDecoder = null;
+      }
+    }
+
+    function fallbackToMjpeg(reason) {
+      if (isFallbackActive) return;
+      isFallbackActive = true;
+      console.warn('[Stream] Fallback to MJPEG triggered:', reason);
+      cleanupWebCodecs();
+      startMjpegStream();
+    }
+
+    function startMjpegStream() {
+      streamMode = 'mjpeg';
+      if (streamCanvas) streamCanvas.style.display = 'none';
+      if (streamImg) {
+        streamImg.style.display = 'block';
+        streamImg.src = '/stream?t=' + Date.now();
+      }
+    }
+
+    async function checkHevcWebCodecsSupport() {
+      if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
+        return null;
+      }
+      const codecs = [
+        'hev1.1.6.L93.B0',
+        'hev1.1.6.L120.B0',
+        'hvc1.1.6.L93.B0',
+        'hvc1.1.6.L120.B0',
+        'hev1.1.6.L90.90'
+      ];
+      for (const c of codecs) {
+        try {
+          const res = await VideoDecoder.isConfigSupported({
+            codec: c,
+            codedWidth: 1920,
+            codedHeight: 1080
+          });
+          if (res && res.supported) {
+            return c;
+          }
+        } catch (e) {
+          // continue checking
+        }
+      }
+      return null;
+    }
+
+    function startWebCodecsStream(codec) {
+      cleanupWebCodecs();
+      streamMode = 'webcodecs';
+      isFallbackActive = false;
+
+      let hasKeyframe = false;
+      let frameCount = 0;
+      let decoderError = false;
+
+      try {
+        activeDecoder = new VideoDecoder({
+          output: (frame) => {
+            if (streamMode !== 'webcodecs') {
+              frame.close();
+              return;
+            }
+            if (streamCanvas.width !== frame.displayWidth || streamCanvas.height !== frame.displayHeight) {
+              streamCanvas.width = frame.displayWidth;
+              streamCanvas.height = frame.displayHeight;
+            }
+            const ctx = streamCanvas.getContext('2d');
+            ctx.drawImage(frame, 0, 0, streamCanvas.width, streamCanvas.height);
+            frame.close();
+
+            if (frameCount === 0) {
+              streamRetryCount = 0;
+              if (streamCanvas) streamCanvas.style.display = 'block';
+              if (streamImg) {
+                streamImg.style.display = 'none';
+                streamImg.src = '';
+              }
+              const streamBadge = document.getElementById('stream-badge');
+              const liveDot = document.getElementById('live-dot');
+              if (streamBadge) {
+                streamBadge.innerText = 'LIVE STREAM (HEVC)';
+                streamBadge.title = 'Hardware-accelerated HEVC stream (WebCodecs)';
+              }
+              if (liveDot) {
+                liveDot.style.background = '#48BB78';
+                liveDot.style.animation = 'pulse 1.5s infinite';
+              }
+              const errOverlay = document.getElementById('video-error');
+              if (errOverlay) errOverlay.classList.add('hidden');
+            }
+            frameCount++;
+          },
+          error: (err) => {
+            console.error('[WebCodecs] Decoder error:', err);
+            decoderError = true;
+            fallbackToMjpeg('Hardware decoder error: ' + (err.message || err));
+          }
+        });
+
+        activeDecoder.configure({
+          codec: codec,
+          codedWidth: 1920,
+          codedHeight: 1080,
+          optimizeForLatency: true
+        });
+      } catch (err) {
+        console.error('[WebCodecs] Failed configuring decoder:', err);
+        fallbackToMjpeg('Decoder configuration failed: ' + err.message);
+        return;
+      }
+
+      const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProto}//${location.host}/ws/stream`;
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+      activeWs = ws;
+
+      ws.onopen = () => {
+        console.log('[WebCodecs] Connected to /ws/stream');
+      };
+
+      ws.onmessage = (event) => {
+        if (streamMode !== 'webcodecs' || decoderError) return;
+        if (!(event.data instanceof ArrayBuffer)) return;
+        const bytes = new Uint8Array(event.data);
+        if (bytes.length <= 1) return;
+        const isKey = (bytes[0] === 1);
+        if (!hasKeyframe) {
+          if (!isKey) return; // Wait for first keyframe
+          hasKeyframe = true;
+        }
+        const chunkData = bytes.subarray(1);
+        const pts = Math.round(performance.now() * 1000);
+        try {
+          const chunk = new EncodedVideoChunk({
+            type: isKey ? 'key' : 'delta',
+            timestamp: pts,
+            data: chunkData
+          });
+          activeDecoder.decode(chunk);
+        } catch (err) {
+          console.error('[WebCodecs] Chunk decode exception:', err);
+          fallbackToMjpeg('Chunk decode exception: ' + err.message);
+        }
+      };
+
+      ws.onerror = (e) => {
+        console.warn('[WebCodecs] WebSocket error:', e);
+        if (frameCount === 0) {
+          fallbackToMjpeg('WebSocket connection error');
+        }
+      };
+
+      ws.onclose = (e) => {
+        console.log('[WebCodecs] WebSocket closed:', e.code, e.reason);
+        if (frameCount === 0 && !isFallbackActive) {
+          fallbackToMjpeg('WebSocket closed before receiving video frames');
+        } else if (streamMode === 'webcodecs' && !isFallbackActive) {
+          setStreamError('Live Stream Reconnecting', 'HEVC feed connection lost. Retrying...');
+          if (!streamRetryTimer) {
+            streamRetryTimer = setTimeout(() => {
+              streamRetryTimer = null;
+              retryStream();
+            }, 2000);
+          }
+        }
+      };
+    }
+
+    async function initPlayer() {
+      supportedHevcCodec = await checkHevcWebCodecsSupport();
+      if (supportedHevcCodec) {
+        console.log('[Stream] WebCodecs HEVC hardware decoding supported (' + supportedHevcCodec + '). Using WebCodecs.');
+        startWebCodecsStream(supportedHevcCodec);
+      } else {
+        console.log('[Stream] WebCodecs / HEVC not supported. Using MJPEG fallback.');
+        startMjpegStream();
+      }
+    }
+
     function retryStream() {
       const errOverlay = document.getElementById('video-error');
       if (errOverlay) errOverlay.classList.add('hidden');
@@ -858,11 +1067,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         liveDot.style.background = '#ED8936';
         liveDot.style.animation = 'pulse 1s infinite';
       }
-      if (streamImg) {
-        streamImg.src = '/stream?t=' + Date.now();
-      }
       showToast('Reconnecting to video stream...', 'info', 2500);
+
+      if (supportedHevcCodec && !isFallbackActive) {
+        startWebCodecsStream(supportedHevcCodec);
+      } else {
+        startMjpegStream();
+      }
       updateStatus();
+    }
+
+    if (streamCanvas) {
+      streamCanvas.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        toggleFullscreen();
+      });
     }
 
     if (streamImg) {
@@ -872,6 +1091,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       });
 
       streamImg.onerror = function() {
+        if (streamMode !== 'mjpeg') return;
         streamRetryCount++;
         const delay = Math.min(10, 2 * streamRetryCount);
         setStreamError('Live Stream Reconnecting', `Video feed connection lost. Retrying in ${delay}s...`);
@@ -884,12 +1104,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       };
 
       streamImg.onload = function() {
+        if (streamMode !== 'mjpeg') return;
         streamRetryCount = 0;
         const errOverlay = document.getElementById('video-error');
         if (errOverlay) errOverlay.classList.add('hidden');
         const streamBadge = document.getElementById('stream-badge');
         const liveDot = document.getElementById('live-dot');
-        if (streamBadge) streamBadge.innerText = 'LIVE STREAM';
+        if (streamBadge) {
+          streamBadge.innerText = 'LIVE STREAM';
+          streamBadge.title = 'Motion JPEG stream (Fallback)';
+        }
         if (liveDot) {
           liveDot.style.background = '#48BB78';
           liveDot.style.animation = 'pulse 1.5s infinite';
@@ -898,9 +1122,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
-          // Re-trigger live stream if device woke up with a stale connection
-          if (streamImg && (!streamImg.complete || streamImg.naturalWidth === 0)) {
-            streamImg.src = '/stream?t=' + Date.now();
+          if (streamMode === 'webcodecs') {
+            if (!activeWs || activeWs.readyState !== WebSocket.OPEN) {
+              retryStream();
+            }
+          } else if (streamMode === 'mjpeg') {
+            if (streamImg && (!streamImg.complete || streamImg.naturalWidth === 0)) {
+              streamImg.src = '/stream?t=' + Date.now();
+            }
           }
           updateStatus();
         }
@@ -1176,6 +1405,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     setInterval(updateStatus, 3000);
     updateStatus();
+    initPlayer();
   </script>
 </body>
 </html>
@@ -1290,6 +1520,7 @@ class WebServer:
         self.app.router.add_get("/", self.handle_index)
         self.app.router.add_get("/favicon.ico", self.handle_favicon)
         self.app.router.add_get("/stream", self.handle_stream)
+        self.app.router.add_get("/ws/stream", self.handle_ws_stream)
         self.app.router.add_get("/audio", self.handle_audio)
         self.app.router.add_get("/audio.mp3", self.handle_audio)
         self.app.router.add_get("/hls/stream.m3u8", self.handle_hls_playlist)
@@ -1388,6 +1619,44 @@ class WebServer:
             logger.warning("Client %s /stream write error: %s (sent %d frames)", client_ip, e, frames_sent)
 
         return response
+
+    async def handle_ws_stream(self, request: web.Request) -> web.WebSocketResponse:
+        """Serve raw HEVC video frames over WebSocket for WebCodecs API playback."""
+        ws = web.WebSocketResponse(heartbeat=15.0)
+        await ws.prepare(request)
+        client_ip = request.remote or "unknown"
+
+        if not self.streamer:
+            logger.warning("Rejected /ws/stream from %s: Live video streamer is not configured", client_ip)
+            await ws.close(code=4004, message=b"Streamer not configured")
+            return ws
+
+        if not self.streamer.is_running:
+            logger.info("Incoming /ws/stream connection from %s: Starting live video streamer on demand...", client_ip)
+            try:
+                await self.streamer.start()
+            except Exception as e:
+                logger.error("Could not start live video streamer for %s: %s", client_ip, e)
+                await ws.close(code=4002, message=str(e).encode("utf-8"))
+                return ws
+
+        logger.info("Client %s connected to /ws/stream (HEVC pass-through)", client_ip)
+        frames_sent = 0
+        try:
+            async for chunk, is_key in self.streamer.subscribe_hevc():
+                if ws.closed:
+                    break
+                header = b"\x01" if is_key else b"\x00"
+                await ws.send_bytes(header + chunk)
+                frames_sent += 1
+        except (asyncio.CancelledError, ConnectionResetError):
+            logger.info("Client %s disconnected from /ws/stream (sent %d frames)", client_ip, frames_sent)
+        except Exception as e:
+            logger.warning("Client %s /ws/stream error: %s (sent %d frames)", client_ip, e, frames_sent)
+        finally:
+            if not ws.closed:
+                await ws.close()
+        return ws
 
     async def handle_audio(self, request: web.Request) -> web.StreamResponse:
         """Serve live microphone audio stream (MP3 or WAV)."""
@@ -1544,6 +1813,9 @@ class WebServer:
         raw_lc = getattr(self.streamer, "listener_count", 0) if self.streamer else 0
         stream_listeners = int(raw_lc) if isinstance(raw_lc, (int, float)) else 0
 
+        raw_hl = getattr(self.streamer, "hevc_listener_count", 0) if self.streamer else 0
+        hevc_listeners = int(raw_hl) if isinstance(raw_hl, (int, float)) else 0
+
         raw_al = getattr(self.streamer, "audio_listener_count", 0) if self.streamer else 0
         audio_listeners = int(raw_al) if isinstance(raw_al, (int, float)) else 0
 
@@ -1571,6 +1843,8 @@ class WebServer:
             "stream_running": bool(getattr(self.streamer, "is_running", False)) if self.streamer else False,
             "stream_connected": bool(getattr(self.streamer, "is_connected", False)) if self.streamer else False,
             "stream_listeners": stream_listeners,
+            "hevc_listeners": hevc_listeners,
+            "total_video_listeners": stream_listeners + hevc_listeners,
             "audio_available": True,
             "audio_listeners": audio_listeners,
             "has_detection_snapshot": has_detect_snap,

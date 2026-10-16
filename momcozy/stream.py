@@ -12,7 +12,7 @@ import logging
 import struct
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional, Set
+from typing import Any, AsyncIterator, Callable, Optional, Set
 
 import cv2
 import numpy as np
@@ -147,10 +147,57 @@ def make_wav_header(sample_rate: int = 8000, channels: int = 1, bits_per_sample:
 
 
 
-class MomcozyHevcHandler:
-    """Reassembles and decodes BM04 1080p HEVC video streams into JPEG frames."""
+def parse_hevc_nalus(data: bytes) -> list[tuple[int, bytes]]:
+    """Parse Annex B stream into a list of (nal_type, full_nalu_bytes)."""
+    nalus: list[tuple[int, bytes]] = []
+    indices: list[int] = []
+    pos = 0
+    data_len = len(data)
+    while pos < data_len:
+        idx = data.find(b"\x00\x00\x00\x01", pos)
+        if idx == -1:
+            idx = data.find(b"\x00\x00\x01", pos)
+            if idx == -1:
+                break
+            indices.append(idx)
+            pos = idx + 3
+        else:
+            indices.append(idx)
+            pos = idx + 4
 
-    def __init__(self, on_frame: Any) -> None:
+    for i in range(len(indices)):
+        start = indices[i]
+        end = indices[i + 1] if i + 1 < len(indices) else data_len
+        nalu = data[start:end]
+        if nalu.startswith(b"\x00\x00\x00\x01"):
+            hdr_pos = 4
+        elif nalu.startswith(b"\x00\x00\x01"):
+            hdr_pos = 3
+        else:
+            continue
+        if hdr_pos < len(nalu):
+            nal_type = (nalu[hdr_pos] >> 1) & 0x3F
+            nalus.append((nal_type, nalu))
+    return nalus
+
+
+def is_hevc_keyframe(data: bytes) -> bool:
+    """Check if an Annex B HEVC byte chunk contains VPS, SPS, PPS, or IRAP keyframe slices."""
+    for nal_type, _ in parse_hevc_nalus(data):
+        if nal_type in (16, 17, 18, 19, 20, 21, 32, 33, 34):
+            return True
+    return False
+
+
+class MomcozyHevcHandler:
+    """Reassembles BM04 1080p HEVC video streams, yielding raw chunks and decoded JPEG frames."""
+
+    def __init__(
+        self,
+        on_frame: Any,
+        on_hevc: Optional[Any] = None,
+        is_transcoding_needed: Optional[Callable[[], bool]] = None,
+    ) -> None:
         try:
             import av
         except ImportError as e:
@@ -160,6 +207,9 @@ class MomcozyHevcHandler:
             ) from e
 
         self._on_frame = on_frame
+        self._on_hevc = on_hevc
+        self._is_transcoding_needed = is_transcoding_needed
+        self._transcoding_active = False
         self._buffer = bytearray()
         self._fu_buffer = bytearray()
         self._codec = av.CodecContext.create("hevc", "r")
@@ -236,16 +286,40 @@ class MomcozyHevcHandler:
                 annexb_chunk.extend(payload)
 
         if annexb_chunk:
-            try:
-                for packet in self._codec.parse(bytes(annexb_chunk)):
-                    for frame in self._codec.decode(packet):
-                        arr = frame.to_ndarray(format="bgr24")
-                        _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                        jpg_bytes = enc.tobytes()
-                        self.frame_count += 1
-                        self._on_frame(jpg_bytes)
-            except Exception as exc:
-                logger.warning("Error decoding camera HEVC video packet: %s", exc)
+            chunk_bytes = bytes(annexb_chunk)
+            is_key = is_hevc_keyframe(chunk_bytes)
+            if self._on_hevc:
+                try:
+                    self._on_hevc(chunk_bytes, is_key)
+                except Exception as exc:
+                    logger.debug("Error in on_hevc callback: %s", exc)
+
+            needs_transcode = True
+            if self._is_transcoding_needed is not None:
+                try:
+                    needs_transcode = bool(self._is_transcoding_needed())
+                except Exception:
+                    needs_transcode = True
+
+            if needs_transcode:
+                if not self._transcoding_active:
+                    if not is_key:
+                        return
+                    self._transcoding_active = True
+
+                try:
+                    for packet in self._codec.parse(chunk_bytes):
+                        for frame in self._codec.decode(packet):
+                            arr = frame.to_ndarray(format="bgr24")
+                            _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                            jpg_bytes = enc.tobytes()
+                            self.frame_count += 1
+                            if self._on_frame:
+                                self._on_frame(jpg_bytes)
+                except Exception as exc:
+                    logger.warning("Error decoding camera HEVC video packet: %s", exc)
+            else:
+                self._transcoding_active = False
 
 
 def _patch_tuya_stream_session() -> None:
@@ -288,7 +362,11 @@ def _patch_tuya_stream_session() -> None:
 
     def momcozy_session_init(self: Any, *args: Any, **kwargs: Any) -> None:
         orig_init(self, *args, **kwargs)
-        self._momcozy_hevc = MomcozyHevcHandler(self._on_frame)
+        self._momcozy_hevc = MomcozyHevcHandler(
+            self._on_frame,
+            getattr(self, "_on_hevc", None),
+            getattr(self, "_is_transcoding_needed", None),
+        )
         self._momcozy_audio = MomcozyAudioHandler(getattr(self, "_on_pcm", None))
 
     def momcozy_on_media_record(self: Any, record: bytes) -> None:
@@ -315,12 +393,14 @@ def _patch_tuya_stream_session() -> None:
     StreamSession._on_media_record = momcozy_on_media_record
     StreamSession._async_dial_relay = momcozy_dial_relay
 
-    # 3. Patch CameraStream to expose async_audio()
+    # 3. Patch CameraStream to expose async_audio() and async_hevc()
     orig_cam_init = CameraStream.__init__
 
     def momcozy_cam_init(self: Any, *args: Any, **kwargs: Any) -> None:
         orig_cam_init(self, *args, **kwargs)
         self._audio_subscribers: Set[asyncio.Queue[bytes]] = set()
+        self._hevc_subscribers: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
+        self._is_transcoding_needed: Optional[Callable[[], bool]] = None
 
     def momcozy_on_audio(self: Any, pcm: bytes) -> None:
         for subscriber in list(self._audio_subscribers):
@@ -334,6 +414,33 @@ def _patch_tuya_stream_session() -> None:
             except asyncio.QueueFull:
                 pass
 
+    def momcozy_on_hevc(self: Any, chunk: bytes, is_key: bool) -> None:
+        for subscriber in list(self._hevc_subscribers):
+            if subscriber.full():
+                try:
+                    subscriber.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                subscriber.put_nowait((chunk, is_key))
+            except asyncio.QueueFull:
+                pass
+
+    def momcozy_async_hevc(self: Any) -> Any:
+        queue: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=30)
+        self._hevc_subscribers.add(queue)
+
+        async def _generator():
+            try:
+                while True:
+                    yield await queue.get()
+            finally:
+                self._hevc_subscribers.discard(queue)
+
+        return _generator()
+
+    CameraStream.async_hevc = momcozy_async_hevc
+
     orig_run_one_session = CameraStream._async_run_one_session
 
     async def momcozy_run_one_session(self: Any) -> bool:
@@ -342,6 +449,11 @@ def _patch_tuya_stream_session() -> None:
         uid = await self._client.async_uid()
         session = StreamSession(config, identity, uid, self._on_frame)
         session._on_pcm = self._on_audio
+        session._on_hevc = self._on_hevc
+        session._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
+        if hasattr(session, "_momcozy_hevc"):
+            session._momcozy_hevc._on_hevc = self._on_hevc
+            session._momcozy_hevc._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
         if hasattr(session, "_momcozy_audio"):
             session._momcozy_audio._on_pcm = self._on_audio
         self._session = session
@@ -369,6 +481,7 @@ def _patch_tuya_stream_session() -> None:
 
     CameraStream.__init__ = momcozy_cam_init
     CameraStream._on_audio = momcozy_on_audio
+    CameraStream._on_hevc = momcozy_on_hevc
     CameraStream._async_run_one_session = momcozy_run_one_session
     CameraStream.async_audio = momcozy_async_audio
 
@@ -542,6 +655,9 @@ class VideoStreamer:
         self._latest_detection_trigger: str = ""
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
+        self._hevc_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
+        self._latest_hevc_keyframe: Optional[bytes] = None
+        self._snapshot_requested: bool = False
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -565,9 +681,18 @@ class VideoStreamer:
         return len(self._audio_listeners)
 
     @property
+    def hevc_listener_count(self) -> int:
+        """Number of active client queues subscribing to the raw HEVC pass-through stream."""
+        return len(self._hevc_listeners)
+
+    @property
     def total_listener_count(self) -> int:
-        """Total active listeners across video and audio."""
-        return len(self._listeners) + len(self._audio_listeners)
+        """Total active listeners across video, audio, and HEVC pass-through."""
+        return len(self._listeners) + len(self._audio_listeners) + len(self._hevc_listeners)
+
+    def is_transcoding_needed(self) -> bool:
+        """Return True only if an active listener or pending snapshot requires JPEG transcoding."""
+        return len(self._listeners) > 0 or self._snapshot_requested
 
     @property
     def last_error(self) -> Optional[str]:
@@ -654,7 +779,7 @@ class VideoStreamer:
                 int(self.idle_timeout),
             )
             await asyncio.sleep(self.idle_timeout)
-            if not self._listeners and not self._audio_listeners and self._running:
+            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running:
                 logger.info(
                     "No stream clients connected for %d minutes (%ds). Disconnecting cloud video stream to conserve resources.",
                     int(self.idle_timeout // 60),
@@ -672,7 +797,7 @@ class VideoStreamer:
             self._running = True
             self._stream_task = asyncio.create_task(self._stream_loop())
             logger.info("Video streamer started for device %s", self.device_id)
-        if not self._listeners and not self._audio_listeners and self.idle_timeout > 0:
+        if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self.idle_timeout > 0:
             self._schedule_idle_stop()
 
     async def stop(self) -> None:
@@ -682,6 +807,7 @@ class VideoStreamer:
             self._running = False
             self._connected = False
             self._latest_frame = None
+            self._latest_hevc_keyframe = None
             if self._stream_task:
                 self._stream_task.cancel()
                 try:
@@ -707,6 +833,7 @@ class VideoStreamer:
                     tuya_region=self.tuya_region,
                 ) as client:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
+                    stream._is_transcoding_needed = self.is_transcoding_needed
 
                     def on_state():
                         if getattr(stream, "needs_power_cycle", False):
@@ -748,23 +875,51 @@ class VideoStreamer:
 
                     audio_task = asyncio.create_task(audio_worker())
 
-                    frame_iter = stream.async_frames()
-                    frames_received = 0
+                    async def jpeg_worker():
+                        try:
+                            async for jpeg_frame in stream.async_frames():
+                                if not self._running:
+                                    break
+                                self._latest_frame = jpeg_frame
+                                if not self._latest_detection_snapshot:
+                                    self.capture_detection_snapshot(trigger="Session Baseline Snapshot")
+                                for q in list(self._listeners):
+                                    if q.full():
+                                        try:
+                                            q.get_nowait()
+                                        except asyncio.QueueEmpty:
+                                            pass
+                                    try:
+                                        q.put_nowait(jpeg_frame)
+                                    except asyncio.QueueFull:
+                                        pass
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:
+                            logger.debug("JPEG consumer worker exited: %s", exc)
+
+                    jpeg_task = asyncio.create_task(jpeg_worker())
+
+                    hevc_iter = stream.async_hevc()
+                    chunks_received = 0
                     initial_timeout = 20.0
                     cadence_timeout = 10.0
+                    vps = None
+                    sps = None
+                    pps = None
 
                     try:
                         while self._running:
-                            timeout = initial_timeout if frames_received == 0 else cadence_timeout
+                            timeout = initial_timeout if chunks_received == 0 else cadence_timeout
                             try:
-                                jpeg_frame = await asyncio.wait_for(frame_iter.__anext__(), timeout=timeout)
+                                chunk, is_key = await asyncio.wait_for(hevc_iter.__anext__(), timeout=timeout)
                             except TimeoutError:
-                                if frames_received == 0:
-                                    err_msg = f"Timed out waiting for initial video frame from camera {self.device_id} ({timeout:.0f}s)"
+                                if chunks_received == 0:
+                                    err_msg = f"Timed out waiting for initial video stream from camera {self.device_id} ({timeout:.0f}s)"
                                     logger.warning("✗ %s. Re-establishing P2P session...", err_msg)
                                     self._last_error = err_msg
                                 else:
-                                    err_msg = f"Live video stream stalled: no frames received from camera {self.device_id} for {timeout:.0f}s"
+                                    err_msg = f"Live video stream stalled: no data received from camera {self.device_id} for {timeout:.0f}s"
                                     logger.warning("✗ %s. Reconnecting...", err_msg)
                                     self._last_error = err_msg
                                 self._connected = False
@@ -773,40 +928,69 @@ class VideoStreamer:
                                 logger.info("Video stream closed by camera %s.", self.device_id)
                                 break
 
-                            frames_received += 1
-                            if frames_received == 1:
+                            chunks_received += 1
+                            if chunks_received == 1:
                                 logger.info(
-                                    "✓ First live video frame decoded for %s (%d bytes). Stream active.",
+                                    "✓ First live video stream chunk received for %s (%d bytes). Stream active.",
                                     self.device_id,
-                                    len(jpeg_frame),
+                                    len(chunk),
                                 )
-                                if not self._latest_detection_snapshot:
-                                    self.capture_detection_snapshot(trigger="Session Baseline Snapshot")
-                            elif frames_received % 1000 == 0:
+                            elif chunks_received % 1000 == 0:
                                 logger.info(
-                                    "Stream healthy: %d frames decoded from camera %s",
-                                    frames_received,
+                                    "Stream healthy: %d chunks received from camera %s (transcoding: %s)",
+                                    chunks_received,
                                     self.device_id,
+                                    self.is_transcoding_needed(),
                                 )
 
                             self._connected = True
                             self._last_error = None
-                            self._latest_frame = jpeg_frame
-                            for q in list(self._listeners):
+
+                            nalus = parse_hevc_nalus(chunk)
+                            has_irap = False
+                            has_vps = False
+                            has_sps = False
+                            has_pps = False
+                            for nal_type, nalu in nalus:
+                                if nal_type == 32:
+                                    vps = nalu
+                                    has_vps = True
+                                elif nal_type == 33:
+                                    sps = nalu
+                                    has_sps = True
+                                elif nal_type == 34:
+                                    pps = nalu
+                                    has_pps = True
+                                elif nal_type in (16, 17, 18, 19, 20, 21):
+                                    has_irap = True
+
+                            if has_irap or (has_vps and has_sps):
+                                prefix = b""
+                                if not has_vps and vps:
+                                    prefix += vps
+                                if not has_sps and sps:
+                                    prefix += sps
+                                if not has_pps and pps:
+                                    prefix += pps
+                                self._latest_hevc_keyframe = prefix + chunk
+                                is_key = True
+
+                            for q in list(self._hevc_listeners):
                                 if q.full():
                                     try:
                                         q.get_nowait()
                                     except asyncio.QueueEmpty:
                                         pass
                                 try:
-                                    q.put_nowait(jpeg_frame)
+                                    q.put_nowait((chunk, is_key))
                                 except asyncio.QueueFull:
                                     pass
                     finally:
                         self._connected = False
                         audio_task.cancel()
+                        jpeg_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
-                            await audio_task
+                            await asyncio.gather(audio_task, jpeg_task)
                         await stream.async_stop()
             except asyncio.CancelledError:
                 self._connected = False
@@ -846,7 +1030,7 @@ class VideoStreamer:
                 len(self._listeners),
                 self.device_id,
             )
-            if not self._listeners and not self._audio_listeners and self._running and self.idle_timeout > 0:
+            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
                 self._schedule_idle_stop()
 
     async def subscribe_audio(self, format: str = "mp3") -> AsyncIterator[bytes]:
@@ -885,27 +1069,65 @@ class VideoStreamer:
                 len(self._audio_listeners),
                 self.device_id,
             )
-            if not self._listeners and not self._audio_listeners and self._running and self.idle_timeout > 0:
+            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
+                self._schedule_idle_stop()
+
+    async def subscribe_hevc(self) -> AsyncIterator[tuple[bytes, bool]]:
+        """Subscribe to raw HEVC Annex B chunks (chunk_bytes, is_key)."""
+        queue: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=30)
+        if self._latest_hevc_keyframe and self._connected:
+            queue.put_nowait((self._latest_hevc_keyframe, True))
+        self._hevc_listeners.add(queue)
+        self._cancel_idle_stop()
+        logger.info(
+            "Client subscribed to raw HEVC pass-through stream (active viewers: %d, device: %s)",
+            len(self._hevc_listeners),
+            self.device_id,
+        )
+        try:
+            while self._running:
+                try:
+                    chunk, is_key = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    yield chunk, is_key
+                except TimeoutError:
+                    if not self._running:
+                        break
+                    continue
+        finally:
+            self._hevc_listeners.discard(queue)
+            logger.info(
+                "Client unsubscribed from raw HEVC stream (remaining viewers: %d, device: %s)",
+                len(self._hevc_listeners),
+                self.device_id,
+            )
+            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
                 self._schedule_idle_stop()
 
     async def get_snapshot(self, timeout_seconds: float = 10.0) -> bytes:
         """Capture a single frame as JPEG."""
         if not self._running:
             await self.start()
-        elif not self._listeners and self.idle_timeout > 0:
+        elif not self._listeners and not self._hevc_listeners and self.idle_timeout > 0:
             self._cancel_idle_stop()
             self._schedule_idle_stop()
 
-        start_time = time.time()
-        while time.time() - start_time < timeout_seconds:
-            if self._latest_frame:
-                return self._latest_frame
-            if self._last_error and time.time() - start_time > 3.0:
-                raise RuntimeError(f"Camera stream error: {self._last_error}")
-            await asyncio.sleep(0.1)
+        if self._latest_frame:
+            return self._latest_frame
 
-        err_suffix = f": {self._last_error}" if self._last_error else ""
-        raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
+        self._snapshot_requested = True
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                if self._latest_frame:
+                    return self._latest_frame
+                if self._last_error and time.time() - start_time > 3.0:
+                    raise RuntimeError(f"Camera stream error: {self._last_error}")
+                await asyncio.sleep(0.1)
+
+            err_suffix = f": {self._last_error}" if self._last_error else ""
+            raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
+        finally:
+            self._snapshot_requested = False
 
     async def record_clip(
         self,

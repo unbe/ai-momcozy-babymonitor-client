@@ -1118,6 +1118,129 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("window.serverHttpPort = 8420;", resp.text)
 
+    def test_hevc_nalu_parsing_and_keyframe_detection(self):
+        from momcozy.stream import parse_hevc_nalus, is_hevc_keyframe
+
+        # VPS NALU (type 32: (0x40 >> 1) == 32)
+        vps = b"\x00\x00\x00\x01\x40\x01\x0c\x01"
+        # SPS NALU (type 33: (0x42 >> 1) == 33)
+        sps = b"\x00\x00\x00\x01\x42\x01\x01\x01"
+        # PPS NALU (type 34: (0x44 >> 1) == 34)
+        pps = b"\x00\x00\x00\x01\x44\x01\xc0"
+        # IDR NALU (type 19: (0x26 >> 1) == 19)
+        idr = b"\x00\x00\x00\x01\x26\x01\xaf\xfe"
+        # Non-IRAP P-slice (type 1: (0x02 >> 1) == 1)
+        p_slice = b"\x00\x00\x00\x01\x02\x01\x12\x34"
+
+        combined = vps + sps + pps + idr
+        nalus = parse_hevc_nalus(combined)
+        self.assertEqual(len(nalus), 4)
+        self.assertEqual(nalus[0][0], 32)
+        self.assertEqual(nalus[1][0], 33)
+        self.assertEqual(nalus[2][0], 34)
+        self.assertEqual(nalus[3][0], 19)
+
+        self.assertTrue(is_hevc_keyframe(combined))
+        self.assertTrue(is_hevc_keyframe(idr))
+        self.assertTrue(is_hevc_keyframe(vps))
+        self.assertFalse(is_hevc_keyframe(p_slice))
+
+    async def test_video_streamer_subscribe_hevc(self):
+        from momcozy.stream import VideoStreamer
+        streamer = VideoStreamer("dev123", "localkey")
+        self.assertEqual(streamer.hevc_listener_count, 0)
+
+        # Mock latest keyframe
+        streamer._latest_hevc_keyframe = b"\x00\x00\x00\x01\x26\x01KEY"
+        streamer._connected = True
+        streamer._running = True
+
+        gen = streamer.subscribe_hevc()
+        chunk, is_key = await gen.__anext__()
+        self.assertEqual(chunk, b"\x00\x00\x00\x01\x26\x01KEY")
+        self.assertTrue(is_key)
+        self.assertEqual(streamer.hevc_listener_count, 1)
+        await gen.aclose()
+        self.assertEqual(streamer.hevc_listener_count, 0)
+
+    async def test_web_server_dashboard_webcodecs_and_fallback(self):
+        from momcozy.web import HTML_DASHBOARD
+        self.assertIn('id="stream-canvas"', HTML_DASHBOARD)
+        self.assertIn('id="stream-img"', HTML_DASHBOARD)
+        self.assertIn("checkHevcWebCodecsSupport", HTML_DASHBOARD)
+        self.assertIn("fallbackToMjpeg", HTML_DASHBOARD)
+        self.assertIn("startMjpegStream", HTML_DASHBOARD)
+        self.assertIn("startWebCodecsStream", HTML_DASHBOARD)
+        self.assertIn("initPlayer", HTML_DASHBOARD)
+
+    async def test_web_server_ws_stream_unconfigured(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        server = WebServer(monitor=MagicMock(), streamer=None)
+        req = make_mocked_request("GET", "/ws/stream")
+        with unittest.mock.patch("aiohttp.web.WebSocketResponse") as mock_ws_cls:
+            mock_ws = MagicMock()
+            mock_ws.prepare = AsyncMock()
+            mock_ws.close = AsyncMock()
+            mock_ws_cls.return_value = mock_ws
+
+            resp = await server.handle_ws_stream(req)
+            self.assertEqual(resp, mock_ws)
+            mock_ws.close.assert_awaited_once_with(code=4004, message=b"Streamer not configured")
+
+    def test_is_transcoding_needed_and_handler_bypass(self):
+        import asyncio
+        from unittest.mock import MagicMock
+        from momcozy.stream import VideoStreamer, MomcozyHevcHandler
+
+        streamer = VideoStreamer("dev123", "localkey")
+        # No listeners: False
+        self.assertFalse(streamer.is_transcoding_needed())
+
+        # Only HEVC passthrough listener: False
+        q_hevc = asyncio.Queue()
+        streamer._hevc_listeners.add(q_hevc)
+        self.assertFalse(streamer.is_transcoding_needed())
+
+        # Active JPEG listener: True
+        q_jpeg = asyncio.Queue()
+        streamer._listeners.add(q_jpeg)
+        self.assertTrue(streamer.is_transcoding_needed())
+
+        # Disconnect JPEG listener: False even though HEVC listener is still connected
+        streamer._listeners.discard(q_jpeg)
+        self.assertFalse(streamer.is_transcoding_needed())
+
+        # Snapshot requested: True
+        streamer._snapshot_requested = True
+        self.assertTrue(streamer.is_transcoding_needed())
+        streamer._snapshot_requested = False
+
+        # Test MomcozyHevcHandler bypasses codec when is_transcoding_needed returns False
+        mock_frame_cb = MagicMock()
+        mock_hevc_cb = MagicMock()
+        handler = MomcozyHevcHandler(
+            on_frame=mock_frame_cb,
+            on_hevc=mock_hevc_cb,
+            is_transcoding_needed=lambda: False,
+        )
+        handler._codec = MagicMock()
+
+        # Properly formatted Tuya packet
+        from momcozy.stream import _SYNC_MARKER
+        import struct
+        payload = b"\x00" * 12 + b"\x40\x01\x0c\x01"
+        record = _SYNC_MARKER + b"\x00" * 8 + struct.pack("<I", 0) + struct.pack("<I", 0) + struct.pack("<I", len(payload)) + payload
+        handler.feed_record(record)
+
+        # HEVC callback should have been called
+        self.assertTrue(mock_hevc_cb.called)
+        # But codec.parse should NOT have been called because transcoding was not needed!
+        self.assertFalse(handler._codec.parse.called)
+        self.assertFalse(mock_frame_cb.called)
+
 
 if __name__ == "__main__":
     unittest.main()
