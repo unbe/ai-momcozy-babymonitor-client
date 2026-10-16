@@ -8,6 +8,7 @@ RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list
     ffmpeg \
     va-driver-all \
     vainfo \
+    procps \
     libgl1 \
     libglib2.0-0 \
     ca-certificates \
