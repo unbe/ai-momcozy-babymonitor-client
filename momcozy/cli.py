@@ -66,6 +66,53 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         except Exception:
             pass
 
+    # Log local IP resolution source
+    if getattr(args, "ip", None):
+        logger.info("Local IP determined from CLI flag (--ip %s)", ip)
+    elif os.environ.get("MOMCOZY_IP"):
+        logger.info("Local IP determined from MOMCOZY_IP environment variable: %s", ip)
+    elif saved.get("ip"):
+        logger.info("Local IP determined from config file %s: %s", config_path, ip)
+    else:
+        logger.info(
+            "Local IP determination: No local IP specified in CLI, MOMCOZY_IP env, or config (%s).",
+            config_path,
+        )
+
+    # Attempt local network auto-discovery if IP is missing
+    if not ip and dev_id:
+        logger.info("Scanning local network for camera %s via UDP broadcast...", dev_id)
+        try:
+            import tinytuya
+            devices = tinytuya.deviceScan(False, 3)
+            for dev_ip, dev_info in devices.items():
+                if dev_info.get("gwId") == dev_id or dev_info.get("id") == dev_id:
+                    ip = dev_ip
+                    logger.info("✓ Discovered camera %s on local network at %s", dev_id, ip)
+                    saved["ip"] = ip
+                    if config_path.exists():
+                        try:
+                            config_path.write_text(json.dumps(saved, indent=2))
+                            logger.info("Saved discovered IP %s to %s", ip, config_path)
+                        except Exception:
+                            pass
+                    break
+        except Exception as scan_err:
+            logger.debug("Local network scan encountered error: %s", scan_err)
+
+        if not ip:
+            logger.warning(
+                "✗ Camera %s was NOT discovered on local network via UDP broadcast.\n"
+                "  • Reason: UDP broadcasts (ports 6666/6667) do not cross different subnets/VLANs or Docker bridge networks.\n"
+                "  • How to enable local control: Provide your camera's LAN IP address directly using:\n"
+                "      - Environment variable: MOMCOZY_IP=<CAMERA_IP>\n"
+                "      - Or in %s: {\"ip\": \"<CAMERA_IP>\"}\n"
+                "      - Or CLI flag: --ip <CAMERA_IP>\n"
+                "  • Device control will fall back to Tuya Cloud Gateway.",
+                dev_id,
+                config_path,
+            )
+
     # Auto-resolve local_key from Tuya Cloud if missing
     if not local_key and config_path.exists():
         try:
@@ -332,6 +379,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         if args.json:
             data = dict(status.__dict__)
             data["control_transport"] = monitor.control_transport
+            data["control_mode"] = monitor.control_mode
+            data["control_diagnostic"] = monitor.control_diagnostic
             data["stream_transport"] = "Cloud Relay (Tuya P2P)"
             print(json.dumps(data, indent=2, default=str))
         else:

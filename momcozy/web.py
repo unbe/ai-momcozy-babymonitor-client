@@ -293,7 +293,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div>
         <h1>🍼 Momcozy BM04 Monitor</h1>
         <div style="font-size: 0.76rem; color: var(--text-muted); margin-top: 3px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-          <span>Control: <strong id="hdr-control-transport" style="color:var(--text);">Local LAN (:6668)</strong></span>
+          <span>Control: <strong id="hdr-control-transport" style="color:var(--text);">Checking...</strong> <span id="hdr-control-diag" style="color:var(--text-muted); font-size:0.7rem; display:none;"></span></span>
           <span>&bull;</span>
           <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong></span>
         </div>
@@ -598,7 +598,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         // Update transport badges
         if (d.control_transport) {
           const ctrlEl = document.getElementById('hdr-control-transport');
-          if (ctrlEl) ctrlEl.innerText = d.control_transport;
+          if (ctrlEl) {
+            ctrlEl.innerText = d.control_transport;
+            if (d.control_diagnostic) {
+              ctrlEl.title = d.control_diagnostic;
+            }
+          }
+          const diagEl = document.getElementById('hdr-control-diag');
+          if (diagEl) {
+            if (d.control_mode !== 'local_lan' && d.control_diagnostic) {
+              diagEl.innerText = `(${d.control_diagnostic})`;
+              diagEl.title = d.control_diagnostic;
+              diagEl.style.display = 'inline';
+            } else {
+              diagEl.style.display = 'none';
+            }
+          }
         }
         if (d.stream_transport) {
           const stEl = document.getElementById('hdr-stream-transport');
@@ -755,6 +770,9 @@ class WebServer:
         raw_ct = getattr(self.monitor, "control_transport", "Tuya Cloud Gateway")
         control_transport = raw_ct if isinstance(raw_ct, str) else "Tuya Cloud Gateway"
 
+        raw_cd = getattr(self.monitor, "control_diagnostic", "")
+        control_diagnostic = raw_cd if isinstance(raw_cd, str) else ""
+
         stream_info = {
             "stream_configured": self.streamer is not None,
             "stream_running": self.streamer.is_running if self.streamer else False,
@@ -764,6 +782,7 @@ class WebServer:
             "stream_transport": stream_transport,
             "control_mode": control_mode,
             "control_transport": control_transport,
+            "control_diagnostic": control_diagnostic,
         }
         try:
             status = await asyncio.to_thread(self.monitor.get_status)

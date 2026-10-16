@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -67,6 +68,7 @@ class BM04Status:
     sd_card_status: int = 1  # 1=normal, 4=no card
     sd_storage: str = ""
     control_transport: str = ""
+    control_diagnostic: Optional[str] = None
 
     raw_dps: Dict[str, Any] = field(default_factory=dict)
 
@@ -85,10 +87,12 @@ class BM04Status:
             else "Stopped"
         )
         transport_line = f"  • Control Transport:  {self.control_transport}\n" if self.control_transport else ""
+        diag_line = f"  • Control Diagnostic: {self.control_diagnostic}\n" if (self.control_diagnostic and "Local LAN" not in (self.control_transport or "")) else ""
 
         return (
             f"--- Momcozy BM04 Baby Monitor Status ---\n"
             f"{transport_line}"
+            f"{diag_line}"
             f"  • Temperature:        {temp_str}\n"
             f"  • Temp Alerts:        {'Enabled' if self.temp_alert_enabled else 'Disabled'} "
             f"(Range: {self.temp_min_c}°C - {self.temp_max_c}°C)\n"
@@ -152,7 +156,37 @@ class MomcozyMonitor:
         self._lock = threading.RLock()
 
         self._device: Optional[tinytuya.Device] = None
+        self.control_diagnostic: str = ""
         self._init_local_device()
+
+    def test_local_lan_connection(self) -> bool:
+        """Test direct TCP connection to port 6668 on the camera IP."""
+        if not self.ip:
+            self.control_diagnostic = (
+                f"No local camera IP configured for device {self.device_id}. "
+                "Specify 'ip' in .momcozy.json or set MOMCOZY_IP environment variable."
+            )
+            return False
+        logger.info("Checking local LAN connection to camera at %s:6668...", self.ip)
+        try:
+            with socket.create_connection((self.ip, 6668), timeout=1.5):
+                self._lan_tcp_unavailable = False
+                self.control_diagnostic = f"Local LAN TCP port 6668 reachable at {self.ip}"
+                logger.info("✓ Local LAN control active: connected to camera at %s:6668", self.ip)
+                return True
+        except Exception as exc:
+            self._lan_tcp_unavailable = True
+            self.control_diagnostic = (
+                f"Local LAN TCP port 6668 unreachable on {self.ip} ({exc}). "
+                "Device control will fall back to Tuya Cloud Gateway."
+            )
+            logger.warning(
+                "✗ Local LAN connection to %s:6668 failed (%s). "
+                "Device control will fall back to Tuya Cloud Gateway.",
+                self.ip,
+                exc,
+            )
+            return False
 
     def _init_local_device(self) -> None:
         if self.ip:
@@ -164,18 +198,27 @@ class MomcozyMonitor:
             )
             self._device.set_socketPersistent(True)
             self._device.set_socketTimeout(1.0)
-            self._lan_tcp_unavailable = False
-            self._lan_status_unsupported = False
+            self.test_local_lan_connection()
+        else:
+            self.control_diagnostic = (
+                f"No local IP address configured for camera {self.device_id}. "
+                "Specify 'ip' in .momcozy.json or set MOMCOZY_IP environment variable."
+            )
+            logger.info("Local LAN control: %s", self.control_diagnostic)
 
     @property
     def control_mode(self) -> str:
         """Control mode: 'local_lan' or 'cloud'."""
-        return "local_lan" if self.ip else "cloud"
+        return "local_lan" if (self.ip and not self._lan_tcp_unavailable) else "cloud"
 
     @property
     def control_transport(self) -> str:
         """Human-readable description of device control transport."""
-        return f"Local LAN ({self.ip}:6668)" if self.ip else "Tuya Cloud Gateway"
+        if self.ip and not self._lan_tcp_unavailable:
+            return f"Local LAN ({self.ip}:6668)"
+        if self.ip and self._lan_tcp_unavailable:
+            return f"Tuya Cloud Gateway (Local LAN {self.ip}:6668 unreachable)"
+        return "Tuya Cloud Gateway (No local IP configured)"
 
     def set_ip(self, ip: str) -> None:
         """Update monitor IP address."""
@@ -184,14 +227,23 @@ class MomcozyMonitor:
 
     def discover_local_ip(self) -> Optional[str]:
         """Scan the local network for this device IP."""
-        logger.info("Scanning local subnet for device %s...", self.device_id)
-        devices = tinytuya.deviceScan(False, 5)
-        for dev_ip, dev_info in devices.items():
-            if dev_info.get("gwId") == self.device_id or dev_info.get("id") == self.device_id:
-                logger.info("Found BM04 at %s", dev_ip)
-                self.set_ip(dev_ip)
-                return dev_ip
-        logger.warning("Device %s not found in local scan", self.device_id)
+        logger.info("Scanning local subnet for device %s via UDP broadcast...", self.device_id)
+        try:
+            devices = tinytuya.deviceScan(False, 3)
+            for dev_ip, dev_info in devices.items():
+                if dev_info.get("gwId") == self.device_id or dev_info.get("id") == self.device_id:
+                    logger.info("✓ Discovered camera %s on local network at %s", self.device_id, dev_ip)
+                    self.set_ip(dev_ip)
+                    return dev_ip
+            logger.warning(
+                "✗ Camera %s was not found in local UDP scan. "
+                "(Note: UDP broadcast discovery cannot cross subnets/VLANs or Docker bridge networks unless host networking is enabled).",
+                self.device_id,
+            )
+            self.control_diagnostic = f"Camera {self.device_id} not found via UDP broadcast on local network."
+        except Exception as exc:
+            logger.warning("Local scan error: %s", exc)
+            self.control_diagnostic = f"Local UDP scan error: {exc}"
         return None
 
     def _ensure_device(self) -> tinytuya.Device:
@@ -203,7 +255,7 @@ class MomcozyMonitor:
                     f"Device IP for {self.device_id} was not auto-discovered on the local subnet via UDP broadcast.\n"
                     f"Please provide the monitor's local Wi-Fi IP address (e.g., from your router or DHCP leases):\n"
                     f"    ./momcozy.py status --ip <CAMERA_IP>\n"
-                    f"(Once provided with --ip, it will be automatically saved to .momcozy.json)"
+                    f"(Or set MOMCOZY_IP=<CAMERA_IP>)"
                 )
         return self._device
 
@@ -257,6 +309,7 @@ class MomcozyMonitor:
         status.sd_card_status = int(dps.get(str(int(DP.SD_STATUS)), 1))
         status.sd_storage = str(dps.get(str(int(DP.SD_STORAGE)), ""))
         status.control_transport = self.control_transport
+        status.control_diagnostic = self.control_diagnostic
 
         return status
 
