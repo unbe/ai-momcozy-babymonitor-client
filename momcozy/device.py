@@ -8,6 +8,9 @@ adjust settings (night vision, PTZ, volume, alarms), and stream live video.
 from __future__ import annotations
 
 import asyncio
+import base64
+from datetime import datetime
+import json
 import logging
 import socket
 import threading
@@ -69,6 +72,15 @@ class BM04Status:
     sd_storage: str = ""
     control_transport: str = ""
     control_diagnostic: Optional[str] = None
+
+    # Latest detection event (DP 185)
+    latest_event_cmd: str = ""
+    latest_event_name: str = ""
+    latest_event_time: Optional[int] = None
+    latest_event_time_str: str = ""
+    latest_event_bucket: str = ""
+    latest_event_file: str = ""
+    latest_event_key: str = ""
 
     raw_dps: Dict[str, Any] = field(default_factory=dict)
 
@@ -292,9 +304,57 @@ class MomcozyMonitor:
         status.motion_switch = bool(dps.get(str(int(DP.MOTION_SWITCH)), False))
         status.motion_tracking = bool(dps.get(str(int(DP.MOTION_TRACKING)), False))
         status.motion_sensitivity = str(dps.get(str(int(DP.MOTION_SENSITIVITY)), "1"))
-        status.sound_switch = bool(dps.get(str(int(DP.DECIBEL_SWITCH)), False))
+        status.sound_switch = bool(
+            dps.get(str(int(DP.DECIBEL_SWITCH)))
+            if dps.get(str(int(DP.DECIBEL_SWITCH))) is not None
+            else dps.get(str(int(DP.DECIBEL_SWITCH_ALT)), False)
+        )
         status.sound_sensitivity = str(dps.get(str(int(DP.DECIBEL_SENSITIVITY)), "1"))
         status.cry_detection_switch = bool(dps.get(str(int(DP.CRY_DETECTION_SWITCH)), False))
+
+        # Event Detection Snapshot metadata (DP 185)
+        raw_185 = dps.get("185") or dps.get(str(int(DP.MOVEMENT_DETECT_PIC)))
+        if raw_185:
+            try:
+                if isinstance(raw_185, str):
+                    decoded_bytes = base64.b64decode(raw_185)
+                    info_185 = json.loads(decoded_bytes.decode("utf-8"))
+                elif isinstance(raw_185, dict):
+                    info_185 = raw_185
+                else:
+                    info_185 = {}
+
+                cmd = info_185.get("cmd", "")
+                status.latest_event_cmd = cmd
+                cmd_map = {
+                    "ipc_bang": "Sound / Cry Alert",
+                    "ipc_motion": "Motion Alert",
+                    "ipc_human": "Human Presence",
+                    "ipc_crying": "Baby Crying",
+                    "ipc_alarm": "Alarm Event",
+                }
+                status.latest_event_name = cmd_map.get(cmd, cmd or "Camera Detection Alert")
+                status.latest_event_bucket = info_185.get("bucket", "")
+
+                files = info_185.get("files", [])
+                if files and isinstance(files, list) and len(files) > 0:
+                    first_file = files[0]
+                    if isinstance(first_file, (list, tuple)) and len(first_file) >= 1:
+                        status.latest_event_file = str(first_file[0])
+                        if len(first_file) >= 2:
+                            status.latest_event_key = str(first_file[1])
+                        # Extract timestamp from filename like /.../detect/1791828432.jpeg
+                        fname = status.latest_event_file.split("/")[-1]
+                        num_part = fname.split(".")[0]
+                        if num_part.isdigit():
+                            ts = int(num_part)
+                            if ts > 10_000_000_000:
+                                ts = ts // 1000
+                            status.latest_event_time = ts
+                            dt = datetime.fromtimestamp(ts)
+                            status.latest_event_time_str = dt.strftime("%b %d, %Y %H:%M:%S")
+            except Exception as exc:
+                logger.debug("Could not parse DP 185: %s", exc)
 
         # Lullaby
         lullaby_ctrl = str(dps.get(str(int(DP.IPC_LULLABY_CONTROL)), "0"))

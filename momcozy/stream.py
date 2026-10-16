@@ -537,6 +537,9 @@ class VideoStreamer:
         self._connected = False
         self._last_error: Optional[str] = None
         self._latest_frame: Optional[bytes] = None
+        self._latest_detection_snapshot: Optional[bytes] = None
+        self._latest_detection_time: Optional[float] = None
+        self._latest_detection_trigger: str = ""
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._stream_task: Optional[asyncio.Task] = None
@@ -573,6 +576,43 @@ class VideoStreamer:
     @property
     def latest_frame(self) -> Optional[bytes]:
         return self._latest_frame
+
+    @property
+    def latest_detection_snapshot(self) -> Optional[bytes]:
+        return self._latest_detection_snapshot
+
+    @property
+    def latest_detection_time(self) -> Optional[float]:
+        return self._latest_detection_time
+
+    @property
+    def latest_detection_trigger(self) -> str:
+        return self._latest_detection_trigger
+
+    def capture_detection_snapshot(self, trigger: str = "Live Snapshot") -> Optional[bytes]:
+        """Freeze and save current video frame as detection snapshot."""
+        if self._latest_frame:
+            self._latest_detection_snapshot = self._latest_frame
+            self._latest_detection_time = time.time()
+            self._latest_detection_trigger = trigger
+            logger.info("Saved detection snapshot for %s (trigger: %s, %d bytes)", self.device_id, trigger, len(self._latest_frame))
+            return self._latest_frame
+        return None
+
+    async def get_detection_snapshot(self, timeout_seconds: float = 5.0) -> bytes:
+        """Return the latest detection snapshot, or capture a live frame if none stored yet."""
+        if self._latest_detection_snapshot:
+            return self._latest_detection_snapshot
+        if self._latest_frame:
+            self._latest_detection_snapshot = self._latest_frame
+            self._latest_detection_time = time.time()
+            self._latest_detection_trigger = "Live Capture"
+            return self._latest_frame
+        frame = await self.get_snapshot(timeout_seconds=timeout_seconds)
+        self._latest_detection_snapshot = frame
+        self._latest_detection_time = time.time()
+        self._latest_detection_trigger = "Live Snapshot"
+        return frame
 
     @property
     def stream_mode(self) -> str:
@@ -675,6 +715,9 @@ class VideoStreamer:
                                 self.device_id,
                             )
                             self._last_error = f"Camera {self.device_id} reported busy repeatedly. Reboot camera."
+                        elif getattr(stream, "motion_detected", False):
+                            logger.info("Motion detected on camera %s! Freezing detection snapshot.", self.device_id)
+                            self.capture_detection_snapshot(trigger="Motion Detected")
                         elif getattr(stream, "streaming", False):
                             logger.info("P2P session confirmed streaming from camera %s.", self.device_id)
 
@@ -737,6 +780,8 @@ class VideoStreamer:
                                     self.device_id,
                                     len(jpeg_frame),
                                 )
+                                if not self._latest_detection_snapshot:
+                                    self.capture_detection_snapshot(trigger="Session Baseline Snapshot")
                             elif frames_received % 1000 == 0:
                                 logger.info(
                                     "Stream healthy: %d frames decoded from camera %s",

@@ -492,6 +492,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <button class="btn" onclick="toggleFlip()">Flip</button>
         </div>
       </div>
+
+      <!-- Detection Snapshot Card -->
+      <div class="card">
+        <h2>📸 Detection Snapshot <span class="badge" id="detect-badge">Event Log</span></h2>
+        <div style="position:relative; width:100%; aspect-ratio:16/9; background:#1A202C; border-radius:8px; overflow:hidden; margin:8px 0 12px 0; display:flex; align-items:center; justify-content:center; box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);">
+          <img id="detect-img" src="/detection_snapshot.jpg" alt="Latest Detection Snapshot" style="width:100%; height:100%; object-fit:contain; cursor:pointer;" onclick="viewFullDetectSnapshot()" title="Click to view full size">
+          <div id="detect-empty" style="display:none; color:#A0AEC0; font-size:0.85rem; text-align:center; padding:12px;">No detection event recorded yet</div>
+        </div>
+        <div class="control-row">
+          <span>Trigger Event</span>
+          <span id="detect-trigger" class="badge" style="background:#EDF2F7; color:var(--text);">Sound / Cry Alert</span>
+        </div>
+        <div class="control-row">
+          <span>Recorded At</span>
+          <span id="detect-time" style="font-size:0.85rem; font-weight:600; color:var(--text);">Checking...</span>
+        </div>
+        <div class="control-row" id="detect-cloud-row" style="display:none;">
+          <span>Camera Event File</span>
+          <span id="detect-cloud-file" style="font-family:monospace; font-size:0.72rem; color:var(--text-muted); max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn" style="flex:1; font-size:0.82rem;" onclick="viewFullDetectSnapshot()">🔍 Full Size</button>
+          <button class="btn primary" style="flex:1; font-size:0.82rem;" onclick="captureLiveSnapshot()">📷 Capture Now</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -529,6 +554,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         console.error(e);
         showToast(`Request failed: ${e.message}`, 'error');
         return false;
+      }
+    }
+
+    let lastDetectTime = null;
+    function viewFullDetectSnapshot() {
+      window.open('/detection_snapshot.jpg?t=' + Date.now(), '_blank');
+    }
+
+    async function captureLiveSnapshot() {
+      showToast('Capturing snapshot from live camera...', 'info', 1500);
+      const ok = await apiPost('capture_detection_snapshot');
+      if (ok) {
+        showToast('Detection snapshot captured!', 'success', 2000);
+        const detectImg = document.getElementById('detect-img');
+        if (detectImg) detectImg.src = '/detection_snapshot.jpg?t=' + Date.now();
+        updateStatus();
       }
     }
 
@@ -883,6 +924,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('priv-stat').innerText = d.privacy_mode ? "ON" : "OFF";
         const nvMap = {"0": "Auto", "1": "Off", "2": "On"};
         document.getElementById('nv-stat').innerText = nvMap[d.night_vision] || d.night_vision;
+
+        // Detection snapshot telemetry
+        const detectTrigger = d.detection_trigger || d.latest_event_name || 'Event Alert';
+        const detectTime = d.detection_time_str || d.latest_event_time_str || '';
+        const trigEl = document.getElementById('detect-trigger');
+        if (trigEl) trigEl.innerText = detectTrigger;
+        const timeEl = document.getElementById('detect-time');
+        if (timeEl) timeEl.innerText = detectTime || 'No recent events';
+        if (d.latest_event_file) {
+          const rowEl = document.getElementById('detect-cloud-row');
+          const fileEl = document.getElementById('detect-cloud-file');
+          if (rowEl) rowEl.style.display = 'flex';
+          if (fileEl) {
+            fileEl.innerText = d.latest_event_file;
+            fileEl.title = `${d.latest_event_bucket || 'cloud'}: ${d.latest_event_file}`;
+          }
+        }
+        if (d.detection_time && d.detection_time !== lastDetectTime) {
+          lastDetectTime = d.detection_time;
+          const detectImg = document.getElementById('detect-img');
+          if (detectImg) detectImg.src = '/detection_snapshot.jpg?t=' + Date.now();
+        }
       } catch(e) {
         offlineFailures++;
         if (offlineFailures >= 2) {
@@ -961,6 +1024,8 @@ class WebServer:
         self.app.router.add_get("/stream", self.handle_stream)
         self.app.router.add_get("/audio", self.handle_audio)
         self.app.router.add_get("/snapshot", self.handle_snapshot)
+        self.app.router.add_get("/detection_snapshot.jpg", self.handle_detection_snapshot)
+        self.app.router.add_get("/api/detection_snapshot", self.handle_detection_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_post("/api/control", self.handle_api_control)
 
@@ -1099,6 +1164,26 @@ class WebServer:
         except Exception as e:
             return web.Response(status=504, text=f"Snapshot error: {e}")
 
+    async def handle_detection_snapshot(self, request: web.Request) -> web.Response:
+        """Return the latest detection event snapshot JPEG."""
+        if not self.streamer:
+            return web.Response(status=503, text="Video streamer not configured")
+        try:
+            frame = await self.streamer.get_detection_snapshot(timeout_seconds=5)
+            if not frame:
+                return web.Response(status=404, text="No detection snapshot available yet")
+            return web.Response(
+                body=frame,
+                content_type="image/jpeg",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
+        except Exception as e:
+            return web.Response(status=504, text=f"Detection snapshot error: {e}")
+
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
         raw_sm = getattr(self.streamer, "stream_mode", "none") if self.streamer else "none"
@@ -1128,6 +1213,19 @@ class WebServer:
         raw_le = getattr(self.streamer, "last_error", None) if self.streamer else None
         stream_error = str(raw_le) if isinstance(raw_le, str) else None
 
+        raw_dt = getattr(self.streamer, "latest_detection_time", None) if self.streamer else None
+        detect_time = float(raw_dt) if isinstance(raw_dt, (int, float)) and not isinstance(raw_dt, bool) else None
+
+        raw_trig = getattr(self.streamer, "latest_detection_trigger", "") if self.streamer else ""
+        detect_trigger = str(raw_trig) if isinstance(raw_trig, str) else ""
+
+        has_detect_snap = bool(
+            self.streamer is not None and (
+                isinstance(getattr(self.streamer, "latest_detection_snapshot", None), bytes)
+                or isinstance(getattr(self.streamer, "latest_frame", None), bytes)
+            )
+        )
+
         stream_info = {
             "stream_configured": self.streamer is not None,
             "stream_running": bool(getattr(self.streamer, "is_running", False)) if self.streamer else False,
@@ -1135,6 +1233,14 @@ class WebServer:
             "stream_listeners": stream_listeners,
             "audio_available": True,
             "audio_listeners": audio_listeners,
+            "has_detection_snapshot": has_detect_snap,
+            "detection_trigger": detect_trigger,
+            "detection_time": detect_time,
+            "detection_time_str": (
+                time.strftime("%b %d, %Y %H:%M:%S", time.localtime(detect_time))
+                if detect_time
+                else ""
+            ),
             "stream_idle_timeout": stream_idle_timeout,
             "stream_error": stream_error,
             "stream_mode": stream_mode,
@@ -1145,6 +1251,25 @@ class WebServer:
         }
         try:
             status = await asyncio.to_thread(self.monitor.get_status)
+
+            raw_cmd = getattr(status, "latest_event_cmd", "")
+            latest_event_cmd = str(raw_cmd) if isinstance(raw_cmd, str) else ""
+
+            raw_name = getattr(status, "latest_event_name", "")
+            latest_event_name = str(raw_name) if isinstance(raw_name, str) else ""
+
+            raw_ev_time = getattr(status, "latest_event_time", None)
+            latest_event_time = int(raw_ev_time) if isinstance(raw_ev_time, (int, float)) and not isinstance(raw_ev_time, bool) else None
+
+            raw_time_str = getattr(status, "latest_event_time_str", "")
+            latest_event_time_str = str(raw_time_str) if isinstance(raw_time_str, str) else ""
+
+            raw_file = getattr(status, "latest_event_file", "")
+            latest_event_file = str(raw_file) if isinstance(raw_file, str) else ""
+
+            raw_bucket = getattr(status, "latest_event_bucket", "")
+            latest_event_bucket = str(raw_bucket) if isinstance(raw_bucket, str) else ""
+
             return web.json_response({
                 "online": True,
                 "temperature_c": status.temperature_c,
@@ -1162,6 +1287,12 @@ class WebServer:
                 "lullaby_track": status.lullaby_track,
                 "master_volume": status.master_volume,
                 "sd_card_status": status.sd_card_status,
+                "latest_event_cmd": latest_event_cmd,
+                "latest_event_name": latest_event_name,
+                "latest_event_time": latest_event_time,
+                "latest_event_time_str": latest_event_time_str,
+                "latest_event_file": latest_event_file,
+                "latest_event_bucket": latest_event_bucket,
                 **stream_info,
             })
         except Exception as e:
@@ -1184,6 +1315,12 @@ class WebServer:
                 "lullaby_track": "0",
                 "master_volume": 50,
                 "sd_card_status": 1,
+                "latest_event_cmd": "",
+                "latest_event_name": "",
+                "latest_event_time": None,
+                "latest_event_time_str": "",
+                "latest_event_file": "",
+                "latest_event_bucket": "",
                 **stream_info,
             })
 
@@ -1194,7 +1331,12 @@ class WebServer:
             data = await request.json()
             action = data.get("action")
 
-            if action == "ptz_step":
+            if action == "capture_detection_snapshot":
+                if self.streamer:
+                    frame = self.streamer.capture_detection_snapshot(trigger="Manual UI Capture")
+                    return web.json_response({"status": "ok", "captured": frame is not None})
+                return web.json_response({"status": "error", "error": "Streamer not available"}, status=503)
+            elif action == "ptz_step":
                 direction = data.get("direction", "0")
                 duration = float(data.get("duration", 0.175))
                 await asyncio.to_thread(self.monitor.ptz_step, direction, duration)

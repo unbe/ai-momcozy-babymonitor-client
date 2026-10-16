@@ -973,6 +973,64 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(streamer._idle_task)
         await streamer.stop()
 
+    def test_dp_185_detection_event_parsing(self):
+        import base64
+        import json
+        from momcozy.device import MomcozyMonitor
+
+        raw_payload = {
+            "v": "3.0",
+            "bucket": "ty-eu-storage30-pic",
+            "cmd": "ipc_bang",
+            "type": "image",
+            "files": [["/path/detect/1791828432.jpeg", "key123"]],
+        }
+        b64_str = base64.b64encode(json.dumps(raw_payload).encode()).decode()
+
+        monitor = MomcozyMonitor(device_id="dev1", local_key="key1")
+        status = monitor._parse_dps({"185": b64_str})
+
+        self.assertEqual(status.latest_event_cmd, "ipc_bang")
+        self.assertEqual(status.latest_event_name, "Sound / Cry Alert")
+        self.assertEqual(status.latest_event_bucket, "ty-eu-storage30-pic")
+        self.assertEqual(status.latest_event_file, "/path/detect/1791828432.jpeg")
+        self.assertEqual(status.latest_event_time, 1791828432)
+        self.assertIn("2026", status.latest_event_time_str)
+
+    async def test_handle_detection_snapshot_endpoint(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        mock_streamer = MagicMock()
+        mock_streamer.get_detection_snapshot = AsyncMock(return_value=b"FAKE_JPEG_BYTES")
+
+        server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+
+        req = make_mocked_request("GET", "/detection_snapshot.jpg")
+        resp = await server.handle_detection_snapshot(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.content_type, "image/jpeg")
+        self.assertEqual(resp.body, b"FAKE_JPEG_BYTES")
+
+    async def test_video_streamer_detection_snapshot_capture(self):
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer("dev123", "localkey")
+        streamer._latest_frame = b"CURRENT_JPEG_FRAME"
+
+        # Capture snapshot
+        captured = streamer.capture_detection_snapshot(trigger="Test Trigger")
+        self.assertEqual(captured, b"CURRENT_JPEG_FRAME")
+        self.assertEqual(streamer.latest_detection_snapshot, b"CURRENT_JPEG_FRAME")
+        self.assertEqual(streamer.latest_detection_trigger, "Test Trigger")
+        self.assertIsNotNone(streamer.latest_detection_time)
+
+        # get_detection_snapshot returns cached frame
+        snap = await streamer.get_detection_snapshot()
+        self.assertEqual(snap, b"CURRENT_JPEG_FRAME")
+
 
 if __name__ == "__main__":
     unittest.main()

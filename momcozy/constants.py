@@ -71,13 +71,16 @@ class DP(int, Enum):
     TEMP_SETTING = 239          # Temperature configuration
 
     # Motion & Sound Detection
+    ALARM_STATUS = 127          # String: Current alarm event status (e.g. "motion")
     MOTION_SWITCH = 134         # Boolean: Motion detection on/off
     MOTION_TRACKING = 161       # Boolean: Auto-follow moving objects
     MOTION_AREA_SWITCH = 168    # Boolean: Custom detection zone on/off
     MOTION_AREA = 169           # String: Custom detection zone coordinates
     DECIBEL_SWITCH = 138        # Boolean: Sound/Noise detection on/off
+    DECIBEL_SWITCH_ALT = 139    # Boolean: Sound detection switch on certain BM04 firmwares
     DECIBEL_SENSITIVITY = 140   # String: Sound sensitivity
     CRY_DETECTION_SWITCH = 167  # Boolean: Cry detection on/off
+    MOVEMENT_DETECT_PIC = 185   # String (Base64 JSON): Event detection snapshot metadata and cloud path
 
     # Electronic Fence (Safe / Danger Zone)
     FENCE_AREA_SWITCH = 247     # Boolean: Danger zone alert on/off
