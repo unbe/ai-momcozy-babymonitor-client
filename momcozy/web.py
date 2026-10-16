@@ -26,6 +26,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Momcozy BM04 Baby Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
   <style>
     :root {
       --primary: #FF7E98;
@@ -843,6 +844,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 """
 
 
+BABY_FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="30" fill="#E0F2FE" stroke="#38BDF8" stroke-width="2"/>
+  <circle cx="32" cy="34" r="19" fill="#FED7AA"/>
+  <!-- Hair tuft -->
+  <path d="M32 15 C34 9 39 12 37 16 C35 16 33 16 32 15 Z" fill="#9A3412"/>
+  <!-- Eyes -->
+  <circle cx="26" cy="32" r="2.5" fill="#1E293B"/>
+  <circle cx="38" cy="32" r="2.5" fill="#1E293B"/>
+  <circle cx="25.2" cy="31.2" r="0.9" fill="#FFFFFF"/>
+  <circle cx="37.2" cy="31.2" r="0.9" fill="#FFFFFF"/>
+  <!-- Rosy Cheeks -->
+  <ellipse cx="22" cy="37" rx="3.5" ry="2" fill="#FB7185" opacity="0.6"/>
+  <ellipse cx="42" cy="37" rx="3.5" ry="2" fill="#FB7185" opacity="0.6"/>
+  <!-- Pacifier -->
+  <circle cx="32" cy="41" r="4.5" fill="#38BDF8"/>
+  <circle cx="32" cy="41" r="2" fill="#FFFFFF"/>
+  <path d="M29 44 C29 48 35 48 35 44" fill="none" stroke="#0284C7" stroke-width="1.8" stroke-linecap="round"/>
+</svg>"""
+
+
 class WebServer:
     """Embedded aiohttp server hosting the BM04 web dashboard and MJPEG stream."""
 
@@ -869,7 +890,11 @@ class WebServer:
         self.app.router.add_post("/api/control", self.handle_api_control)
 
     async def handle_favicon(self, request: web.Request) -> web.Response:
-        return web.Response(status=204)
+        return web.Response(
+            text=BABY_FAVICON_SVG,
+            content_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     async def handle_index(self, request: web.Request) -> web.Response:
         return web.Response(text=HTML_DASHBOARD, content_type="text/html")

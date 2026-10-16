@@ -600,6 +600,21 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["control_mode"], "local_lan")
         self.assertEqual(body["control_transport"], "Local LAN (192.168.1.50:6668)")
 
+    async def test_handle_favicon_returns_baby_svg(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        server = WebServer(monitor=mock_monitor, streamer=None)
+        req = make_mocked_request("GET", "/favicon.ico")
+        resp = await server.handle_favicon(req)
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.content_type, "image/svg+xml")
+        self.assertIn("<svg", resp.text)
+        self.assertIn("Pacifier", resp.text)
+
     async def test_handle_stream_not_configured(self):
         from unittest.mock import MagicMock
         from aiohttp.test_utils import make_mocked_request
