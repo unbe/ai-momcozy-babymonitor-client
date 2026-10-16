@@ -280,44 +280,15 @@ Now open `http://localhost:8421` in any browser:
 - **Latest Detection Snapshot:** `http://localhost:8421/detection_snapshot.jpg`
 - **JSON Telemetry API:** `http://localhost:8421/api/status`
 - **Control API:** `POST http://localhost:8421/api/control`
-- **Chromecast API:** `GET /api/chromecast/devices`, `POST /api/chromecast/cast`, `POST /api/chromecast/stop`
 
-### 8. Google Chromecast & Smart TV Streaming
+### 8. Google Chromecast & Smart TV Streaming (Browser Native)
 
-Cast your baby monitor's live camera feed or microphone audio directly to any **Google Chromecast**, **Chromecast with Google TV**, **Google Nest Hub**, or **Google Home / Nest Audio speaker**.
+Stream your baby monitor's live camera feed directly to any **Google Chromecast**, **Chromecast with Google TV**, or **Google Nest Hub**:
 
-#### A. Web UI Casting (One-Click)
-- Open the dashboard at `http://localhost:8421`.
-- The dashboard automatically scans your local Wi-Fi for Chromecast devices.
-- In the **📺 Chromecast / TV** card:
-  - Click **📺 Cast Video** to cast the live camera video stream (via HLS) to your TV or Nest Hub.
-  - Click **🔊 Cast Audio** to stream live baby nursery audio (via MP3) to a Google Home or Nest Mini speaker.
-  - Click **⏹️ Stop** anytime to end the cast session.
-- In Chrome / Edge / Brave browsers, you can also use the native **Cast button** directly on the video player overlay.
-
-#### B. Command-Line (CLI) Casting
-Discover devices on your network:
-```bash
-momcozy chromecast
-# Or: momcozy cast
-```
-
-Cast live camera video to a Chromecast by name or IP:
-```bash
-momcozy cast --device "Living Room TV"
-# Or cast directly to an IP:
-momcozy cast --device "192.168.1.100"
-```
-
-Cast live nursery audio to a smart speaker:
-```bash
-momcozy cast --device "Bedroom Speaker" --type audio
-```
-
-Stop casting on a device:
-```bash
-momcozy cast --stop "Living Room TV"
-```
+- Open the dashboard at `http://localhost:8421` in Chrome or any browser supporting Google Cast.
+- Click the native **Google Cast button** on the video player overlay.
+- Select your Chromecast or smart display from the browser's native Cast dialog.
+- The browser will stream the live HLS feed (`/hls/stream.m3u8`) directly to your TV.
 
 ### 9. Device Sharing
 
