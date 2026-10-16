@@ -3,14 +3,13 @@ services:
     build: .
     container_name: momcozy-monitor
     restart: unless-stopped
-    ports:
-      - "8421:8421"
+    # Shares the host's IP and network stack (enables local LAN UDP discovery & control):
+    network_mode: host
     volumes:
       # Mount single config file (ensure `touch .momcozy.json` exists before running)
       - ./.momcozy.json:/config/.momcozy.json
     environment:
       - MOMCOZY_CONFIG=/config/.momcozy.json
       # Optional environment overrides:
+      # - MOMCOZY_IP=10.11.2.12
       # - MOMCOZY_PASSWORD=your_password_here
-    # For optimal local LAN device control and lowest latency on Linux:
-    # network_mode: host

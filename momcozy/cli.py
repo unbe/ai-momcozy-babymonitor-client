@@ -33,9 +33,9 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         except Exception:
             pass
 
-    dev_id = getattr(args, "device_id", None) or saved.get("device_id")
-    local_key = getattr(args, "local_key", None) or saved.get("local_key")
-    ip = getattr(args, "ip", None) or saved.get("ip")
+    dev_id = getattr(args, "device_id", None) or os.environ.get("MOMCOZY_DEVICE_ID") or saved.get("device_id")
+    local_key = getattr(args, "local_key", None) or os.environ.get("MOMCOZY_LOCAL_KEY") or saved.get("local_key")
+    ip = getattr(args, "ip", None) or os.environ.get("MOMCOZY_IP") or saved.get("ip")
 
     # If dev_id is an app client UUID (36 chars with hyphens), auto-resolve to real camera ID
     if (not dev_id) or (dev_id and len(dev_id) == 36 and "-" in dev_id):

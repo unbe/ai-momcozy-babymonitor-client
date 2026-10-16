@@ -134,11 +134,11 @@ docker build -t momcozy-client .
 # 3. Log in
 docker run -it --rm -v $(pwd)/.momcozy.json:/config/.momcozy.json momcozy-client login
 
-# 4. Run the streaming server
+# 4. Run the streaming server (shares host IP for native local LAN discovery)
 docker run -d \
   --name momcozy-monitor \
   --restart unless-stopped \
-  -p 8421:8421 \
+  --network host \
   -v $(pwd)/.momcozy.json:/config/.momcozy.json \
   momcozy-client
 
