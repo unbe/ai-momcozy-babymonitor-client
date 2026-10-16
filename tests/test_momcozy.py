@@ -673,6 +673,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
 
         streamer = VideoStreamer("dev123", "localkey", idle_timeout=0.08)
         streamer._running = True
+        streamer._connected = True
         streamer._latest_frame = b"fake_jpeg"
 
         # When a listener subscribes, idle stop is cancelled

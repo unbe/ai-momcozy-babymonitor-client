@@ -661,17 +661,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       updateStatus();
     }
 
+    let streamRetryTimer = null;
+    let streamRetryCount = 0;
+
     if (streamImg) {
       streamImg.onerror = function() {
-        setStreamError('Live Stream Disconnected', 'Video feed connection lost. Reconnecting in 3s...');
+        streamRetryCount++;
+        const delay = Math.min(10, 2 * streamRetryCount);
+        setStreamError('Live Stream Reconnecting', `Video feed connection lost. Retrying in ${delay}s...`);
         if (!streamRetryTimer) {
           streamRetryTimer = setTimeout(() => {
             streamRetryTimer = null;
             if (streamImg) streamImg.src = '/stream?t=' + Date.now();
-          }, 3000);
+          }, delay * 1000);
         }
       };
       streamImg.onload = function() {
+        streamRetryCount = 0;
         const errOverlay = document.getElementById('video-error');
         if (errOverlay) errOverlay.classList.add('hidden');
         const streamBadge = document.getElementById('stream-badge');
@@ -683,18 +689,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
       };
 
-      // Disconnect stream when page is unloaded or hidden to conserve bandwidth and trigger server idle timeout
-      window.addEventListener('beforeunload', () => {
-        if (streamImg) streamImg.src = '';
-      });
-      window.addEventListener('pagehide', () => {
-        if (streamImg) streamImg.src = '';
-      });
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') {
-          if (streamImg) streamImg.src = '';
-        } else if (document.visibilityState === 'visible') {
-          if (streamImg && !streamImg.src.includes('/stream')) {
+        if (document.visibilityState === 'visible') {
+          // Re-trigger live stream if device woke up with a stale connection
+          if (streamImg && (!streamImg.complete || streamImg.naturalWidth === 0)) {
             streamImg.src = '/stream?t=' + Date.now();
           }
           updateStatus();
@@ -769,6 +767,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           if (liveDot) {
             liveDot.style.background = '#48BB78';
             liveDot.style.animation = 'pulse 1.5s infinite';
+          }
+        } else if (d.stream_running) {
+          const streamBadge = document.getElementById('stream-badge');
+          const liveDot = document.getElementById('live-dot');
+          if (streamBadge) streamBadge.innerText = 'CONNECTING...';
+          if (liveDot) {
+            liveDot.style.background = '#ED8936';
+            liveDot.style.animation = 'pulse 1s infinite';
           }
         }
 
@@ -869,7 +875,9 @@ class WebServer:
 
     async def handle_stream(self, request: web.Request) -> web.StreamResponse:
         """Serve live video as multipart/x-mixed-replace MJPEG stream."""
+        client_ip = request.remote or "unknown"
         if not self.streamer:
+            logger.warning("Rejected /stream from %s: Live video streamer is not configured (missing Tuya credentials)", client_ip)
             return web.Response(
                 status=503,
                 text="Live video stream is not configured: Missing Tuya credentials.",
@@ -877,16 +885,18 @@ class WebServer:
             )
 
         if not self.streamer.is_running:
+            logger.info("Incoming /stream request from %s: Starting live video streamer on demand...", client_ip)
             try:
                 await self.streamer.start()
             except Exception as e:
-                logger.warning("Could not start live video streamer: %s", e)
+                logger.error("Could not start live video streamer for %s: %s", client_ip, e)
                 return web.Response(
                     status=502,
                     text=f"Could not start video stream: {e}",
                     content_type="text/plain",
                 )
 
+        logger.info("Serving /stream MJPEG response to client %s", client_ip)
         response = web.StreamResponse(
             status=200,
             reason="OK",
@@ -902,6 +912,7 @@ class WebServer:
 
         last_sent = 0.0
         min_interval = 0.065  # Target smooth ~15 FPS to prevent browser buffer saturation
+        frames_sent = 0
 
         try:
             async for frame in self.streamer.subscribe():
@@ -916,10 +927,11 @@ class WebServer:
                 )
                 await response.write(header + frame + b"\r\n")
                 await response.drain()
+                frames_sent += 1
         except (asyncio.CancelledError, ConnectionResetError):
-            pass
+            logger.info("Client %s disconnected from /stream (sent %d frames)", client_ip, frames_sent)
         except Exception as e:
-            logger.debug("Video stream subscription error: %s", e)
+            logger.warning("Client %s /stream write error: %s (sent %d frames)", client_ip, e, frames_sent)
 
         return response
 

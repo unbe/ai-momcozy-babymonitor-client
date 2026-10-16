@@ -123,13 +123,16 @@ class MomcozyHevcHandler:
                 annexb_chunk.extend(payload)
 
         if annexb_chunk:
-            for packet in self._codec.parse(bytes(annexb_chunk)):
-                for frame in self._codec.decode(packet):
-                    arr = frame.to_ndarray(format="bgr24")
-                    _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                    jpg_bytes = enc.tobytes()
-                    self.frame_count += 1
-                    self._on_frame(jpg_bytes)
+            try:
+                for packet in self._codec.parse(bytes(annexb_chunk)):
+                    for frame in self._codec.decode(packet):
+                        arr = frame.to_ndarray(format="bgr24")
+                        _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                        jpg_bytes = enc.tobytes()
+                        self.frame_count += 1
+                        self._on_frame(jpg_bytes)
+            except Exception as exc:
+                logger.warning("Error decoding camera HEVC video packet: %s", exc)
 
 
 def _patch_tuya_stream_session() -> None:
@@ -149,11 +152,15 @@ def _patch_tuya_stream_session() -> None:
     def momcozy_on_media_record(self: Any, record: bytes) -> None:
         try:
             pt = decrypt_record(self._answer_key, record)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Decryption failed on incoming media packet: %s", exc)
             return
         if hasattr(self, "_momcozy_hevc"):
-            self._momcozy_hevc.feed_record(pt)
-            self._frames = self._momcozy_hevc.frame_count
+            try:
+                self._momcozy_hevc.feed_record(pt)
+                self._frames = self._momcozy_hevc.frame_count
+            except Exception as exc:
+                logger.warning("Error processing HEVC media packet: %s", exc)
 
     StreamSession.__init__ = momcozy_session_init
     StreamSession._on_media_record = momcozy_on_media_record
@@ -165,6 +172,11 @@ def _configure_tuya_p2p_sdk() -> None:
     import tuya_ipc_p2p_sdk.const as sdk_const
     import tuya_ipc_p2p_sdk.gateway.client as sdk_gw_client
     import tuya_ipc_p2p_sdk.gateway.identity as sdk_gw_identity
+
+    # Ensure Tuya P2P SDK errors and state warnings are visible in server logs
+    p2p_log = logging.getLogger("tuya_ipc_p2p_sdk")
+    p2p_log.setLevel(logging.INFO)
+    p2p_log.propagate = True
 
     for mod in (sdk_const, sdk_gw_client, sdk_gw_identity):
         for attr, val in [
@@ -408,6 +420,7 @@ class VideoStreamer:
         async with self._lock:
             self._running = False
             self._connected = False
+            self._latest_frame = None
             if self._stream_task:
                 self._stream_task.cancel()
                 try:
@@ -433,12 +446,61 @@ class VideoStreamer:
                     tuya_region=self.tuya_region,
                 ) as client:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
+
+                    def on_state():
+                        if getattr(stream, "needs_power_cycle", False):
+                            logger.error(
+                                "Camera %s answered busy repeatedly and needs to be power cycled/rebooted.",
+                                self.device_id,
+                            )
+                            self._last_error = f"Camera {self.device_id} reported busy repeatedly. Reboot camera."
+                        elif getattr(stream, "streaming", False):
+                            logger.info("P2P session confirmed streaming from camera %s.", self.device_id)
+
+                    stream.add_state_listener(on_state)
                     await stream.async_start()
+                    logger.info("P2P stream initiated for %s. Awaiting video frames...", self.device_id)
                     backoff = 2
+
+                    frame_iter = stream.async_frames()
+                    frames_received = 0
+                    initial_timeout = 20.0
+                    cadence_timeout = 10.0
+
                     try:
-                        async for jpeg_frame in stream.async_frames():
-                            if not self._running:
+                        while self._running:
+                            timeout = initial_timeout if frames_received == 0 else cadence_timeout
+                            try:
+                                jpeg_frame = await asyncio.wait_for(frame_iter.__anext__(), timeout=timeout)
+                            except TimeoutError:
+                                if frames_received == 0:
+                                    err_msg = f"Timed out waiting for initial video frame from camera {self.device_id} ({timeout:.0f}s)"
+                                    logger.warning("✗ %s. Re-establishing P2P session...", err_msg)
+                                    self._last_error = err_msg
+                                else:
+                                    err_msg = f"Live video stream stalled: no frames received from camera {self.device_id} for {timeout:.0f}s"
+                                    logger.warning("✗ %s. Reconnecting...", err_msg)
+                                    self._last_error = err_msg
+                                self._connected = False
                                 break
+                            except StopAsyncIteration:
+                                logger.info("Video stream closed by camera %s.", self.device_id)
+                                break
+
+                            frames_received += 1
+                            if frames_received == 1:
+                                logger.info(
+                                    "✓ First live video frame decoded for %s (%d bytes). Stream active.",
+                                    self.device_id,
+                                    len(jpeg_frame),
+                                )
+                            elif frames_received % 1000 == 0:
+                                logger.info(
+                                    "Stream healthy: %d frames decoded from camera %s",
+                                    frames_received,
+                                    self.device_id,
+                                )
+
                             self._connected = True
                             self._last_error = None
                             self._latest_frame = jpeg_frame
@@ -461,23 +523,38 @@ class VideoStreamer:
             except Exception as e:
                 self._connected = False
                 self._last_error = str(e)
-                logger.error("P2P stream error: %s. Reconnecting in %ss...", e, backoff)
+                logger.error("P2P stream error for %s: %s. Reconnecting in %ss...", self.device_id, e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(30, backoff * 1.5)
 
     async def subscribe(self) -> AsyncIterator[bytes]:
         """Subscribe to live frames."""
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=10)
-        if self._latest_frame:
+        if self._latest_frame and self._connected:
             queue.put_nowait(self._latest_frame)
         self._listeners.add(queue)
         self._cancel_idle_stop()
+        logger.info(
+            "Client subscribed to live stream (active viewers: %d, device: %s)",
+            len(self._listeners),
+            self.device_id,
+        )
         try:
             while self._running:
-                frame = await queue.get()
-                yield frame
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    yield frame
+                except TimeoutError:
+                    if not self._running:
+                        break
+                    continue
         finally:
             self._listeners.discard(queue)
+            logger.info(
+                "Client unsubscribed from live stream (remaining viewers: %d, device: %s)",
+                len(self._listeners),
+                self.device_id,
+            )
             if not self._listeners and self._running and self.idle_timeout > 0:
                 self._schedule_idle_stop()
 
