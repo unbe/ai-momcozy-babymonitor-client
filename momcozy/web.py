@@ -944,6 +944,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       let decoderError = false;
       let lastPts = 0;
 
+      const streamBadgeInit = document.getElementById('stream-badge');
+      if (streamBadgeInit) streamBadgeInit.innerText = 'CONNECTING...';
+
       console.log(`[WebCodecs] Initializing VideoDecoder with codec: ${codec}`);
       try {
         activeDecoder = new VideoDecoder({
@@ -1054,22 +1057,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       ws.onerror = (e) => {
         console.warn('[WebCodecs] WebSocket error:', e);
-        if (frameCount === 0) {
-          fallbackToMjpeg('WebSocket connection error');
-        }
       };
 
       ws.onclose = (e) => {
         console.log('[WebCodecs] WebSocket closed:', e.code, e.reason);
-        if (frameCount === 0 && !isFallbackActive) {
-          fallbackToMjpeg('WebSocket closed before receiving video frames');
-        } else if (streamMode === 'webcodecs' && !isFallbackActive) {
-          setStreamError('Live Stream Reconnecting', 'HEVC feed connection lost. Retrying...');
-          if (!streamRetryTimer) {
-            streamRetryTimer = setTimeout(() => {
-              streamRetryTimer = null;
-              retryStream();
-            }, 2000);
+        if (streamMode === 'webcodecs' && !isFallbackActive && !decoderError) {
+          streamRetryCount++;
+          if (streamRetryCount <= 6) {
+            console.log(`[WebCodecs] Connection closed. Reconnecting (attempt ${streamRetryCount}/6)...`);
+            setStreamError('Live Stream Connecting', `Connecting to camera stream (attempt ${streamRetryCount}/6)...`);
+            if (!streamRetryTimer) {
+              streamRetryTimer = setTimeout(() => {
+                streamRetryTimer = null;
+                retryStream();
+              }, 1500);
+            }
+          } else {
+            console.warn('[WebCodecs] Exceeded retry attempts. Falling back to MJPEG.');
+            fallbackToMjpeg('Camera stream startup timed out after multiple retries');
           }
         }
       };
@@ -1091,12 +1096,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (errOverlay) errOverlay.classList.add('hidden');
       const streamBadge = document.getElementById('stream-badge');
       const liveDot = document.getElementById('live-dot');
-      if (streamBadge) streamBadge.innerText = 'RECONNECTING...';
+      if (streamBadge) streamBadge.innerText = 'CONNECTING...';
       if (liveDot) {
         liveDot.style.background = '#ED8936';
         liveDot.style.animation = 'pulse 1s infinite';
       }
-      showToast('Reconnecting to video stream...', 'info', 2500);
+      showToast('Connecting to camera stream...', 'info', 2500);
 
       if (supportedHevcCodec && !isFallbackActive) {
         startWebCodecsStream(supportedHevcCodec);
@@ -1661,7 +1666,7 @@ class WebServer:
 
     async def handle_ws_stream(self, request: web.Request) -> web.WebSocketResponse:
         """Serve raw HEVC video frames over WebSocket for WebCodecs API playback."""
-        ws = web.WebSocketResponse(heartbeat=15.0)
+        ws = web.WebSocketResponse(heartbeat=20.0)
         await ws.prepare(request)
         client_ip = request.remote or "unknown"
 
@@ -1681,20 +1686,46 @@ class WebServer:
 
         logger.info("Client %s connected to /ws/stream (HEVC pass-through)", client_ip)
         frames_sent = 0
-        try:
+
+        async def send_frames() -> None:
+            nonlocal frames_sent
             async for chunk, is_key in self.streamer.subscribe_hevc():
                 if ws.closed:
                     break
                 header = b"\x01" if is_key else b"\x00"
                 await ws.send_bytes(header + chunk)
                 frames_sent += 1
-        except (asyncio.CancelledError, ConnectionResetError):
-            logger.info("Client %s disconnected from /ws/stream (sent %d frames)", client_ip, frames_sent)
-        except Exception as e:
-            logger.warning("Client %s /ws/stream error: %s (sent %d frames)", client_ip, e, frames_sent)
-        finally:
-            if not ws.closed:
-                await ws.close()
+
+        async def ws_reader() -> None:
+            try:
+                async for _ in ws:
+                    pass
+            except Exception:
+                pass
+
+        sender_task = asyncio.create_task(send_frames())
+        reader_task = asyncio.create_task(ws_reader())
+
+        done, pending = await asyncio.wait(
+            [sender_task, reader_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        for task in done:
+            if not task.cancelled() and task.exception():
+                exc = task.exception()
+                if not isinstance(exc, (ConnectionResetError, asyncio.CancelledError)):
+                    logger.warning("Client %s /ws/stream error: %s (sent %d frames)", client_ip, exc, frames_sent)
+
+        logger.info("Client %s disconnected from /ws/stream (sent %d frames)", client_ip, frames_sent)
+        if not ws.closed:
+            await ws.close()
         return ws
 
     async def handle_audio(self, request: web.Request) -> web.StreamResponse:

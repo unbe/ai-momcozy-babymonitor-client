@@ -1192,6 +1192,45 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp, mock_ws)
             mock_ws.close.assert_awaited_once_with(code=4004, message=b"Streamer not configured")
 
+    async def test_handle_ws_stream_streaming_and_reader(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+
+        async def fake_hevc():
+            yield b"keyframe_bytes", True
+            yield b"delta_bytes", False
+
+        mock_streamer.subscribe_hevc = fake_hevc
+
+        server = WebServer(monitor=MagicMock(), streamer=mock_streamer)
+        req = make_mocked_request("GET", "/ws/stream")
+
+        with unittest.mock.patch("aiohttp.web.WebSocketResponse") as mock_ws_cls:
+            mock_ws = MagicMock()
+            mock_ws.prepare = AsyncMock()
+            mock_ws.close = AsyncMock()
+            mock_ws.send_bytes = AsyncMock()
+            mock_ws.closed = False
+
+            async def fake_incoming():
+                # simulate reader receiving nothing and ending
+                if False:
+                    yield None
+
+            mock_ws.__aiter__ = lambda self: fake_incoming()
+            mock_ws_cls.return_value = mock_ws
+
+            resp = await server.handle_ws_stream(req)
+            self.assertEqual(resp, mock_ws)
+            # Verify sent frames with 1-byte header: \x01 for key, \x00 for delta
+            self.assertEqual(mock_ws.send_bytes.call_count, 2)
+            mock_ws.send_bytes.assert_any_call(b"\x01keyframe_bytes")
+            mock_ws.send_bytes.assert_any_call(b"\x00delta_bytes")
+
     def test_is_transcoding_needed_and_handler_bypass(self):
         import asyncio
         from unittest.mock import MagicMock
