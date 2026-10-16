@@ -992,7 +992,7 @@ class VideoStreamer:
 
                     hevc_iter = stream.async_hevc()
                     chunks_received = 0
-                    initial_timeout = 25.0
+                    initial_timeout = 10.0
                     cadence_timeout = 10.0
 
                     try:
