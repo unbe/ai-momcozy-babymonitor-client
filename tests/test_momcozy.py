@@ -1479,6 +1479,82 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertIn("initial_timeout = 20.0", source)
         self.assertIn("Do not poison _last_error on initial cold-start reconnect", source)
 
+    def test_decode_hevc_gop_to_jpeg(self):
+        import io
+        import av
+        import numpy as np
+        from momcozy.stream import decode_hevc_gop_to_jpeg
+
+        # Empty chunks
+        self.assertIsNone(decode_hevc_gop_to_jpeg([]))
+
+        # Synthesize 3 HEVC frames (1 IDR + 2 delta)
+        buf = io.BytesIO()
+        container = av.open(buf, mode="w", format="hevc")
+        stream = container.add_stream("hevc", rate=15)
+        stream.width = 160
+        stream.height = 120
+        stream.pix_fmt = "yuv420p"
+
+        for i in range(3):
+            img = np.zeros((120, 160, 3), dtype=np.uint8)
+            img[:, :] = (i * 40, 50, 100)
+            frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+
+        hevc_data = buf.getvalue()
+        self.assertGreater(len(hevc_data), 0)
+
+        # Decode GOP chunks to JPEG
+        jpg_bytes = decode_hevc_gop_to_jpeg([hevc_data])
+        self.assertIsNotNone(jpg_bytes)
+        self.assertTrue(jpg_bytes.startswith(b"\xff\xd8"))  # JPEG header
+        self.assertTrue(jpg_bytes.endswith(b"\xff\xd9"))    # JPEG footer
+
+    async def test_get_snapshot_with_rolling_gop_buffer(self):
+        import io
+        import av
+        import numpy as np
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer("dev123", "localkey")
+        self.assertEqual(streamer.gop_buffer_size, 0)
+
+        # Synthesize HEVC GOP
+        buf = io.BytesIO()
+        container = av.open(buf, mode="w", format="hevc")
+        stream = container.add_stream("hevc", rate=15)
+        stream.width = 160
+        stream.height = 120
+        stream.pix_fmt = "yuv420p"
+        img = np.zeros((120, 160, 3), dtype=np.uint8)
+        frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+
+        # Seed rolling GOP buffer
+        streamer._running = True
+        streamer._gop_chunks = [buf.getvalue()]
+        self.assertEqual(streamer.gop_buffer_size, 1)
+
+        # get_snapshot should burst-decode the buffered GOP and return immediately
+        snap = await streamer.get_snapshot(max_age=0.0)
+        self.assertIsNotNone(snap)
+        self.assertTrue(snap.startswith(b"\xff\xd8"))
+        self.assertEqual(streamer.latest_frame, snap)
+
+        # Verify stop clears the GOP buffer
+        await streamer.stop()
+        self.assertEqual(streamer.gop_buffer_size, 0)
+        self.assertIsNone(streamer.latest_frame)
+
 
 if __name__ == "__main__":
     unittest.main()

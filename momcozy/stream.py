@@ -189,6 +189,43 @@ def is_hevc_keyframe(data: bytes) -> bool:
     return False
 
 
+def decode_hevc_gop_to_jpeg(gop_chunks: list[bytes], jpeg_quality: int = 80) -> Optional[bytes]:
+    """Decode a sequence of HEVC Annex B chunks (starting with a keyframe) to a single JPEG image.
+
+    Decodes all frames in the GOP sequentially to maintain the reference picture buffer,
+    then converts and encodes only the final decoded frame as JPEG.
+    """
+    if not gop_chunks:
+        return None
+    try:
+        import av
+    except ImportError:
+        return None
+
+    try:
+        codec = av.CodecContext.create("hevc", "r")
+        last_frame = None
+        for chunk in gop_chunks:
+            for packet in codec.parse(chunk):
+                for frame in codec.decode(packet):
+                    last_frame = frame
+        for packet in codec.parse(b""):
+            for frame in codec.decode(packet):
+                last_frame = frame
+        for frame in codec.decode():
+            last_frame = frame
+
+        if last_frame is None:
+            return None
+
+        arr = last_frame.to_ndarray(format="bgr24")
+        _, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+        return enc.tobytes()
+    except Exception as exc:
+        logger.warning("Error burst-decoding HEVC GOP buffer to JPEG: %s", exc)
+        return None
+
+
 class MomcozyHevcHandler:
     """Reassembles BM04 1080p HEVC video streams, yielding raw chunks and decoded JPEG frames."""
 
@@ -728,6 +765,8 @@ class VideoStreamer:
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._hevc_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._latest_hevc_keyframe: Optional[bytes] = None
+        self._gop_chunks: list[bytes] = []
+        self._gop_time: float = 0.0
         self._snapshot_requests: Set[object] = set()
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
@@ -760,6 +799,11 @@ class VideoStreamer:
     def total_listener_count(self) -> int:
         """Total active listeners across video, audio, and HEVC pass-through."""
         return len(self._listeners) + len(self._audio_listeners) + len(self._hevc_listeners)
+
+    @property
+    def gop_buffer_size(self) -> int:
+        """Number of raw HEVC chunks in the current rolling GOP buffer."""
+        return len(self._gop_chunks)
 
     @property
     def _snapshot_requested(self) -> bool:
@@ -910,6 +954,8 @@ class VideoStreamer:
             self._connected = False
             self._latest_frame = None
             self._latest_hevc_keyframe = None
+            self._gop_chunks = []
+            self._gop_time = 0.0
             if self._stream_task:
                 self._stream_task.cancel()
                 try:
@@ -1058,6 +1104,16 @@ class VideoStreamer:
 
                             if is_key:
                                 self._latest_hevc_keyframe = chunk
+                                self._gop_chunks = [chunk]
+                                self._gop_time = time.monotonic()
+                            else:
+                                if self._gop_chunks:
+                                    if len(self._gop_chunks) < 150:
+                                        self._gop_chunks.append(chunk)
+                                        self._gop_time = time.monotonic()
+                                elif self._latest_hevc_keyframe:
+                                    self._gop_chunks = [self._latest_hevc_keyframe, chunk]
+                                    self._gop_time = time.monotonic()
 
                             for q in list(self._hevc_listeners):
                                 if q.full():
@@ -1194,25 +1250,49 @@ class VideoStreamer:
                 self._schedule_idle_stop()
 
     async def get_snapshot(self, timeout_seconds: float = 10.0, max_age: float = 0.5) -> bytes:
-        """Capture a single fresh frame as JPEG."""
+        """Capture a single fresh frame as JPEG using the rolling GOP buffer."""
         if not self._running:
             await self.start()
         elif not self._listeners and not self._hevc_listeners and self.idle_timeout > 0:
             self._cancel_idle_stop()
             self._schedule_idle_stop()
 
-        # If a live frame was decoded very recently (< max_age seconds ago), it is fresh:
+        # 1. If a live frame was decoded very recently (< max_age seconds ago), it is fresh:
         if self._latest_frame and (time.monotonic() - self._latest_frame_time) < max_age:
             return self._latest_frame
 
+        # 2. If a rolling GOP buffer is available, burst-decode it to JPEG on demand:
+        if self._gop_chunks:
+            gop_copy = list(self._gop_chunks)
+            loop = asyncio.get_running_loop()
+            jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, gop_copy)
+            if jpeg_bytes:
+                self._latest_frame = jpeg_bytes
+                self._latest_frame_time = time.monotonic()
+                if not self._latest_detection_snapshot:
+                    self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
+                return jpeg_bytes
+
+        # 3. Otherwise wait for GOP chunks (or decoded frame) to become available:
         req_id = object()
         self._snapshot_requests.add(req_id)
         start_time = time.monotonic()
         try:
             while time.monotonic() - start_time < timeout_seconds:
-                # Check if a fresh frame arrived since this request started:
+                # Check if a fresh frame arrived:
                 if self._latest_frame and self._latest_frame_time >= start_time:
                     return self._latest_frame
+                # Check if GOP buffer has been populated since request started:
+                if self._gop_chunks:
+                    gop_copy = list(self._gop_chunks)
+                    loop = asyncio.get_running_loop()
+                    jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, gop_copy)
+                    if jpeg_bytes:
+                        self._latest_frame = jpeg_bytes
+                        self._latest_frame_time = time.monotonic()
+                        if not self._latest_detection_snapshot:
+                            self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
+                        return jpeg_bytes
                 if self._last_error and time.monotonic() - start_time > 3.0:
                     raise RuntimeError(f"Camera stream error: {self._last_error}")
                 await asyncio.sleep(0.03)
