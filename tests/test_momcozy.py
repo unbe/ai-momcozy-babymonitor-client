@@ -1033,6 +1033,46 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         snap = await streamer.get_detection_snapshot()
         self.assertEqual(snap, b"CURRENT_JPEG_FRAME")
 
+    async def test_get_snapshot_fetches_fresh_frame_when_cached_frame_stale(self):
+        import asyncio
+        import time
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer("dev123", "localkey")
+        streamer._running = True
+        streamer._latest_frame = b"STALE_BASELINE_FRAME"
+        streamer._latest_frame_time = time.monotonic() - 60.0  # 60s ago
+
+        async def push_fresh_frame():
+            await asyncio.sleep(0.05)
+            streamer._latest_frame = b"NEW_LIVE_CAMERA_FRAME"
+            streamer._latest_frame_time = time.monotonic()
+
+        push_task = asyncio.create_task(push_fresh_frame())
+        fresh_frame = await streamer.get_snapshot(timeout_seconds=2.0)
+        await push_task
+
+        # Ensure get_snapshot waited for and returned the fresh frame, NOT the stale baseline
+        self.assertEqual(fresh_frame, b"NEW_LIVE_CAMERA_FRAME")
+
+    async def test_handle_snapshot_endpoint(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+
+        mock_monitor = MagicMock()
+        mock_streamer = MagicMock()
+        mock_streamer.get_snapshot = AsyncMock(return_value=b"LIVE_SNAPSHOT_BYTES")
+
+        server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+
+        req = make_mocked_request("GET", "/snapshot")
+        resp = await server.handle_snapshot(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.content_type, "image/jpeg")
+        self.assertEqual(resp.body, b"LIVE_SNAPSHOT_BYTES")
+        self.assertIn("Cache-Control", resp.headers)
+        self.assertIn("no-store", resp.headers["Cache-Control"])
 
     async def test_hls_transcoder_properties_and_security(self):
         import tempfile

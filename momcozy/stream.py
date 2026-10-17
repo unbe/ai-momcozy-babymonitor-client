@@ -720,6 +720,7 @@ class VideoStreamer:
         self._connected = False
         self._last_error: Optional[str] = None
         self._latest_frame: Optional[bytes] = None
+        self._latest_frame_time: float = 0.0
         self._latest_detection_snapshot: Optional[bytes] = None
         self._latest_detection_time: Optional[float] = None
         self._latest_detection_trigger: str = ""
@@ -727,7 +728,7 @@ class VideoStreamer:
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._hevc_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._latest_hevc_keyframe: Optional[bytes] = None
-        self._snapshot_requested: bool = False
+        self._snapshot_requests: Set[object] = set()
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -760,9 +761,20 @@ class VideoStreamer:
         """Total active listeners across video, audio, and HEVC pass-through."""
         return len(self._listeners) + len(self._audio_listeners) + len(self._hevc_listeners)
 
+    @property
+    def _snapshot_requested(self) -> bool:
+        return len(self._snapshot_requests) > 0
+
+    @_snapshot_requested.setter
+    def _snapshot_requested(self, val: bool) -> None:
+        if val:
+            self._snapshot_requests.add(self)
+        else:
+            self._snapshot_requests.discard(self)
+
     def is_transcoding_needed(self) -> bool:
         """Return True only if an active listener or pending snapshot requires JPEG transcoding."""
-        return len(self._listeners) > 0 or self._snapshot_requested
+        return len(self._listeners) > 0 or len(self._snapshot_requests) > 0
 
     def is_audio_needed(self) -> bool:
         """Return True only if an active listener is consuming audio."""
@@ -777,6 +789,10 @@ class VideoStreamer:
         return self._latest_frame
 
     @property
+    def latest_frame_time(self) -> float:
+        return self._latest_frame_time
+
+    @property
     def latest_detection_snapshot(self) -> Optional[bytes]:
         return self._latest_detection_snapshot
 
@@ -788,14 +804,15 @@ class VideoStreamer:
     def latest_detection_trigger(self) -> str:
         return self._latest_detection_trigger
 
-    def capture_detection_snapshot(self, trigger: str = "Live Snapshot") -> Optional[bytes]:
+    def capture_detection_snapshot(self, trigger: str = "Live Snapshot", frame: Optional[bytes] = None) -> Optional[bytes]:
         """Freeze and save current video frame as detection snapshot."""
-        if self._latest_frame:
-            self._latest_detection_snapshot = self._latest_frame
+        target = frame or self._latest_frame
+        if target:
+            self._latest_detection_snapshot = target
             self._latest_detection_time = time.time()
             self._latest_detection_trigger = trigger
-            logger.info("Saved detection snapshot for %s (trigger: %s, %d bytes)", self.device_id, trigger, len(self._latest_frame))
-            return self._latest_frame
+            logger.info("Saved detection snapshot for %s (trigger: %s, %d bytes)", self.device_id, trigger, len(target))
+            return target
         return None
 
     async def get_detection_snapshot(self, timeout_seconds: float = 5.0) -> bytes:
@@ -969,6 +986,7 @@ class VideoStreamer:
                                 if not self._running:
                                     break
                                 self._latest_frame = jpeg_frame
+                                self._latest_frame_time = time.monotonic()
                                 if not self._latest_detection_snapshot:
                                     self.capture_detection_snapshot(trigger="Session Baseline Snapshot")
                                 if not self._listeners:
@@ -1170,31 +1188,39 @@ class VideoStreamer:
             if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
                 self._schedule_idle_stop()
 
-    async def get_snapshot(self, timeout_seconds: float = 10.0) -> bytes:
-        """Capture a single frame as JPEG."""
+    async def get_snapshot(self, timeout_seconds: float = 10.0, max_age: float = 0.5) -> bytes:
+        """Capture a single fresh frame as JPEG."""
         if not self._running:
             await self.start()
         elif not self._listeners and not self._hevc_listeners and self.idle_timeout > 0:
             self._cancel_idle_stop()
             self._schedule_idle_stop()
 
-        if self._latest_frame:
+        # If a live frame was decoded very recently (< max_age seconds ago), it is fresh:
+        if self._latest_frame and (time.monotonic() - self._latest_frame_time) < max_age:
             return self._latest_frame
 
-        self._snapshot_requested = True
+        req_id = object()
+        self._snapshot_requests.add(req_id)
+        start_time = time.monotonic()
         try:
-            start_time = time.time()
-            while time.time() - start_time < timeout_seconds:
-                if self._latest_frame:
+            while time.monotonic() - start_time < timeout_seconds:
+                # Check if a fresh frame arrived since this request started:
+                if self._latest_frame and self._latest_frame_time >= start_time:
                     return self._latest_frame
-                if self._last_error and time.time() - start_time > 3.0:
+                if self._last_error and time.monotonic() - start_time > 3.0:
                     raise RuntimeError(f"Camera stream error: {self._last_error}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.03)
+
+            # Fallback to latest available frame if fresh frame timed out
+            if self._latest_frame:
+                logger.warning("Timed out waiting for fresh frame; returning latest available frame")
+                return self._latest_frame
 
             err_suffix = f": {self._last_error}" if self._last_error else ""
             raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
         finally:
-            self._snapshot_requested = False
+            self._snapshot_requests.discard(req_id)
 
     async def record_clip(
         self,

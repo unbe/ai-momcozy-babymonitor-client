@@ -536,7 +536,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <div></div>
         </div>
         <div style="text-align: center; margin-top: 8px;">
-          <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;">📷 Snapshot</a>
+          <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;" onclick="this.href='/snapshot?t=' + Date.now()">📷 Snapshot</a>
         </div>
       </div>
 
@@ -1788,7 +1788,15 @@ class WebServer:
             return web.Response(status=503, text="Video streamer not configured")
         try:
             frame = await self.streamer.get_snapshot(timeout_seconds=5)
-            return web.Response(body=frame, content_type="image/jpeg")
+            return web.Response(
+                body=frame,
+                content_type="image/jpeg",
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
         except Exception as e:
             return web.Response(status=504, text=f"Snapshot error: {e}")
 
@@ -2039,8 +2047,9 @@ class WebServer:
 
             if action == "capture_detection_snapshot":
                 if self.streamer:
-                    frame = self.streamer.capture_detection_snapshot(trigger="Manual UI Capture")
-                    return web.json_response({"status": "ok", "captured": frame is not None})
+                    frame = await self.streamer.get_snapshot(timeout_seconds=5)
+                    self.streamer.capture_detection_snapshot(trigger="Manual UI Capture", frame=frame)
+                    return web.json_response({"status": "ok", "captured": True})
                 return web.json_response({"status": "error", "error": "Streamer not available"}, status=503)
             elif action == "ptz_step":
                 direction = data.get("direction", "0")
