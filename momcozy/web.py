@@ -536,7 +536,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <div></div>
         </div>
         <div style="text-align: center; margin-top: 8px;">
-          <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;" onclick="this.href='/snapshot?t=' + Date.now()">📷 Snapshot</a>
+          <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;">📷 Snapshot</a>
         </div>
       </div>
 
