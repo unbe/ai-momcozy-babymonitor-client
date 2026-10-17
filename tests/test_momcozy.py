@@ -1459,6 +1459,26 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(handler._codec.parse.called)
         self.assertFalse(mock_frame_cb.called)
 
+    def test_client_auto_promotion_and_retry_script(self):
+        from momcozy.web import HTML_DASHBOARD
+
+        # Verify client script includes fatal decoder error tracking
+        self.assertIn("hasFatalDecoderError = false", HTML_DASHBOARD)
+        # Verify 12 retry attempts for WebCodecs before falling back to MJPEG
+        self.assertIn("streamRetryCount <= 12", HTML_DASHBOARD)
+        # Verify retryStream resets fallback if no fatal decoder error
+        self.assertIn("if (supportedHevcCodec && !hasFatalDecoderError)", HTML_DASHBOARD)
+        # Verify auto-promotion in updateStatus
+        self.assertIn("Auto-promoting from MJPEG to WebCodecs HEVC", HTML_DASHBOARD)
+
+    def test_streamer_initial_timeout_configuration(self):
+        import inspect
+        from momcozy.stream import VideoStreamer
+
+        source = inspect.getsource(VideoStreamer._stream_loop)
+        self.assertIn("initial_timeout = 20.0", source)
+        self.assertIn("Do not poison _last_error on initial cold-start reconnect", source)
+
 
 if __name__ == "__main__":
     unittest.main()

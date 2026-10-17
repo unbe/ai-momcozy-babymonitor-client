@@ -840,6 +840,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let activeDecoder = null;
     let supportedHevcCodec = null;
     let isFallbackActive = false;
+    let hasFatalDecoderError = false;
 
     function setStreamError(title, detail) {
       const streamBadge = document.getElementById('stream-badge');
@@ -991,6 +992,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const errMsg = err ? (err.message || String(err)) : 'Unknown decoder error';
             const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, qSize=${activeDecoder ? activeDecoder.decodeQueueSize : 'null'}, chunksFed=${chunksFed}, framesRendered=${frameCount}, hasKeyframe=${hasKeyframe}`;
             console.error(`[WebCodecs] Decoder error (${errName}): ${errMsg}. Details: [${diag}]`, err);
+            hasFatalDecoderError = true;
             decoderError = true;
             fallbackToMjpeg(`Decoder error (${errName}: ${errMsg})`);
           }
@@ -1006,6 +1008,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const errName = err ? (err.name || 'Error') : 'UnknownError';
         const errMsg = err ? (err.message || String(err)) : 'Configuration exception';
         console.error(`[WebCodecs] Failed configuring decoder (${errName}): ${errMsg}`, err);
+        hasFatalDecoderError = true;
         fallbackToMjpeg(`Decoder config failed: ${errMsg}`);
         return;
       }
@@ -1051,6 +1054,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const errMsg = err ? (err.message || String(err)) : 'Decode enqueue failed';
           const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, chunksFed=${chunksFed}, isKey=${isKey}, size=${chunkData.byteLength}`;
           console.error(`[WebCodecs] Chunk decode exception (${errName}): ${errMsg}. Details: [${diag}]`, err);
+          hasFatalDecoderError = true;
           fallbackToMjpeg(`Chunk decode exception: ${errMsg}`);
         }
       };
@@ -1063,14 +1067,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         console.log('[WebCodecs] WebSocket closed:', e.code, e.reason);
         if (streamMode === 'webcodecs' && !isFallbackActive && !decoderError) {
           streamRetryCount++;
-          if (streamRetryCount <= 6) {
-            console.log(`[WebCodecs] Connection closed. Reconnecting (attempt ${streamRetryCount}/6)...`);
-            setStreamError('Live Stream Connecting', `Connecting to camera stream (attempt ${streamRetryCount}/6)...`);
+          if (streamRetryCount <= 12) {
+            const delay = Math.min(3000, 1000 + streamRetryCount * 200);
+            console.log(`[WebCodecs] Connection closed. Reconnecting (attempt ${streamRetryCount}/12 in ${delay}ms)...`);
+            const streamBadge = document.getElementById('stream-badge');
+            const liveDot = document.getElementById('live-dot');
+            if (streamBadge) streamBadge.innerText = 'CONNECTING...';
+            if (liveDot) {
+              liveDot.style.background = '#ED8936';
+              liveDot.style.animation = 'pulse 1s infinite';
+            }
             if (!streamRetryTimer) {
               streamRetryTimer = setTimeout(() => {
                 streamRetryTimer = null;
                 retryStream();
-              }, 1500);
+              }, delay);
             }
           } else {
             console.warn('[WebCodecs] Exceeded retry attempts. Falling back to MJPEG.');
@@ -1103,7 +1114,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
       showToast('Connecting to camera stream...', 'info', 2500);
 
-      if (supportedHevcCodec && !isFallbackActive) {
+      if (supportedHevcCodec && !hasFatalDecoderError) {
+        isFallbackActive = false;
         startWebCodecsStream(supportedHevcCodec);
       } else {
         startMjpegStream();
@@ -1234,6 +1246,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         } else if (d.stream_connected) {
           const errOverlay = document.getElementById('video-error');
           if (errOverlay) errOverlay.classList.add('hidden');
+          // Auto-promote to WebCodecs HEVC if stream is now connected and client is in temporary MJPEG mode without decoder errors
+          if (supportedHevcCodec && !hasFatalDecoderError && streamMode === 'mjpeg') {
+            console.log('[Stream] Camera live stream is now connected. Auto-promoting from MJPEG to WebCodecs HEVC.');
+            isFallbackActive = false;
+            streamRetryCount = 0;
+            startWebCodecsStream(supportedHevcCodec);
+          }
           const streamBadge = document.getElementById('stream-badge');
           const liveDot = document.getElementById('live-dot');
           if (streamBadge) {

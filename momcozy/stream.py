@@ -954,6 +954,7 @@ class VideoStreamer:
                     stream.add_state_listener(on_state)
                     await stream.async_start()
                     logger.info("P2P stream initiated for %s. Awaiting media frames...", self.device_id)
+                    self._last_error = None
                     backoff = 2
 
                     async def audio_worker():
@@ -1010,7 +1011,7 @@ class VideoStreamer:
 
                     hevc_iter = stream.async_hevc()
                     chunks_received = 0
-                    initial_timeout = 10.0
+                    initial_timeout = 20.0
                     cadence_timeout = 10.0
 
                     try:
@@ -1020,9 +1021,13 @@ class VideoStreamer:
                                 chunk, is_key = await asyncio.wait_for(hevc_iter.__anext__(), timeout=timeout)
                             except TimeoutError:
                                 if chunks_received == 0:
-                                    err_msg = f"Timed out waiting for initial video stream from camera {self.device_id} ({timeout:.0f}s)"
-                                    logger.warning("✗ %s. Re-establishing P2P session...", err_msg)
-                                    self._last_error = err_msg
+                                    logger.warning(
+                                        "✗ Timed out waiting for initial video stream from camera %s (%.0fs). Re-establishing P2P session...",
+                                        self.device_id,
+                                        timeout,
+                                    )
+                                    # Do not poison _last_error on initial cold-start reconnect
+                                    # so status endpoint keeps reporting stream_running: true, stream_connected: false
                                 else:
                                     err_msg = f"Live video stream stalled: no data received from camera {self.device_id} for {timeout:.0f}s"
                                     logger.warning("✗ %s. Reconnecting...", err_msg)
@@ -1096,7 +1101,7 @@ class VideoStreamer:
         try:
             while self._running:
                 try:
-                    frame = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    frame = await asyncio.wait_for(queue.get(), timeout=25.0)
                     yield frame
                 except TimeoutError:
                     if not self._running:
@@ -1130,7 +1135,7 @@ class VideoStreamer:
 
             while self._running:
                 try:
-                    pcm_chunk = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    pcm_chunk = await asyncio.wait_for(queue.get(), timeout=25.0)
                     if format == "mp3" and encoder:
                         mp3_bytes = encoder.encode(pcm_chunk)
                         if mp3_bytes:
@@ -1168,7 +1173,7 @@ class VideoStreamer:
             started = False
             while self._running:
                 try:
-                    chunk, is_key = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    chunk, is_key = await asyncio.wait_for(queue.get(), timeout=25.0)
                     if not started:
                         if not is_key:
                             continue
