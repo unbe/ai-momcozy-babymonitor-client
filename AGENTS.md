@@ -1,0 +1,6 @@
+- Keep the dev server running and refreshed.
+- After each task, make a git commit. The e-mail on the commit is antigravity@local, the name is the model that contributed the most to the work being committed.
+- If you notice changes made by me, commit them in a separate commit. The name on that should be unbe on github.
+- Feel free to install any tools you may need.
+- Ask before making authenticated external requests. Generic requests are fine, something using my credentials needs confirmation.
+- Maintain a `MEMORY.md` file in the project root as the source of truth for architectural decisions, system design, domain models, and tricky edge cases. Read it before making design decisions or writing complex code. Update it whenever you discover or build non-obvious context, make architectural choices, or resolve subtle bugs.
