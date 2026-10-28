@@ -266,11 +266,13 @@ class MomcozyMonitor:
             if test_connection:
                 self.test_local_lan_connection(allow_rediscovery=False)
 
-    def discover_local_ip(self) -> Optional[str]:
+    def discover_local_ip(self, timeout: int = 6) -> Optional[str]:
         """Scan the local network for this device IP."""
         logger.info("Scanning local subnet for device %s via UDP broadcast...", self.device_id)
         try:
-            devices = tinytuya.deviceScan(False, 3)
+            # Tuya cameras broadcast UDP status beacons every 4-5 seconds.
+            # Using 6 seconds ensures we comfortably catch at least one broadcast cycle.
+            devices = tinytuya.deviceScan(False, timeout)
             for dev_ip, dev_info in devices.items():
                 if dev_info.get("gwId") == self.device_id or dev_info.get("id") == self.device_id:
                     logger.info("✓ Discovered camera %s on local network at %s", self.device_id, dev_ip)

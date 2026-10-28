@@ -84,7 +84,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         logger.info("Scanning local network for camera %s via UDP broadcast...", dev_id)
         try:
             import tinytuya
-            devices = tinytuya.deviceScan(False, 3)
+            devices = tinytuya.deviceScan(False, 6)
             for dev_ip, dev_info in devices.items():
                 if dev_info.get("gwId") == dev_id or dev_info.get("id") == dev_id:
                     ip = dev_ip
