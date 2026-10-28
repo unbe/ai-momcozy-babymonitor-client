@@ -1464,12 +1464,40 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
 
         # Verify client script includes fatal decoder error tracking
         self.assertIn("hasFatalDecoderError = false", HTML_DASHBOARD)
-        # Verify 12 retry attempts for WebCodecs before falling back to MJPEG
-        self.assertIn("streamRetryCount <= 12", HTML_DASHBOARD)
-        # Verify retryStream resets fallback if no fatal decoder error
-        self.assertIn("if (supportedHevcCodec && !hasFatalDecoderError)", HTML_DASHBOARD)
+        # Verify client waits for camera stream instead of falling back after arbitrary attempts
+        self.assertIn("Waiting for camera stream", HTML_DASHBOARD)
+        # Verify decoder error recovery attempts before fatal fallback
+        self.assertIn("Recovering from decoder error", HTML_DASHBOARD)
+        # Verify retryStream resets fallback if supported
+        self.assertIn("if (supportedHevcCodec)", HTML_DASHBOARD)
         # Verify auto-promotion in updateStatus
         self.assertIn("Auto-promoting from MJPEG to WebCodecs HEVC", HTML_DASHBOARD)
+
+    def test_hevc_handler_build_au_parameter_sets(self):
+        from momcozy.stream import MomcozyHevcHandler
+        handler = MomcozyHevcHandler(lambda f: None)
+
+        # Slice candidate without SPS/PPS should not be marked as keyframe
+        raw_slice = b"\x26\x01\x02\x03"
+        au, is_key = handler._build_au(raw_slice, is_key_candidate=True)
+        self.assertFalse(is_key)
+        self.assertEqual(au, raw_slice)
+
+        # Feed VPS, SPS, PPS
+        vps = b"\x00\x00\x00\x01\x40\x01\x0c\x01"
+        sps = b"\x00\x00\x00\x01\x42\x01\x01\x01"
+        pps = b"\x00\x00\x00\x01\x44\x01\xc0"
+        handler._latest_vps = vps
+        handler._latest_sps = sps
+        handler._latest_pps = pps
+
+        # Now slice candidate should have VPS+SPS+PPS prepended and be marked as keyframe
+        au, is_key = handler._build_au(raw_slice, is_key_candidate=True)
+        self.assertTrue(is_key)
+        self.assertTrue(au.startswith(vps))
+        self.assertIn(sps, au)
+        self.assertIn(pps, au)
+        self.assertTrue(au.endswith(raw_slice))
 
     def test_streamer_initial_timeout_configuration(self):
         import inspect

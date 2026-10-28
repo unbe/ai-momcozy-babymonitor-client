@@ -836,6 +836,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let streamMode = 'none'; // 'webcodecs' | 'mjpeg' | 'none'
     let streamRetryTimer = null;
     let streamRetryCount = 0;
+    let decoderErrorCount = 0;
     let activeWs = null;
     let activeDecoder = null;
     let supportedHevcCodec = null;
@@ -860,6 +861,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    function cleanupDecoder() {
+      if (activeDecoder) {
+        try {
+          activeDecoder.close();
+        } catch (e) {}
+        activeDecoder = null;
+      }
+    }
+
     function cleanupWebCodecs() {
       if (activeWs) {
         try {
@@ -871,17 +881,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         } catch (e) {}
         activeWs = null;
       }
-      if (activeDecoder) {
-        try {
-          activeDecoder.close();
-        } catch (e) {}
-        activeDecoder = null;
-      }
+      cleanupDecoder();
     }
 
     function fallbackToMjpeg(reason) {
       if (isFallbackActive) return;
       isFallbackActive = true;
+      hasFatalDecoderError = true;
       console.warn('[Stream] Fallback to MJPEG triggered:', reason);
       if (reason && typeof showToast === 'function') {
         showToast('HEVC decoding unavailable: ' + reason + '. Switched to standard stream.', 'warn', 6000);
@@ -942,74 +948,86 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       let hasKeyframe = false;
       let frameCount = 0;
       let chunksFed = 0;
-      let decoderError = false;
       let lastPts = 0;
 
       const streamBadgeInit = document.getElementById('stream-badge');
       if (streamBadgeInit) streamBadgeInit.innerText = 'CONNECTING...';
 
-      console.log(`[WebCodecs] Initializing VideoDecoder with codec: ${codec}`);
-      try {
-        activeDecoder = new VideoDecoder({
-          output: (frame) => {
-            if (streamMode !== 'webcodecs') {
+      function createDecoder() {
+        cleanupDecoder();
+        hasKeyframe = false;
+        console.log(`[WebCodecs] Initializing VideoDecoder with codec: ${codec}`);
+        try {
+          activeDecoder = new VideoDecoder({
+            output: (frame) => {
+              if (streamMode !== 'webcodecs') {
+                frame.close();
+                return;
+              }
+              if (streamCanvas.width !== frame.displayWidth || streamCanvas.height !== frame.displayHeight) {
+                streamCanvas.width = frame.displayWidth;
+                streamCanvas.height = frame.displayHeight;
+              }
+              const ctx = streamCanvas.getContext('2d');
+              ctx.drawImage(frame, 0, 0, streamCanvas.width, streamCanvas.height);
               frame.close();
-              return;
-            }
-            if (streamCanvas.width !== frame.displayWidth || streamCanvas.height !== frame.displayHeight) {
-              streamCanvas.width = frame.displayWidth;
-              streamCanvas.height = frame.displayHeight;
-            }
-            const ctx = streamCanvas.getContext('2d');
-            ctx.drawImage(frame, 0, 0, streamCanvas.width, streamCanvas.height);
-            frame.close();
 
-            if (frameCount === 0) {
-              streamRetryCount = 0;
-              console.log(`[WebCodecs] First video frame rendered successfully (${streamCanvas.width}x${streamCanvas.height})`);
-              if (streamCanvas) streamCanvas.style.display = 'block';
-              if (streamImg) {
-                streamImg.style.display = 'none';
-                streamImg.src = '';
+              if (frameCount === 0) {
+                streamRetryCount = 0;
+                decoderErrorCount = 0;
+                console.log(`[WebCodecs] First video frame rendered successfully (${streamCanvas.width}x${streamCanvas.height})`);
+                if (streamCanvas) streamCanvas.style.display = 'block';
+                if (streamImg) {
+                  streamImg.style.display = 'none';
+                  streamImg.src = '';
+                }
+                const streamBadge = document.getElementById('stream-badge');
+                const liveDot = document.getElementById('live-dot');
+                if (streamBadge) {
+                  streamBadge.innerText = 'LIVE STREAM (HEVC)';
+                  streamBadge.title = `Hardware-accelerated HEVC stream (${codec})`;
+                }
+                if (liveDot) {
+                  liveDot.style.background = '#48BB78';
+                  liveDot.style.animation = 'pulse 1.5s infinite';
+                }
+                const errOverlay = document.getElementById('video-error');
+                if (errOverlay) errOverlay.classList.add('hidden');
               }
-              const streamBadge = document.getElementById('stream-badge');
-              const liveDot = document.getElementById('live-dot');
-              if (streamBadge) {
-                streamBadge.innerText = 'LIVE STREAM (HEVC)';
-                streamBadge.title = `Hardware-accelerated HEVC stream (${codec})`;
+              frameCount++;
+            },
+            error: (err) => {
+              const errName = err ? (err.name || 'Error') : 'UnknownError';
+              const errMsg = err ? (err.message || String(err)) : 'Unknown decoder error';
+              const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, qSize=${activeDecoder ? activeDecoder.decodeQueueSize : 'null'}, chunksFed=${chunksFed}, framesRendered=${frameCount}, hasKeyframe=${hasKeyframe}`;
+              console.error(`[WebCodecs] Decoder error (${errName}): ${errMsg}. Details: [${diag}]`, err);
+              decoderErrorCount++;
+              if (decoderErrorCount < 3) {
+                console.warn(`[WebCodecs] Recovering from decoder error (${decoderErrorCount}/3). Awaiting fresh keyframe...`);
+                createDecoder();
+              } else {
+                fallbackToMjpeg(`Persistent decoder error (${errName}: ${errMsg})`);
               }
-              if (liveDot) {
-                liveDot.style.background = '#48BB78';
-                liveDot.style.animation = 'pulse 1.5s infinite';
-              }
-              const errOverlay = document.getElementById('video-error');
-              if (errOverlay) errOverlay.classList.add('hidden');
             }
-            frameCount++;
-          },
-          error: (err) => {
-            const errName = err ? (err.name || 'Error') : 'UnknownError';
-            const errMsg = err ? (err.message || String(err)) : 'Unknown decoder error';
-            const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, qSize=${activeDecoder ? activeDecoder.decodeQueueSize : 'null'}, chunksFed=${chunksFed}, framesRendered=${frameCount}, hasKeyframe=${hasKeyframe}`;
-            console.error(`[WebCodecs] Decoder error (${errName}): ${errMsg}. Details: [${diag}]`, err);
-            hasFatalDecoderError = true;
-            decoderError = true;
-            fallbackToMjpeg(`Decoder error (${errName}: ${errMsg})`);
-          }
-        });
+          });
 
-        activeDecoder.configure({
-          codec: codec,
-          codedWidth: 1920,
-          codedHeight: 1080,
-          optimizeForLatency: true
-        });
-      } catch (err) {
-        const errName = err ? (err.name || 'Error') : 'UnknownError';
-        const errMsg = err ? (err.message || String(err)) : 'Configuration exception';
-        console.error(`[WebCodecs] Failed configuring decoder (${errName}): ${errMsg}`, err);
-        hasFatalDecoderError = true;
-        fallbackToMjpeg(`Decoder config failed: ${errMsg}`);
+          activeDecoder.configure({
+            codec: codec,
+            codedWidth: 1920,
+            codedHeight: 1080,
+            optimizeForLatency: true
+          });
+          return true;
+        } catch (err) {
+          const errName = err ? (err.name || 'Error') : 'UnknownError';
+          const errMsg = err ? (err.message || String(err)) : 'Configuration exception';
+          console.error(`[WebCodecs] Failed configuring decoder (${errName}): ${errMsg}`, err);
+          fallbackToMjpeg(`Decoder config failed: ${errMsg}`);
+          return false;
+        }
+      }
+
+      if (!createDecoder()) {
         return;
       }
 
@@ -1025,7 +1043,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       };
 
       ws.onmessage = (event) => {
-        if (streamMode !== 'webcodecs' || decoderError) return;
+        if (streamMode !== 'webcodecs' || !activeDecoder || activeDecoder.state === 'closed') return;
         if (!(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
         if (bytes.length <= 1) return;
@@ -1054,8 +1072,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const errMsg = err ? (err.message || String(err)) : 'Decode enqueue failed';
           const diag = `codec=${codec}, state=${activeDecoder ? activeDecoder.state : 'null'}, chunksFed=${chunksFed}, isKey=${isKey}, size=${chunkData.byteLength}`;
           console.error(`[WebCodecs] Chunk decode exception (${errName}): ${errMsg}. Details: [${diag}]`, err);
-          hasFatalDecoderError = true;
-          fallbackToMjpeg(`Chunk decode exception: ${errMsg}`);
+          decoderErrorCount++;
+          if (decoderErrorCount < 3) {
+            console.warn(`[WebCodecs] Recovering from chunk decode exception (${decoderErrorCount}/3). Awaiting fresh keyframe...`);
+            createDecoder();
+          } else {
+            fallbackToMjpeg(`Persistent chunk decode exception: ${errMsg}`);
+          }
         }
       };
 
@@ -1065,27 +1088,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       ws.onclose = (e) => {
         console.log('[WebCodecs] WebSocket closed:', e.code, e.reason);
-        if (streamMode === 'webcodecs' && !isFallbackActive && !decoderError) {
+        if (streamMode === 'webcodecs' && !isFallbackActive && !hasFatalDecoderError) {
           streamRetryCount++;
-          if (streamRetryCount <= 12) {
-            const delay = Math.min(3000, 1000 + streamRetryCount * 200);
-            console.log(`[WebCodecs] Connection closed. Reconnecting (attempt ${streamRetryCount}/12 in ${delay}ms)...`);
-            const streamBadge = document.getElementById('stream-badge');
-            const liveDot = document.getElementById('live-dot');
-            if (streamBadge) streamBadge.innerText = 'CONNECTING...';
-            if (liveDot) {
-              liveDot.style.background = '#ED8936';
-              liveDot.style.animation = 'pulse 1s infinite';
-            }
-            if (!streamRetryTimer) {
-              streamRetryTimer = setTimeout(() => {
-                streamRetryTimer = null;
-                retryStream();
-              }, delay);
-            }
-          } else {
-            console.warn('[WebCodecs] Exceeded retry attempts. Falling back to MJPEG.');
-            fallbackToMjpeg('Camera stream startup timed out after multiple retries');
+          const delay = Math.min(3000, 1000 + streamRetryCount * 200);
+          console.log(`[WebCodecs] Waiting for camera stream (attempt ${streamRetryCount} in ${delay}ms)...`);
+          const streamBadge = document.getElementById('stream-badge');
+          const liveDot = document.getElementById('live-dot');
+          if (streamBadge) streamBadge.innerText = 'CONNECTING...';
+          if (liveDot) {
+            liveDot.style.background = '#ED8936';
+            liveDot.style.animation = 'pulse 1s infinite';
+          }
+          if (!streamRetryTimer) {
+            streamRetryTimer = setTimeout(() => {
+              streamRetryTimer = null;
+              retryStream();
+            }, delay);
           }
         }
       };
@@ -1114,8 +1132,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
       showToast('Connecting to camera stream...', 'info', 2500);
 
-      if (supportedHevcCodec && !hasFatalDecoderError) {
-        isFallbackActive = false;
+      decoderErrorCount = 0;
+      hasFatalDecoderError = false;
+      isFallbackActive = false;
+
+      if (supportedHevcCodec) {
         startWebCodecsStream(supportedHevcCodec);
       } else {
         startMjpegStream();
@@ -1241,7 +1262,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         // Live stream status inspection
         if (d.stream_configured === false) {
           setStreamError('Video Stream Not Configured', 'No Tuya cloud credentials found in .momcozy.json. Run "./momcozy.py login" to link your credentials.');
-        } else if (d.stream_error) {
+        } else if (d.stream_error && !d.stream_running) {
           setStreamError('Video Stream Error', d.stream_error);
         } else if (d.stream_connected) {
           const errOverlay = document.getElementById('video-error');
@@ -1251,6 +1272,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             console.log('[Stream] Camera live stream is now connected. Auto-promoting from MJPEG to WebCodecs HEVC.');
             isFallbackActive = false;
             streamRetryCount = 0;
+            decoderErrorCount = 0;
             startWebCodecsStream(supportedHevcCodec);
           }
           const streamBadge = document.getElementById('stream-badge');

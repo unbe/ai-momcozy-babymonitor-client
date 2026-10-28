@@ -234,6 +234,10 @@ class MomcozyHevcHandler:
         on_frame: Any,
         on_hevc: Optional[Any] = None,
         is_transcoding_needed: Optional[Callable[[], bool]] = None,
+        cached_vps: Optional[bytes] = None,
+        cached_sps: Optional[bytes] = None,
+        cached_pps: Optional[bytes] = None,
+        on_params_updated: Optional[Callable[[Optional[bytes], Optional[bytes], Optional[bytes]], None]] = None,
     ) -> None:
         try:
             import av
@@ -246,16 +250,46 @@ class MomcozyHevcHandler:
         self._on_frame = on_frame
         self._on_hevc = on_hevc
         self._is_transcoding_needed = is_transcoding_needed
+        self._on_params_updated = on_params_updated
         self._transcoding_active = False
         self._buffer = bytearray()
         self._fu_buffer = bytearray()
         self._fu_is_key = False
         self._param_buffer = bytearray()
-        self._latest_vps: Optional[bytes] = None
-        self._latest_sps: Optional[bytes] = None
-        self._latest_pps: Optional[bytes] = None
+        self._latest_vps: Optional[bytes] = cached_vps
+        self._latest_sps: Optional[bytes] = cached_sps
+        self._latest_pps: Optional[bytes] = cached_pps
         self._codec = av.CodecContext.create("hevc", "r")
         self.frame_count = 0
+
+    def _notify_params_updated(self) -> None:
+        if self._on_params_updated and self._latest_sps and self._latest_pps:
+            try:
+                self._on_params_updated(self._latest_vps, self._latest_sps, self._latest_pps)
+            except Exception:
+                pass
+
+    def _build_au(self, nalu_bytes: bytes, is_key_candidate: bool) -> tuple[bytes, bool]:
+        if not is_key_candidate:
+            return (nalu_bytes, False)
+        prefix = bytearray(self._param_buffer)
+        self._param_buffer = bytearray()
+        if not prefix:
+            if self._latest_vps:
+                prefix.extend(self._latest_vps)
+            if self._latest_sps:
+                prefix.extend(self._latest_sps)
+            if self._latest_pps:
+                prefix.extend(self._latest_pps)
+        if self._latest_sps and self._latest_pps:
+            if self._latest_vps and self._latest_vps not in prefix:
+                prefix = bytearray(self._latest_vps) + prefix
+            if self._latest_sps not in prefix:
+                prefix.extend(self._latest_sps)
+            if self._latest_pps not in prefix:
+                prefix.extend(self._latest_pps)
+            return (bytes(prefix + nalu_bytes), True)
+        return (nalu_bytes, False)
 
     def feed_record(self, plaintext: bytes) -> None:
         self._buffer.extend(plaintext)
@@ -320,20 +354,7 @@ class MomcozyHevcHandler:
                 if e and self._fu_buffer:
                     nalu_bytes = bytes(self._fu_buffer)
                     self._fu_buffer = bytearray()
-                    is_key = self._fu_is_key
-                    if is_key:
-                        prefix = bytearray(self._param_buffer)
-                        self._param_buffer = bytearray()
-                        if not prefix:
-                            if self._latest_vps:
-                                prefix.extend(self._latest_vps)
-                            if self._latest_sps:
-                                prefix.extend(self._latest_sps)
-                            if self._latest_pps:
-                                prefix.extend(self._latest_pps)
-                        completed_au = (bytes(prefix + nalu_bytes), True)
-                    else:
-                        completed_au = (nalu_bytes, False)
+                    completed_au = self._build_au(nalu_bytes, self._fu_is_key)
 
             elif nal_type == 48:  # AP (Aggregation Packet)
                 ap_off = 2
@@ -348,55 +369,37 @@ class MomcozyHevcHandler:
                     nalu_with_start = b"\x00\x00\x00\x01" + single_nal
                     if single_type == 32:
                         self._latest_vps = nalu_with_start
+                        self._notify_params_updated()
                     elif single_type == 33:
                         self._latest_sps = nalu_with_start
+                        self._notify_params_updated()
                     elif single_type == 34:
                         self._latest_pps = nalu_with_start
+                        self._notify_params_updated()
 
                     if single_type >= 32:
                         self._param_buffer.extend(nalu_with_start)
                     else:
                         is_key = (16 <= single_type <= 21)
-                        if is_key:
-                            prefix = bytearray(self._param_buffer)
-                            self._param_buffer = bytearray()
-                            if not prefix:
-                                if self._latest_vps:
-                                    prefix.extend(self._latest_vps)
-                                if self._latest_sps:
-                                    prefix.extend(self._latest_sps)
-                                if self._latest_pps:
-                                    prefix.extend(self._latest_pps)
-                            completed_au = (bytes(prefix + nalu_with_start), True)
-                        else:
-                            completed_au = (nalu_with_start, False)
+                        completed_au = self._build_au(nalu_with_start, is_key)
 
             else:  # Single NAL unit
                 nalu_with_start = b"\x00\x00\x00\x01" + payload
                 if nal_type == 32:
                     self._latest_vps = nalu_with_start
+                    self._notify_params_updated()
                 elif nal_type == 33:
                     self._latest_sps = nalu_with_start
+                    self._notify_params_updated()
                 elif nal_type == 34:
                     self._latest_pps = nalu_with_start
+                    self._notify_params_updated()
 
                 if nal_type >= 32:
                     self._param_buffer.extend(nalu_with_start)
                 else:
                     is_key = (16 <= nal_type <= 21)
-                    if is_key:
-                        prefix = bytearray(self._param_buffer)
-                        self._param_buffer = bytearray()
-                        if not prefix:
-                            if self._latest_vps:
-                                prefix.extend(self._latest_vps)
-                            if self._latest_sps:
-                                prefix.extend(self._latest_sps)
-                            if self._latest_pps:
-                                prefix.extend(self._latest_pps)
-                        completed_au = (bytes(prefix + nalu_with_start), True)
-                    else:
-                        completed_au = (nalu_with_start, False)
+                    completed_au = self._build_au(nalu_with_start, is_key)
 
             if completed_au:
                 au_bytes, is_key = completed_au
@@ -557,6 +560,16 @@ def _patch_tuya_stream_session() -> None:
         if hasattr(session, "_momcozy_hevc"):
             session._momcozy_hevc._on_hevc = self._on_hevc
             session._momcozy_hevc._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
+            cached_params = getattr(self, "_cached_params", None)
+            if cached_params:
+                vps, sps, pps = cached_params
+                if vps and not session._momcozy_hevc._latest_vps:
+                    session._momcozy_hevc._latest_vps = vps
+                if sps and not session._momcozy_hevc._latest_sps:
+                    session._momcozy_hevc._latest_sps = sps
+                if pps and not session._momcozy_hevc._latest_pps:
+                    session._momcozy_hevc._latest_pps = pps
+            session._momcozy_hevc._on_params_updated = getattr(self, "_update_cached_params", None)
         if hasattr(session, "_momcozy_audio"):
             session._momcozy_audio._on_pcm = self._on_audio
         self._session = session
@@ -764,6 +777,9 @@ class VideoStreamer:
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._hevc_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
+        self._cached_vps: Optional[bytes] = None
+        self._cached_sps: Optional[bytes] = None
+        self._cached_pps: Optional[bytes] = None
         self._latest_hevc_keyframe: Optional[bytes] = None
         self._gop_chunks: list[bytes] = []
         self._gop_time: float = 0.0
@@ -971,6 +987,7 @@ class VideoStreamer:
         while self._running:
             try:
                 logger.info("Connecting to P2P video stream for %s...", self.device_id)
+                self._last_error = None
                 async with create_p2p_client(
                     email=self.email,
                     password=self.password,
@@ -983,6 +1000,17 @@ class VideoStreamer:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
                     stream._is_transcoding_needed = self.is_transcoding_needed
                     stream._is_audio_needed = self.is_audio_needed
+                    stream._cached_params = (self._cached_vps, self._cached_sps, self._cached_pps)
+
+                    def update_params(vps: Optional[bytes], sps: Optional[bytes], pps: Optional[bytes]) -> None:
+                        if vps:
+                            self._cached_vps = vps
+                        if sps:
+                            self._cached_sps = sps
+                        if pps:
+                            self._cached_pps = pps
+
+                    stream._update_cached_params = update_params
 
                     def on_state():
                         if getattr(stream, "needs_power_cycle", False):
