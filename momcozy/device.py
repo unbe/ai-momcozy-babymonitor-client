@@ -145,11 +145,13 @@ class MomcozyMonitor:
         cloud_dps_provider: Optional[Any] = None,
         cloud_dp_publisher: Optional[Callable[[Dict[str, Any]], bool]] = None,
         initial_dps: Optional[Dict[str, Any]] = None,
+        on_ip_discovered: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
         self.ip = ip
         self.version = version
+        self.on_ip_discovered = on_ip_discovered
 
         # Video stream account details
         self.stream_email = stream_account_email
@@ -171,9 +173,13 @@ class MomcozyMonitor:
         self.control_diagnostic: str = ""
         self._init_local_device()
 
-    def test_local_lan_connection(self) -> bool:
+    def test_local_lan_connection(self, allow_rediscovery: bool = True) -> bool:
         """Test direct TCP connection to port 6668 on the camera IP."""
         if not self.ip:
+            if allow_rediscovery and self.device_id:
+                discovered_ip = self.discover_local_ip()
+                if discovered_ip:
+                    return self.test_local_lan_connection(allow_rediscovery=False)
             self.control_diagnostic = (
                 f"No local camera IP configured for device {self.device_id}. "
                 "Specify 'ip' in .momcozy.json or set MOMCOZY_IP environment variable."
@@ -187,6 +193,19 @@ class MomcozyMonitor:
                 logger.info("✓ Local LAN control active: connected to camera at %s:6668", self.ip)
                 return True
         except Exception as exc:
+            if allow_rediscovery and self.device_id:
+                old_ip = self.ip
+                logger.info(
+                    "✗ Camera not reachable at %s:6668 (%s). Scanning local network via UDP broadcast...",
+                    old_ip,
+                    exc,
+                )
+                discovered_ip = self.discover_local_ip()
+                if discovered_ip and discovered_ip != old_ip:
+                    logger.info("✓ Camera rediscovered at new IP %s. Retesting connection...", discovered_ip)
+                    self.set_ip(discovered_ip, test_connection=False)
+                    return self.test_local_lan_connection(allow_rediscovery=False)
+
             self._lan_tcp_unavailable = True
             self.control_diagnostic = (
                 f"Local LAN TCP port 6668 unreachable on {self.ip} ({exc}). "
@@ -232,10 +251,20 @@ class MomcozyMonitor:
             return f"Tuya Cloud Gateway (Local LAN {self.ip}:6668 unreachable)"
         return "Tuya Cloud Gateway (No local IP configured)"
 
-    def set_ip(self, ip: str) -> None:
+    def set_ip(self, ip: str, test_connection: bool = True) -> None:
         """Update monitor IP address."""
         self.ip = ip
-        self._init_local_device()
+        if self.ip:
+            self._device = tinytuya.Device(
+                dev_id=self.device_id,
+                address=self.ip,
+                local_key=self.local_key,
+                version=self.version,
+            )
+            self._device.set_socketPersistent(True)
+            self._device.set_socketTimeout(1.0)
+            if test_connection:
+                self.test_local_lan_connection(allow_rediscovery=False)
 
     def discover_local_ip(self) -> Optional[str]:
         """Scan the local network for this device IP."""
@@ -245,7 +274,12 @@ class MomcozyMonitor:
             for dev_ip, dev_info in devices.items():
                 if dev_info.get("gwId") == self.device_id or dev_info.get("id") == self.device_id:
                     logger.info("✓ Discovered camera %s on local network at %s", self.device_id, dev_ip)
-                    self.set_ip(dev_ip)
+                    self.set_ip(dev_ip, test_connection=False)
+                    if self.on_ip_discovered:
+                        try:
+                            self.on_ip_discovered(dev_ip)
+                        except Exception as save_err:
+                            logger.debug("on_ip_discovered callback error: %s", save_err)
                     return dev_ip
             logger.warning(
                 "✗ Camera %s was not found in local UDP scan. "

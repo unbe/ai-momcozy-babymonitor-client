@@ -240,6 +240,16 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             _dps_cache["session"] = t_session
             return t_client.publish_dps(t_session, dev_id, dps_dict)
 
+    def _on_ip_discovered(new_ip: str) -> None:
+        if config_path.exists():
+            try:
+                data = json.loads(config_path.read_text())
+                data["ip"] = new_ip
+                config_path.write_text(json.dumps(data, indent=2))
+                logger.info("Saved newly discovered IP %s to %s", new_ip, config_path)
+            except Exception as e:
+                logger.debug("Failed saving newly discovered IP to config: %s", e)
+
     return MomcozyMonitor(
         device_id=dev_id,
         local_key=local_key or "",
@@ -254,6 +264,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         cloud_dps_provider=_fetch_cloud_dps if (tuya_uid and tuya_token) else None,
         cloud_dp_publisher=_publish_cloud_dps if (tuya_uid and tuya_token) else None,
         initial_dps=saved.get("dps") if isinstance(saved.get("dps"), dict) else None,
+        on_ip_discovered=_on_ip_discovered,
     )
 
 

@@ -999,6 +999,43 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.latest_event_time, 1791828432)
         self.assertIn("2026", status.latest_event_time_str)
 
+    def test_local_lan_connection_auto_rediscovery(self):
+        from unittest.mock import patch, MagicMock
+        from momcozy.device import MomcozyMonitor
+
+        discovered = []
+
+        # Mock socket.create_connection so 10.11.2.12 fails, but 10.11.2.186 succeeds
+        def mock_conn(addr, timeout=1.5):
+            host, port = addr
+            if host == "10.11.2.12":
+                raise ConnectionRefusedError("[Errno 61] Connection refused")
+            mock_sock = MagicMock()
+            mock_sock.__enter__.return_value = mock_sock
+            mock_sock.__exit__.return_value = False
+            return mock_sock
+
+        # Mock tinytuya.deviceScan to return the new IP 10.11.2.186
+        fake_scan = {
+            "10.11.2.186": {
+                "ip": "10.11.2.186",
+                "gwId": "bfb3260f33c5cdc22arfhh",
+            }
+        }
+
+        with patch("socket.create_connection", side_effect=mock_conn):
+            with patch("tinytuya.deviceScan", return_value=fake_scan):
+                monitor = MomcozyMonitor(
+                    device_id="bfb3260f33c5cdc22arfhh",
+                    local_key="key1",
+                    ip="10.11.2.12",  # Stale IP
+                    on_ip_discovered=lambda ip: discovered.append(ip),
+                )
+                self.assertEqual(monitor.ip, "10.11.2.186")
+                self.assertEqual(discovered, ["10.11.2.186"])
+                self.assertEqual(monitor.control_mode, "local_lan")
+                self.assertFalse(monitor._lan_tcp_unavailable)
+
     async def test_handle_detection_snapshot_endpoint(self):
         from unittest.mock import AsyncMock, MagicMock
         from aiohttp.test_utils import make_mocked_request
