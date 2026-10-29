@@ -18,6 +18,7 @@ from .constants import (
 )
 from .device import BM04Status, MomcozyMonitor
 from .stream import VideoStreamer
+from .timelapse import TimelapseRecorder
 from .web import WebServer
 
 __version__ = "0.1.0"
@@ -33,6 +34,7 @@ __all__ = [
     "PRODUCT_ID_BM04S",
     "PtzDirection",
     "Sensitivity",
+    "TimelapseRecorder",
     "TuyaCredentials",
     "VideoStreamer",
     "WebServer",

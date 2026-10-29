@@ -22,6 +22,7 @@ from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection
 from .device import MomcozyMonitor
 from .hls import HlsTranscoder
 from .stream import VideoStreamer
+from .timelapse import TimelapseRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -479,6 +480,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </svg>
           <span id="cast-btn-text">Cast</span>
         </button>
+        <button class="video-ctrl-btn" id="timelapse-ctrl-btn" onclick="openTimelapseModal()" title="Watch 12-Hour Timelapse">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          <span id="timelapse-ctrl-text">Timelapse</span>
+        </button>
         <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
           <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
@@ -613,6 +618,30 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div style="display:flex; gap:8px; margin-top:12px;">
           <button class="btn" style="flex:1; font-size:0.82rem;" onclick="viewFullDetectSnapshot()">🔍 Full Size</button>
           <button class="btn primary" style="flex:1; font-size:0.82rem;" onclick="captureLiveSnapshot()">📷 Capture Now</button>
+        </div>
+      </div>
+
+      <!-- 12-Hour Circular Timelapse Card -->
+      <div class="card" id="timelapse-card">
+        <h2>⏱️ 12-Hour Timelapse <span class="badge" id="timelapse-badge">Stopped</span></h2>
+        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:2px; margin-bottom:10px;">
+          Rolling circular ring buffer &bull; 1:60 rate (12h real time in 12 min video)
+        </div>
+        <div class="control-row">
+          <span>Buffered Real Time</span>
+          <span id="timelapse-buffered" style="font-weight:600; font-size:0.85rem;">0m 00s / 12h</span>
+        </div>
+        <div class="control-row">
+          <span>Timelapse Video Duration</span>
+          <span id="timelapse-vlen" style="font-weight:600; font-size:0.85rem;">0:00</span>
+        </div>
+        <div class="control-row">
+          <span>Ring Buffer Slots</span>
+          <span id="timelapse-slots" style="font-size:0.85rem; color:var(--text-muted);">0 / 72 slots (0.0 MB)</span>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn primary" id="timelapse-toggle-btn" style="flex:1;" onclick="toggleTimelapseRecord()">⏺ Start Recording</button>
+          <button class="btn" id="timelapse-watch-btn" style="flex:1;" onclick="openTimelapseModal()" disabled>▶ Watch</button>
         </div>
       </div>
 
@@ -1355,6 +1384,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const detectImg = document.getElementById('detect-img');
           if (detectImg) detectImg.src = '/detection_snapshot.jpg?t=' + Date.now();
         }
+        if (d.timelapse) {
+          updateTimelapseUI(d.timelapse);
+        }
       } catch(e) {
         offlineFailures++;
         if (offlineFailures >= 2) {
@@ -1486,10 +1518,165 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    let currentTimelapseCodec = 'hevc';
+
+    function updateTimelapseUI(tl) {
+      if (!tl) return;
+      const badge = document.getElementById('timelapse-badge');
+      const toggleBtn = document.getElementById('timelapse-toggle-btn');
+      const watchBtn = document.getElementById('timelapse-watch-btn');
+      const bufferedEl = document.getElementById('timelapse-buffered');
+      const vlenEl = document.getElementById('timelapse-vlen');
+      const slotsEl = document.getElementById('timelapse-slots');
+      const ctrlBtn = document.getElementById('timelapse-ctrl-btn');
+
+      if (bufferedEl) bufferedEl.innerText = `${tl.buffered_formatted || '0m 00s'} / 12h`;
+      if (vlenEl) vlenEl.innerText = tl.video_duration_formatted || '0:00';
+      if (slotsEl) slotsEl.innerText = `${tl.filled_slots || 0} / ${tl.total_slots || 72} slots (${tl.disk_formatted || '0.0 MB'})`;
+
+      if (tl.is_recording) {
+        if (badge) {
+          badge.className = 'badge active';
+          badge.style.background = '#FED7D7';
+          badge.style.color = '#C53030';
+          badge.innerText = 'Recording (1:60)';
+        }
+        if (toggleBtn) {
+          toggleBtn.innerText = '⏹ Stop Recording';
+          toggleBtn.className = 'btn';
+        }
+        if (ctrlBtn) ctrlBtn.classList.add('active');
+      } else {
+        if (badge) {
+          badge.className = 'badge';
+          badge.style.background = '#EDF2F7';
+          badge.style.color = 'var(--text-muted)';
+          badge.innerText = tl.has_content ? 'Ready' : 'Stopped';
+        }
+        if (toggleBtn) {
+          toggleBtn.innerText = '⏺ Start Recording';
+          toggleBtn.className = 'btn primary';
+        }
+        if (ctrlBtn) ctrlBtn.classList.remove('active');
+      }
+
+      if (watchBtn) {
+        watchBtn.disabled = !tl.has_content;
+      }
+    }
+
+    async function toggleTimelapseRecord() {
+      const toggleBtn = document.getElementById('timelapse-toggle-btn');
+      const isCurrentlyRecording = toggleBtn && toggleBtn.innerText.includes('Stop');
+      const endpoint = isCurrentlyRecording ? '/api/timelapse/stop' : '/api/timelapse/start';
+
+      try {
+        if (toggleBtn) toggleBtn.disabled = true;
+        const res = await fetch(endpoint, { method: 'POST' });
+        const d = await res.json();
+        if (d.success) {
+          showToast(isCurrentlyRecording ? 'Timelapse recording stopped.' : '12-hour circular timelapse recording started!', 'success', 3500);
+          updateTimelapseUI(d.timelapse);
+        } else {
+          showToast('Timelapse error: ' + (d.error || 'Failed to toggle recording'), 'error', 4000);
+        }
+      } catch (e) {
+        showToast('Network error toggling timelapse: ' + e.message, 'error', 4000);
+      } finally {
+        if (toggleBtn) toggleBtn.disabled = false;
+        updateStatus();
+      }
+    }
+
+    function openTimelapseModal() {
+      const modal = document.getElementById('timelapse-modal');
+      const video = document.getElementById('timelapse-video');
+      const loading = document.getElementById('timelapse-loading');
+      const dlLink = document.getElementById('timelapse-modal-dl');
+      if (!modal || !video) return;
+
+      modal.style.display = 'flex';
+      if (loading) loading.style.display = 'block';
+
+      const videoUrl = `/api/timelapse/video.mp4?codec=${currentTimelapseCodec}&t=${Date.now()}`;
+      video.src = videoUrl;
+      if (dlLink) dlLink.href = `/api/timelapse/video.mp4?codec=${currentTimelapseCodec}&download=1`;
+
+      video.onloadeddata = () => {
+        if (loading) loading.style.display = 'none';
+        video.play().catch(() => {});
+      };
+
+      video.onerror = (e) => {
+        if (loading) loading.style.display = 'none';
+        console.warn('[Timelapse] Video playback error:', e);
+        if (currentTimelapseCodec === 'hevc') {
+          showToast('Native HEVC playback failed in this browser. Switching to H.264...', 'warn', 4000);
+          switchTimelapseCodec('h264');
+        } else {
+          showToast('Could not play timelapse video in browser. Use Download button.', 'error', 4000);
+        }
+      };
+    }
+
+    function closeTimelapseModal() {
+      const modal = document.getElementById('timelapse-modal');
+      const video = document.getElementById('timelapse-video');
+      if (modal) modal.style.display = 'none';
+      if (video) {
+        video.pause();
+        video.src = '';
+      }
+    }
+
+    function setTimelapseSpeed(speed) {
+      const video = document.getElementById('timelapse-video');
+      if (video) video.playbackRate = speed;
+    }
+
+    function switchTimelapseCodec(codec) {
+      currentTimelapseCodec = codec;
+      const select = document.getElementById('timelapse-codec-select');
+      if (select) select.value = codec;
+      openTimelapseModal();
+    }
+
     setInterval(updateStatus, 3000);
     updateStatus();
     initPlayer();
   </script>
+
+  <!-- Timelapse Viewer Modal -->
+  <div id="timelapse-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; align-items:center; justify-content:center; padding:16px;">
+    <div style="background:var(--card-bg); max-width:850px; width:100%; border-radius:14px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,0.5); display:flex; flex-direction:column;">
+      <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid var(--border);">
+        <div>
+          <h3 style="font-size:1.05rem; font-weight:700; display:flex; align-items:center; gap:6px;">⏱️ 12-Hour Timelapse</h3>
+          <div style="font-size:0.75rem; color:var(--text-muted);" id="timelapse-modal-sub">1:60 playback rate &bull; Rolling 12-hour ring buffer</div>
+        </div>
+        <button class="btn" onclick="closeTimelapseModal()" style="padding:4px 10px; font-size:1rem; line-height:1;" title="Close">✕</button>
+      </div>
+      <div style="position:relative; background:#000; display:flex; align-items:center; justify-content:center; min-height:280px; max-height:65vh;">
+        <video id="timelapse-video" controls playsinline style="width:100%; max-height:65vh; background:#000;"></video>
+        <div id="timelapse-loading" style="display:none; position:absolute; color:#fff; font-size:0.9rem; background:rgba(0,0,0,0.7); padding:10px 16px; border-radius:8px;">Preparing timelapse video...</div>
+      </div>
+      <div style="padding:10px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; border-top:1px solid var(--border); background:var(--bg);">
+        <div style="display:flex; gap:6px; align-items:center; font-size:0.8rem;">
+          <span>Speed:</span>
+          <button class="btn" style="padding:3px 7px; font-size:0.75rem;" onclick="setTimelapseSpeed(1)">1x</button>
+          <button class="btn" style="padding:3px 7px; font-size:0.75rem;" onclick="setTimelapseSpeed(2)">2x</button>
+          <button class="btn" style="padding:3px 7px; font-size:0.75rem;" onclick="setTimelapseSpeed(4)">4x</button>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <select id="timelapse-codec-select" onchange="switchTimelapseCodec(this.value)" style="padding:4px 8px; font-size:0.75rem; border-radius:6px; border:1px solid var(--border);">
+            <option value="hevc">Native HEVC (Fastest, 0% CPU)</option>
+            <option value="h264">H.264 (Universal Compatibility)</option>
+          </select>
+          <a id="timelapse-modal-dl" href="/api/timelapse/video.mp4?download=1" download="timelapse.mp4" class="btn primary" style="text-decoration:none; padding:5px 12px; font-size:0.78rem;">⬇ Download MP4</a>
+        </div>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -1596,6 +1783,9 @@ class WebServer:
         else:
             self.http_port = 8420 if self.ssl_context else self.port
         self.hls: Optional[HlsTranscoder] = HlsTranscoder(streamer=self.streamer) if self.streamer else None
+        self.timelapse: Optional[TimelapseRecorder] = (
+            TimelapseRecorder(streamer=self.streamer) if self.streamer else None
+        )
         self._cached_status: Optional[Any] = None
         self._cached_status_time: float = 0.0
         self.app = web.Application()
@@ -1615,6 +1805,10 @@ class WebServer:
         self.app.router.add_get("/api/detection_snapshot", self.handle_detection_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_post("/api/control", self.handle_api_control)
+        self.app.router.add_post("/api/timelapse/start", self.handle_timelapse_start)
+        self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
+        self.app.router.add_get("/api/timelapse/status", self.handle_timelapse_status)
+        self.app.router.add_get("/api/timelapse/video.mp4", self.handle_timelapse_video)
 
     async def handle_favicon(self, request: web.Request) -> web.Response:
         return web.Response(
@@ -1997,6 +2191,25 @@ class WebServer:
             "server_lan_ip": self.get_local_lan_ip(),
             "server_port": self.port,
             "server_http_port": self.http_port,
+            "timelapse": (
+                self.timelapse.get_status()
+                if self.timelapse
+                else {
+                    "is_recording": False,
+                    "has_content": False,
+                    "total_slots": 72,
+                    "filled_slots": 0,
+                    "current_slot": 0,
+                    "total_frames": 0,
+                    "buffered_seconds": 0,
+                    "buffered_formatted": "0m 00s",
+                    "video_duration_seconds": 0,
+                    "video_duration_formatted": "0:00",
+                    "speed_ratio": "1:60",
+                    "disk_bytes": 0,
+                    "disk_formatted": "0.0 MB",
+                }
+            ),
         }
         try:
             now = time.monotonic()
@@ -2131,6 +2344,72 @@ class WebServer:
             logger.warning("Device action '%s' failed: %s", action_name, e)
             return web.json_response({"status": "error", "error": str(e)}, status=502)
 
+    async def handle_timelapse_start(self, request: web.Request) -> web.Response:
+        """Start recording the 12-hour circular timelapse."""
+        if not self.timelapse:
+            return web.json_response(
+                {"success": False, "error": "Timelapse recorder not configured (missing video streamer)."},
+                status=503,
+            )
+        try:
+            await self.timelapse.start()
+            return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
+        except Exception as exc:
+            logger.error("Error starting timelapse: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_timelapse_stop(self, request: web.Request) -> web.Response:
+        """Stop recording the timelapse."""
+        if not self.timelapse:
+            return web.json_response(
+                {"success": False, "error": "Timelapse recorder not configured."},
+                status=503,
+            )
+        try:
+            await self.timelapse.stop()
+            return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
+        except Exception as exc:
+            logger.error("Error stopping timelapse: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_timelapse_status(self, request: web.Request) -> web.Response:
+        """Get timelapse recorder status."""
+        if not self.timelapse:
+            return web.json_response({"is_recording": False, "has_content": False})
+        return web.json_response(self.timelapse.get_status())
+
+    async def handle_timelapse_video(self, request: web.Request) -> web.StreamResponse:
+        """Serve exported timelapse MP4 with HTTP Range support for scrubbing."""
+        if not self.timelapse:
+            return web.Response(
+                status=503,
+                text="Timelapse recorder not configured.",
+                content_type="text/plain",
+            )
+        codec = request.query.get("codec", "hevc").lower()
+        if codec not in ("hevc", "h264"):
+            codec = "hevc"
+        try:
+            mp4_path = await self.timelapse.export_mp4(codec=codec)
+        except Exception as exc:
+            logger.error("Error generating timelapse MP4: %s", exc)
+            return web.Response(status=500, text=f"Error exporting timelapse: {exc}", content_type="text/plain")
+
+        if not mp4_path or not mp4_path.exists():
+            return web.Response(status=404, text="No timelapse video frames recorded yet.", content_type="text/plain")
+
+        is_download = request.query.get("download") == "1"
+        disposition = f'attachment; filename="momcozy_timelapse_{codec}.mp4"' if is_download else "inline"
+
+        return web.FileResponse(
+            mp4_path,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+                "Content-Disposition": disposition,
+            },
+        )
+
     async def run(self) -> None:
         """Run the server until interrupted."""
         if self.streamer and not self.streamer.is_running:
@@ -2158,6 +2437,8 @@ class WebServer:
             while True:
                 await asyncio.sleep(3600)
         finally:
+            if self.timelapse and self.timelapse.is_recording:
+                await self.timelapse.stop()
             if self.hls:
                 await self.hls.stop()
             if self.streamer:

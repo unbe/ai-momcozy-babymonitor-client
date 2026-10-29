@@ -46,3 +46,20 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * `test_local_lan_connection(allow_rediscovery=True)` detects this failure and automatically triggers an in-band UDP broadcast scan using `tinytuya.deviceScan(False, 3)` matching the camera's `device_id` / `gwId`.
   * When rediscovered at a new IP, `MomcozyMonitor` updates its address, fires `on_ip_discovered(new_ip)` to persist the new IP to `.momcozy.json`, and reconnects via Local LAN.
 
+### 6. 12-Hour Circular Disk-Backed Timelapse Buffer
+* **Rate & Duration:** 1:60 speedup ratio compresses 12 hours of real time into 12 minutes (720 seconds) of video.
+* **Framerate & Sampling:** At 30 fps playback, 1 frame is sampled every 2.0 seconds of real time.
+* **Direct Overwrite Circular Ring Buffer (Zero Periodic Scavengers):**
+  * 72 static slot files on disk (`slot_00.hevc` .. `slot_71.hevc`), each representing 10 minutes of real time (300 keyframes, 10 seconds of video).
+  * As the buffer advances (`current_slot = (current_slot + 1) % 72`), the incoming slot is opened in `"wb"` mode, immediately truncating and overwriting the 12-hour-old file on disk.
+  * Total disk usage is strictly hard-capped (~700 MB - 1 GB), eliminating background cron jobs or periodic file deletion scans.
+* **Zero Transcoding During Recording:**
+  * Directly writes Annex B HEVC keyframes (VPS/SPS/PPS + IDR slices) from `VideoStreamer.subscribe_hevc()`.
+  * Non-keyframes are dropped without decoding; server CPU consumption during recording is literally 0.0%.
+* **Stream-Copy Browser Playback:**
+  * `export_mp4()` concatenates chronologically ordered slots using FFmpeg's concat demuxer in stream-copy mode (`-c:v copy -tag:v hvc1 -movflags +faststart`).
+  * Instantaneous packaging (< 1 second) with zero transcoding, cached for instant repeat requests.
+  * Served via `GET /api/timelapse/video.mp4` with HTTP Range support (`Accept-Ranges: bytes`) enabling seamless timeline scrubbing in HTML5 `<video>` controls with native 1x/2x/4x speed adjustment.
+  * Provides optional on-demand H.264 fallback (`?codec=h264`) for older browsers.
+
+

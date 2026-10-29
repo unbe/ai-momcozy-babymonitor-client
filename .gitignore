@@ -34,3 +34,5 @@ androguard.db*
 *.pem
 ssl/
 .momcozy_ssl/
+timelapse/
+*.hevc

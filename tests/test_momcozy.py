@@ -1620,6 +1620,230 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(streamer.gop_buffer_size, 0)
         self.assertIsNone(streamer.latest_frame)
 
+    async def test_timelapse_recorder_circular_ring_buffer(self):
+        import asyncio
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock, AsyncMock
+        from momcozy.timelapse import TimelapseRecorder, format_duration, format_video_duration
+
+        with tempfile.TemporaryDirectory() as td:
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            # Create 3-slot recorder with very short duration for testing (1s interval, 2 frames per slot)
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=td,
+                total_slots=3,
+                slot_duration_sec=10.0,
+                sample_interval_sec=0.01,
+                fps=30,
+            )
+
+            # Check initial status
+            st = recorder.get_status()
+            self.assertFalse(st["is_recording"])
+            self.assertEqual(st["total_slots"], 3)
+            self.assertEqual(st["filled_slots"], 0)
+            self.assertFalse(st["has_content"])
+
+            # Test slot paths
+            self.assertEqual(recorder.slot_path(0).name, "slot_00.hevc")
+            self.assertEqual(recorder.slot_path(2).name, "slot_02.hevc")
+
+            # Simulate incoming HEVC chunks
+            dummy_key_1 = b"\x00\x00\x00\x01\x40\x01" + b"A" * 100
+            dummy_key_2 = b"\x00\x00\x00\x01\x40\x01" + b"B" * 100
+            dummy_delta = b"\x00\x00\x00\x01\x02\x01" + b"C" * 50
+
+            async def fake_hevc_stream():
+                # Yield keyframe, delta (should be ignored), keyframe
+                yield dummy_key_1, True
+                yield dummy_delta, False
+                yield dummy_key_2, True
+                try:
+                    while True:
+                        await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    pass
+
+            mock_streamer.subscribe_hevc = fake_hevc_stream
+
+            # Start recording
+            await recorder.start()
+            self.assertTrue(recorder.is_recording)
+
+            # Give it a moment to process the frames
+            await asyncio.sleep(0.1)
+
+            await recorder.stop()
+            self.assertFalse(recorder.is_recording)
+
+            st = recorder.get_status()
+            self.assertTrue(st["has_content"])
+            self.assertGreater(st["total_frames"], 0)
+
+            # Test slot rotation and direct overwrite
+            # Slot 0 should exist with content
+            slot0 = recorder.slot_path(0)
+            self.assertTrue(slot0.exists())
+            self.assertGreater(slot0.stat().st_size, 0)
+
+            # Simulate rotating through all slots and verifying overwrite
+            recorder._rotate_slot()
+            self.assertEqual(recorder._current_slot, 1)
+            recorder._active_file.write(dummy_key_1)
+            recorder._rotate_slot()
+            self.assertEqual(recorder._current_slot, 2)
+            recorder._active_file.write(dummy_key_2)
+            recorder._rotate_slot()
+            # Should have wrapped around to 0
+            self.assertEqual(recorder._current_slot, 0)
+            # Writing to slot 0 truncates and overwrites
+            recorder._active_file.write(b"NEW_DATA")
+            recorder._close_active_slot()
+
+            # Verify slot 0 content was overwritten with NEW_DATA
+            self.assertEqual(recorder.slot_path(0).read_bytes(), b"NEW_DATA")
+
+            # Check format utilities
+            self.assertEqual(format_duration(3600), "1h 00m")
+            self.assertEqual(format_duration(45), "0m 45s")
+            self.assertEqual(format_video_duration(720), "12:00")
+            self.assertEqual(format_video_duration(65), "1:05")
+
+    async def test_timelapse_web_endpoints(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, AsyncMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            server = WebServer(monitor=MagicMock(), streamer=mock_streamer)
+            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td, total_slots=3)
+
+            # Test GET /api/timelapse/status
+            req = make_mocked_request("GET", "/api/timelapse/status")
+            resp = await server.handle_timelapse_status(req)
+            self.assertEqual(resp.status, 200)
+
+            # Test POST /api/timelapse/start
+            req = make_mocked_request("POST", "/api/timelapse/start")
+            with unittest.mock.patch.object(server.timelapse, "start", AsyncMock()) as mock_start:
+                resp = await server.handle_timelapse_start(req)
+                self.assertEqual(resp.status, 200)
+                mock_start.assert_called_once()
+
+            # Test POST /api/timelapse/stop
+            req = make_mocked_request("POST", "/api/timelapse/stop")
+            with unittest.mock.patch.object(server.timelapse, "stop", AsyncMock()) as mock_stop:
+                resp = await server.handle_timelapse_stop(req)
+                self.assertEqual(resp.status, 200)
+                mock_stop.assert_called_once()
+
+            # Test GET /api/timelapse/video.mp4 when empty (should 404)
+            req = make_mocked_request("GET", "/api/timelapse/video.mp4")
+            resp = await server.handle_timelapse_video(req)
+            self.assertEqual(resp.status, 404)
+
+            # Test GET /api/timelapse/video.mp4 when video exists
+            dummy_mp4 = Path(td) / "dummy.mp4"
+            dummy_mp4.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100)
+
+            with unittest.mock.patch.object(server.timelapse, "export_mp4", AsyncMock(return_value=dummy_mp4)):
+                req = make_mocked_request("GET", "/api/timelapse/video.mp4")
+                resp = await server.handle_timelapse_video(req)
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get("Accept-Ranges"), "bytes")
+                self.assertIn("inline", resp.headers.get("Content-Disposition", ""))
+
+                # With download query param
+                req_dl = make_mocked_request("GET", "/api/timelapse/video.mp4?download=1")
+                resp_dl = await server.handle_timelapse_video(req_dl)
+                self.assertEqual(resp_dl.status, 200)
+                self.assertIn("attachment", resp_dl.headers.get("Content-Disposition", ""))
+
+            # Test status endpoint includes timelapse info
+            req_status = make_mocked_request("GET", "/api/status")
+            with unittest.mock.patch.object(server.monitor, "get_status", MagicMock()):
+                resp_status = await server.handle_api_status(req_status)
+                self.assertEqual(resp_status.status, 200)
+                import json
+                data = json.loads(resp_status.text)
+                self.assertIn("timelapse", data)
+                self.assertEqual(data["timelapse"]["total_slots"], 3)
+
+    async def test_timelapse_export_mp4_stream_copy(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=4,
+                fps=30,
+            )
+
+            # Generate 2 valid synthetic HEVC chunks using ffmpeg
+            slot0 = recorder.slot_path(0)
+            slot1 = recorder.slot_path(1)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+                    "-c:v", "libx265", "-f", "hevc", str(slot0),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+                    "-c:v", "libx265", "-f", "hevc", str(slot1),
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "frames": 30, "bytes": slot0.stat().st_size}
+            recorder._slots_meta["1"] = {"mtime": 2000.0, "frames": 30, "bytes": slot1.stat().st_size}
+
+            ordered = recorder.get_ordered_slots()
+            self.assertEqual(len(ordered), 2)
+            self.assertEqual(ordered[0][0], 0)
+            self.assertEqual(ordered[1][0], 1)
+
+            # Export MP4 via stream copy (native HEVC, 0% CPU transcoding)
+            mp4_path = await recorder.export_mp4(codec="hevc")
+            self.assertIsNotNone(mp4_path)
+            self.assertTrue(mp4_path.exists())
+            self.assertGreater(mp4_path.stat().st_size, 1000)
+
+            # Verify that calling export_mp4 again returns the cached file
+            mp4_path_2 = await recorder.export_mp4(codec="hevc")
+            self.assertEqual(mp4_path, mp4_path_2)
+
+            # Test export with h264 fallback
+            mp4_h264 = await recorder.export_mp4(codec="h264")
+            self.assertIsNotNone(mp4_h264)
+            self.assertTrue(mp4_h264.exists())
+            self.assertGreater(mp4_h264.stat().st_size, 1000)
+
 
 if __name__ == "__main__":
     unittest.main()
