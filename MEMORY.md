@@ -54,10 +54,14 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * When rediscovered at a new IP, `MomcozyMonitor` updates its address, fires `on_ip_discovered(new_ip)` to persist the new IP to `.momcozy.json`, and reconnects via Local LAN.
 
 ### 6. 12-Hour Circular Disk-Backed Timelapse Buffer
-* **Rate & Duration:** 1:60 speedup ratio compresses 12 hours of real time into 12 minutes (720 seconds) of video.
+* **Selectable Speed Ratios:** Supports selectable speed ratios: `1:15`, `1:30`, `1:60` (default), and `1:90`.
+  * `1:60`: 12 hours of real time in 12 minutes (720 seconds) of video.
+  * `1:30`: 12 hours in 24 minutes.
+  * `1:15`: 12 hours in 48 minutes.
+  * `1:90`: 12 hours in 8 minutes.
+  * Dynamically configures the video export playback framerate (`export_fps = round(total_frames / target_video_sec, 2)`) during stream-copy packaging (`-r <fps> -c:v copy`), ensuring exact playback duration without transcoding.
 * **Real-Time Duration & Cadence Tracking:**
   * Real time elapsed is tracked via monotonic timestamps per slot (`time.monotonic() - slot_start_monotonic`) rather than multiplying frame count by nominal sampling interval, ensuring accurate 1:1 real-time second counting regardless of camera GOP length.
-  * FFmpeg remuxing sets `-r 15` so that keyframes recorded at the camera's native keyframe cadence playback at the exact 1:60 speedup ratio.
 * **Direct Overwrite Circular Ring Buffer (Zero Periodic Scavengers):**
   * 72 static slot files on disk (`slot_00.hevc` .. `slot_71.hevc`), each representing 10 minutes of real time.
   * As the buffer advances (`current_slot = (current_slot + 1) % 72`), the incoming slot is opened in `"wb"` mode, immediately truncating and overwriting the 12-hour-old file on disk.

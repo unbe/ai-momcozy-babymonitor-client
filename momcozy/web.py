@@ -629,7 +629,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
           <h2 style="margin:0; display:flex; align-items:center; gap:8px;">
             <span>⏱️ Timelapse</span>
-            <span class="badge" style="background:rgba(66,153,225,0.15); color:var(--accent-blue); font-size:0.75rem;">1:60</span>
+            <select id="timelapse-ratio-select" onchange="changeTimelapseRatio(this.value)" style="background:rgba(66,153,225,0.12); color:var(--accent-blue); font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:6px; border:1px solid rgba(66,153,225,0.3); outline:none; cursor:pointer;" title="Select Timelapse Speed Ratio">
+              <option value="15">1:15</option>
+              <option value="30">1:30</option>
+              <option value="60" selected>1:60</option>
+              <option value="90">1:90</option>
+            </select>
           </h2>
           <span class="badge" id="timelapse-badge">Stopped</span>
         </div>
@@ -1541,11 +1546,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const bufferedEl = document.getElementById('timelapse-buffered');
       const vlenEl = document.getElementById('timelapse-vlen');
       const storageEl = document.getElementById('timelapse-storage');
+      const ratioSelect = document.getElementById('timelapse-ratio-select');
       const ctrlBtn = document.getElementById('timelapse-ctrl-btn');
 
       if (bufferedEl) bufferedEl.innerText = tl.buffered_formatted || '0m 00s';
       if (vlenEl) vlenEl.innerText = tl.video_duration_formatted || '0:00';
       if (storageEl) storageEl.innerText = tl.disk_formatted || '0.0 MB';
+      if (ratioSelect && tl.speed_ratio_val) ratioSelect.value = String(tl.speed_ratio_val);
 
       if (tl.is_recording) {
         if (badge) {
@@ -1575,6 +1582,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       if (watchBtn) {
         watchBtn.disabled = !tl.has_content;
+      }
+    }
+
+    async function changeTimelapseRatio(val) {
+      try {
+        const res = await fetch('/api/timelapse/ratio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ratio: parseInt(val, 10) })
+        });
+        const d = await res.json();
+        if (d.success) {
+          updateTimelapseUI(d.timelapse);
+        } else {
+          showToast('Failed to change speed ratio: ' + (d.error || ''), 'error', 3500);
+        }
+      } catch (e) {
+        showToast('Network error setting speed ratio: ' + e.message, 'error', 3500);
       }
     }
 
@@ -1772,7 +1797,12 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         <div>
           <h1 style="display:flex; align-items:center; gap:8px;">
             <span>Timelapse</span>
-            <span style="font-size:0.75rem; background:rgba(66,153,225,0.15); color:#60a5fa; padding:2px 8px; border-radius:6px; font-weight:600;">1:60</span>
+            <select id="player-ratio-select" onchange="changePlayerRatio(this.value)" style="background:rgba(66,153,225,0.15); color:#60a5fa; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(66,153,225,0.3); outline:none; cursor:pointer;" title="Playback Speed Ratio">
+              <option value="15">1:15</option>
+              <option value="30">1:30</option>
+              <option value="60" selected>1:60</option>
+              <option value="90">1:90</option>
+            </select>
           </h1>
           <div style="font-size: 0.75rem; color: var(--text-muted);">Momcozy BM04</div>
         </div>
@@ -1829,15 +1859,16 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     let activeCodec = canPlayHevc() ? 'hevc' : 'h264';
     let fallbackAttempted = false;
+    let currentRatio = 60;
 
     function loadPlayback(codec) {
       activeCodec = codec;
       loading.style.display = 'flex';
       errorBox.style.display = 'none';
-      const url = `/api/timelapse/video.mp4?codec=${codec}&t=${Date.now()}`;
+      const url = `/api/timelapse/video.mp4?codec=${codec}&ratio=${currentRatio}&t=${Date.now()}`;
       video.src = url;
       if (dlBtn) {
-        dlBtn.href = `/api/timelapse/video.mp4?codec=${codec}&download=1`;
+        dlBtn.href = `/api/timelapse/video.mp4?codec=${codec}&ratio=${currentRatio}&download=1`;
       }
       video.load();
       video.play().catch(function() {});
@@ -1867,12 +1898,38 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       if (btn) btn.classList.add('active');
     }
 
+    async function changePlayerRatio(val) {
+      currentRatio = parseInt(val, 10);
+      try {
+        await fetch('/api/timelapse/ratio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ratio: currentRatio })
+        });
+      } catch (e) {}
+      fallbackAttempted = false;
+      loadPlayback(activeCodec);
+    }
+
     function reloadVideo() {
       fallbackAttempted = false;
       loadPlayback(activeCodec);
     }
 
-    loadPlayback(activeCodec);
+    async function initPlayer() {
+      try {
+        const res = await fetch('/api/timelapse/status');
+        const st = await res.json();
+        if (st.speed_ratio_val) {
+          currentRatio = st.speed_ratio_val;
+          const sel = document.getElementById('player-ratio-select');
+          if (sel) sel.value = String(currentRatio);
+        }
+      } catch (e) {}
+      loadPlayback(activeCodec);
+    }
+
+    initPlayer();
   </script>
 </body>
 </html>
@@ -2004,6 +2061,7 @@ class WebServer:
         self.app.router.add_post("/api/control", self.handle_api_control)
         self.app.router.add_post("/api/timelapse/start", self.handle_timelapse_start)
         self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
+        self.app.router.add_post("/api/timelapse/ratio", self.handle_timelapse_ratio)
         self.app.router.add_get("/api/timelapse/status", self.handle_timelapse_status)
         self.app.router.add_get("/api/timelapse/video.mp4", self.handle_timelapse_video)
         self.app.router.add_get("/timelapse", self.handle_timelapse_page)
@@ -2550,6 +2608,14 @@ class WebServer:
                 status=503,
             )
         try:
+            if request.can_read_body:
+                try:
+                    data = await request.json()
+                    ratio = data.get("ratio")
+                    if ratio is not None:
+                        self.timelapse.set_speed_ratio(ratio)
+                except Exception:
+                    pass
             await self.timelapse.start(fresh=True)
             return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
         except Exception as exc:
@@ -2570,6 +2636,23 @@ class WebServer:
             logger.error("Error stopping timelapse: %s", exc)
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
+    async def handle_timelapse_ratio(self, request: web.Request) -> web.Response:
+        """Update timelapse speed ratio (15, 30, 60, 90)."""
+        if not self.timelapse:
+            return web.json_response({"success": False, "error": "Timelapse recorder not configured."}, status=503)
+        try:
+            data = await request.json()
+            ratio = data.get("ratio")
+            if ratio is None:
+                return web.json_response({"success": False, "error": "Missing 'ratio' parameter."}, status=400)
+            self.timelapse.set_speed_ratio(ratio)
+            return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
+        except ValueError as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.error("Error setting timelapse speed ratio: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
     async def handle_timelapse_status(self, request: web.Request) -> web.Response:
         """Get timelapse recorder status."""
         if not self.timelapse:
@@ -2587,8 +2670,10 @@ class WebServer:
         codec = request.query.get("codec", "hevc").lower()
         if codec not in ("hevc", "h264"):
             codec = "hevc"
+        ratio_param = request.query.get("ratio")
+        ratio = int(ratio_param) if (ratio_param and ratio_param.isdigit()) else None
         try:
-            mp4_path = await self.timelapse.export_mp4(codec=codec)
+            mp4_path = await self.timelapse.export_mp4(codec=codec, ratio=ratio)
         except Exception as exc:
             logger.error("Error generating timelapse MP4: %s", exc)
             return web.Response(status=500, text=f"Error exporting timelapse: {exc}", content_type="text/plain")

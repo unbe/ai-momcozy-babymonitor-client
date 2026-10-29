@@ -66,6 +66,7 @@ class TimelapseRecorder:
         slot_duration_sec: float = 600.0,
         sample_interval_sec: float = 2.0,
         fps: int = 15,
+        speed_ratio: int = 60,
     ) -> None:
         self.streamer = streamer
         self.storage_dir = Path(storage_dir or os.getenv("MOMCOZY_TIMELAPSE_DIR", "timelapse"))
@@ -73,6 +74,7 @@ class TimelapseRecorder:
         self.slot_duration_sec = float(slot_duration_sec)
         self.sample_interval_sec = float(sample_interval_sec)
         self.fps = int(fps)
+        self.speed_ratio = int(speed_ratio) if int(speed_ratio) in (15, 30, 60, 90) else 60
 
         self._running = False
         self._record_task: Optional[asyncio.Task] = None
@@ -97,6 +99,21 @@ class TimelapseRecorder:
 
         self._load_meta()
 
+    def set_speed_ratio(self, ratio: int | str) -> int:
+        """Set the speed ratio (15, 30, 60, 90)."""
+        if isinstance(ratio, str):
+            clean = ratio.strip().replace("1:", "")
+            r = int(clean)
+        else:
+            r = int(ratio)
+        if r not in (15, 30, 60, 90):
+            raise ValueError(f"Invalid speed ratio: {ratio}. Options are 1:15, 1:30, 1:60, 1:90.")
+        if self.speed_ratio != r:
+            self.speed_ratio = r
+            self._cached_mp4_path = None
+            self._save_meta()
+        return self.speed_ratio
+
     @property
     def is_recording(self) -> bool:
         return self._running and self._record_task is not None and not self._record_task.done()
@@ -119,6 +136,13 @@ class TimelapseRecorder:
                 data = json.loads(self.meta_file.read_text(encoding="utf-8"))
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
+                if "speed_ratio" in data:
+                    try:
+                        r = int(data["speed_ratio"])
+                        if r in (15, 30, 60, 90):
+                            self.speed_ratio = r
+                    except Exception:
+                        pass
                 meta_loaded = True
             except Exception as exc:
                 logger.warning("Error reading timelapse meta.json: %s", exc)
@@ -155,6 +179,7 @@ class TimelapseRecorder:
                 "slot_duration_sec": self.slot_duration_sec,
                 "sample_interval_sec": self.sample_interval_sec,
                 "fps": self.fps,
+                "speed_ratio": self.speed_ratio,
                 "current_slot": self._current_slot,
                 "slots": self._slots_meta,
             }
@@ -397,7 +422,7 @@ class TimelapseRecorder:
 
         max_duration = self.total_slots * self.slot_duration_sec
         total_real_time_sec = min(total_real_time_sec, max_duration)
-        video_sec = total_real_time_sec / 60.0
+        video_sec = total_real_time_sec / self.speed_ratio if self.speed_ratio > 0 else 0.0
 
         return {
             "is_recording": self.is_recording,
@@ -409,13 +434,15 @@ class TimelapseRecorder:
             "buffered_formatted": format_duration(total_real_time_sec),
             "video_duration_seconds": round(video_sec, 1),
             "video_duration_formatted": format_video_duration(video_sec),
-            "speed_ratio": "1:60",
+            "speed_ratio": f"1:{self.speed_ratio}",
+            "speed_ratio_val": self.speed_ratio,
+            "speed_ratio_options": ["1:15", "1:30", "1:60", "1:90"],
             "disk_bytes": total_bytes,
             "disk_formatted": format_bytes(total_bytes),
             "has_content": total_frames > 0,
         }
 
-    async def export_mp4(self, codec: str = "hevc") -> Optional[Path]:
+    async def export_mp4(self, codec: str = "hevc", ratio: Optional[int] = None) -> Optional[Path]:
         """Concatenate ordered slots and remux to MP4 using stream-copy (zero transcoding).
 
         If codec=='h264' is explicitly requested, transcodes using libx264 as fallback.
@@ -431,10 +458,12 @@ class TimelapseRecorder:
             except Exception:
                 pass
 
+        effective_ratio = ratio if (isinstance(ratio, int) and ratio in (15, 30, 60, 90)) else self.speed_ratio
+
         # Determine latest mtime among active slots
         latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
 
-        out_name = f"timelapse_cache_{codec}.mp4"
+        out_name = f"timelapse_cache_{codec}_r{effective_ratio}.mp4"
         out_path = self.storage_dir / out_name
 
         # Check if cache is fresh
@@ -442,16 +471,23 @@ class TimelapseRecorder:
             self._cached_mp4_path == out_path
             and out_path.exists()
             and self._cached_mp4_mtime >= latest_mtime
-            and self._cached_mp4_codec == codec
+            and self._cached_mp4_codec == f"{codec}_r{effective_ratio}"
         ):
             return out_path
 
+        # Compute dynamic fps so video duration matches real_time / effective_ratio
+        st = self.get_status()
+        real_time_sec = max(1.0, float(st.get("buffered_seconds", 0.0)))
+        total_frames = max(1, int(st.get("total_frames", 1)))
+        target_video_sec = max(0.1, real_time_sec / effective_ratio)
+        export_fps = max(1.0, round(total_frames / target_video_sec, 2))
+
         loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(None, self._generate_mp4, ordered, out_path, codec)
+        success = await loop.run_in_executor(None, self._generate_mp4, ordered, out_path, codec, export_fps)
         if success and out_path.exists():
             self._cached_mp4_path = out_path
             self._cached_mp4_mtime = time.time()
-            self._cached_mp4_codec = codec
+            self._cached_mp4_codec = f"{codec}_r{effective_ratio}"
             return out_path
 
         return None
@@ -461,6 +497,7 @@ class TimelapseRecorder:
         ordered_slots: List[Tuple[int, Path, Dict[str, Any]]],
         output_file: Path,
         codec: str,
+        fps: float = 15.0,
     ) -> bool:
         """Run FFmpeg to concatenate slots into an MP4 container."""
         if shutil.which("ffmpeg") is None:
@@ -483,7 +520,7 @@ class TimelapseRecorder:
                     "ffmpeg",
                     "-y",
                     "-r",
-                    str(self.fps),
+                    str(fps),
                     "-f",
                     "concat",
                     "-safe",

@@ -1779,16 +1779,32 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp_dl.status, 200)
                 self.assertIn("attachment", resp_dl.headers.get("Content-Disposition", ""))
 
+            # Test POST /api/timelapse/ratio
+            req_ratio = make_mocked_request("POST", "/api/timelapse/ratio")
+            req_ratio._read_bytes = b'{"ratio": 30}'
+            resp_ratio = await server.handle_timelapse_ratio(req_ratio)
+            self.assertEqual(resp_ratio.status, 200)
+            self.assertEqual(server.timelapse.speed_ratio, 30)
+
+            # Test invalid ratio returns 400
+            req_bad_ratio = make_mocked_request("POST", "/api/timelapse/ratio")
+            req_bad_ratio._read_bytes = b'{"ratio": 999}'
+            resp_bad_ratio = await server.handle_timelapse_ratio(req_bad_ratio)
+            self.assertEqual(resp_bad_ratio.status, 400)
+
             # Test GET /timelapse standalone player page
             req_page = make_mocked_request("GET", "/timelapse")
             resp_page = await server.handle_timelapse_page(req_page)
             self.assertEqual(resp_page.status, 200)
             self.assertEqual(resp_page.content_type, "text/html")
             self.assertIn("Timelapse", resp_page.text)
+            self.assertIn("1:15", resp_page.text)
+            self.assertIn("1:30", resp_page.text)
             self.assertIn("1:60", resp_page.text)
+            self.assertIn("1:90", resp_page.text)
             self.assertIn("canPlayHevc", resp_page.text)
             # Verify no codec dropdown is present
-            self.assertNotIn("<select", resp_page.text.lower())
+            self.assertNotIn("timelapse-codec-select", resp_page.text)
 
             # Test status endpoint includes timelapse info
             req_status = make_mocked_request("GET", "/api/status")
