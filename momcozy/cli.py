@@ -627,9 +627,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
         ssl_context=ssl_context,
     )
     proto = "https" if ssl_context else "http"
+    display_host = "localhost" if args.host == "0.0.0.0" else args.host
     print(f"\n=======================================================")
     print(f" Momcozy BM04 Web Dashboard & Live Streaming Server")
-    print(f" Dashboard:    {proto}://{args.host}:{args.port}")
+    print(f" Dashboard:    {proto}://{display_host}:{args.port}")
     if ssl_context and http_port != args.port:
         print(f" Cast / HTTP:  http://{args.host}:{http_port}/hls/stream.m3u8")
     print(f" MJPEG Stream: {proto}://{args.host}:{args.port}/stream")

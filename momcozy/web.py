@@ -34,6 +34,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <title>Momcozy BM04 Baby Monitor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
   <script>
+    if (location.hostname === '0.0.0.0') {
+      location.hostname = 'localhost';
+    }
     window.serverLanIp = '';
     window.serverPort = 8421;
     window.serverHttpPort = 8420;
@@ -940,15 +943,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
     async function checkHevcWebCodecsSupport() {
+      if (!window.isSecureContext) {
+        console.warn('[WebCodecs] Insecure Context: Chrome disables VideoDecoder on plain HTTP unless accessed via localhost or 127.0.0.1.');
+      }
       if (!('VideoDecoder' in window) || !('EncodedVideoChunk' in window)) {
-        console.log('[WebCodecs] VideoDecoder or EncodedVideoChunk API not present in window.');
+        console.log('[WebCodecs] VideoDecoder or EncodedVideoChunk API not present in window. isSecureContext=' + window.isSecureContext);
         return null;
       }
       const codecs = [
-        'hev1.1.6.L93.B0',
+        'hev1.1.6.L150.B0',
+        'hvc1.1.6.L150.B0',
         'hev1.1.6.L120.B0',
-        'hvc1.1.6.L93.B0',
         'hvc1.1.6.L120.B0',
+        'hev1.1.6.L93.B0',
+        'hvc1.1.6.L93.B0',
+        'hev1.1.6.L153.B0',
+        'hvc1.1.6.L153.B0',
         'hev1.1.6.L90.90'
       ];
       for (const c of codecs) {
@@ -1144,8 +1154,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         console.log('[Stream] WebCodecs HEVC hardware decoding supported (' + supportedHevcCodec + '). Using WebCodecs.');
         startWebCodecsStream(supportedHevcCodec);
       } else {
-        console.log('[Stream] WebCodecs / HEVC not supported. Using MJPEG fallback.');
-        startMjpegStream();
+        const reason = (!window.isSecureContext)
+          ? 'Requires HTTPS or localhost'
+          : 'WebCodecs HEVC not supported in this browser';
+        console.log('[Stream] ' + reason + '. Using MJPEG fallback.');
+        startMjpegStream(reason);
       }
     }
 
