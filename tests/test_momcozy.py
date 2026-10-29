@@ -1771,6 +1771,17 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp_dl.status, 200)
                 self.assertIn("attachment", resp_dl.headers.get("Content-Disposition", ""))
 
+            # Test GET /timelapse standalone player page
+            req_page = make_mocked_request("GET", "/timelapse")
+            resp_page = await server.handle_timelapse_page(req_page)
+            self.assertEqual(resp_page.status, 200)
+            self.assertEqual(resp_page.content_type, "text/html")
+            self.assertIn("Timelapse", resp_page.text)
+            self.assertIn("1:60", resp_page.text)
+            self.assertIn("canPlayHevc", resp_page.text)
+            # Verify no codec dropdown is present
+            self.assertNotIn("<select", resp_page.text.lower())
+
             # Test status endpoint includes timelapse info
             req_status = make_mocked_request("GET", "/api/status")
             with unittest.mock.patch.object(server.monitor, "get_status", MagicMock()):

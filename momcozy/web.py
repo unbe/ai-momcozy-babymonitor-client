@@ -483,7 +483,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </svg>
           <span id="cast-btn-text">Cast</span>
         </button>
-        <button class="video-ctrl-btn" id="timelapse-ctrl-btn" onclick="openTimelapseModal()" title="Watch 12-Hour Timelapse">
+        <button class="video-ctrl-btn" id="timelapse-ctrl-btn" onclick="openTimelapsePlayback()" title="Watch 12-Hour Timelapse">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span id="timelapse-ctrl-text">Timelapse</span>
         </button>
@@ -624,27 +624,29 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 12-Hour Circular Timelapse Card -->
+      <!-- Timelapse Card -->
       <div class="card" id="timelapse-card">
-        <h2>⏱️ 12-Hour Timelapse <span class="badge" id="timelapse-badge">Stopped</span></h2>
-        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:2px; margin-bottom:10px;">
-          Rolling circular ring buffer &bull; 1:60 rate (12h real time in 12 min video)
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <h2 style="margin:0; display:flex; align-items:center; gap:8px;">
+            <span>⏱️ Timelapse</span>
+            <span class="badge" style="background:rgba(66,153,225,0.15); color:var(--accent-blue); font-size:0.75rem;">1:60</span>
+          </h2>
+          <span class="badge" id="timelapse-badge">Stopped</span>
         </div>
         <div class="control-row">
-          <span>Buffered Real Time</span>
-          <span id="timelapse-buffered" style="font-weight:600; font-size:0.85rem;">0m 00s / 12h</span>
+          <span>Time Recorded</span>
+          <span style="font-weight:600; font-size:0.85rem;">
+            <span id="timelapse-buffered">0m 00s</span>
+            <span style="color:var(--text-muted); font-weight:normal; font-size:0.8rem;"> (<span id="timelapse-vlen">0:00</span> video)</span>
+          </span>
         </div>
         <div class="control-row">
-          <span>Timelapse Video Duration</span>
-          <span id="timelapse-vlen" style="font-weight:600; font-size:0.85rem;">0:00</span>
-        </div>
-        <div class="control-row">
-          <span>Ring Buffer Slots</span>
-          <span id="timelapse-slots" style="font-size:0.85rem; color:var(--text-muted);">0 / 72 slots (0.0 MB)</span>
+          <span>Storage</span>
+          <span id="timelapse-storage" style="font-size:0.85rem; font-weight:600;">0.0 MB</span>
         </div>
         <div style="display:flex; gap:8px; margin-top:12px;">
           <button class="btn primary" id="timelapse-toggle-btn" style="flex:1;" onclick="toggleTimelapseRecord()">⏺ Start Recording</button>
-          <button class="btn" id="timelapse-watch-btn" style="flex:1;" onclick="openTimelapseModal()" disabled>▶ Watch</button>
+          <button class="btn" id="timelapse-watch-btn" style="flex:1;" onclick="openTimelapsePlayback()" disabled>▶ Watch</button>
         </div>
       </div>
 
@@ -1531,8 +1533,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
-    let currentTimelapseCodec = 'hevc';
-
     function updateTimelapseUI(tl) {
       if (!tl) return;
       const badge = document.getElementById('timelapse-badge');
@@ -1540,19 +1540,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const watchBtn = document.getElementById('timelapse-watch-btn');
       const bufferedEl = document.getElementById('timelapse-buffered');
       const vlenEl = document.getElementById('timelapse-vlen');
-      const slotsEl = document.getElementById('timelapse-slots');
+      const storageEl = document.getElementById('timelapse-storage');
       const ctrlBtn = document.getElementById('timelapse-ctrl-btn');
 
-      if (bufferedEl) bufferedEl.innerText = `${tl.buffered_formatted || '0m 00s'} / 12h`;
+      if (bufferedEl) bufferedEl.innerText = tl.buffered_formatted || '0m 00s';
       if (vlenEl) vlenEl.innerText = tl.video_duration_formatted || '0:00';
-      if (slotsEl) slotsEl.innerText = `${tl.filled_slots || 0} / ${tl.total_slots || 72} slots (${tl.disk_formatted || '0.0 MB'})`;
+      if (storageEl) storageEl.innerText = tl.disk_formatted || '0.0 MB';
 
       if (tl.is_recording) {
         if (badge) {
           badge.className = 'badge active';
           badge.style.background = '#FED7D7';
           badge.style.color = '#C53030';
-          badge.innerText = 'Recording (1:60)';
+          badge.innerText = 'Recording';
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏹ Stop Recording';
@@ -1601,95 +1601,279 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
-    function openTimelapseModal() {
-      const modal = document.getElementById('timelapse-modal');
-      const video = document.getElementById('timelapse-video');
-      const loading = document.getElementById('timelapse-loading');
-      const dlLink = document.getElementById('timelapse-modal-dl');
-      if (!modal || !video) return;
-
-      modal.style.display = 'flex';
-      if (loading) loading.style.display = 'block';
-
-      const videoUrl = `/api/timelapse/video.mp4?codec=${currentTimelapseCodec}&t=${Date.now()}`;
-      video.src = videoUrl;
-      if (dlLink) dlLink.href = `/api/timelapse/video.mp4?codec=${currentTimelapseCodec}&download=1`;
-
-      video.onloadeddata = () => {
-        if (loading) loading.style.display = 'none';
-        video.play().catch(() => {});
-      };
-
-      video.onerror = (e) => {
-        if (loading) loading.style.display = 'none';
-        console.warn('[Timelapse] Video playback error:', e);
-        if (currentTimelapseCodec === 'hevc') {
-          showToast('Native HEVC playback failed in this browser. Switching to H.264...', 'warn', 4000);
-          switchTimelapseCodec('h264');
-        } else {
-          showToast('Could not play timelapse video in browser. Use Download button.', 'error', 4000);
-        }
-      };
-    }
-
-    function closeTimelapseModal() {
-      const modal = document.getElementById('timelapse-modal');
-      const video = document.getElementById('timelapse-video');
-      if (modal) modal.style.display = 'none';
-      if (video) {
-        video.pause();
-        video.src = '';
-      }
-    }
-
-    function setTimelapseSpeed(speed) {
-      const video = document.getElementById('timelapse-video');
-      if (video) video.playbackRate = speed;
-    }
-
-    function switchTimelapseCodec(codec) {
-      currentTimelapseCodec = codec;
-      const select = document.getElementById('timelapse-codec-select');
-      if (select) select.value = codec;
-      openTimelapseModal();
+    function openTimelapsePlayback() {
+      window.open('/timelapse', '_blank');
     }
 
     setInterval(updateStatus, 3000);
     updateStatus();
     initPlayer();
   </script>
+</body>
+</html>
+"""
 
-  <!-- Timelapse Viewer Modal -->
-  <div id="timelapse-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:9999; align-items:center; justify-content:center; padding:16px;">
-    <div style="background:var(--card-bg); max-width:850px; width:100%; border-radius:14px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,0.5); display:flex; flex-direction:column;">
-      <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid var(--border);">
+
+HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Momcozy BM04 - 12-Hour Timelapse</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <style>
+    :root {
+      --primary: #FF7E98;
+      --primary-dark: #E65A77;
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 16px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 960px;
+      background: var(--card-bg);
+      border-radius: 16px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .title-group h1 {
+      font-size: 1.15rem;
+      font-weight: 700;
+    }
+    .video-container {
+      position: relative;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 380px;
+      max-height: 72vh;
+    }
+    video {
+      width: 100%;
+      max-height: 72vh;
+      background: #000;
+      display: block;
+      outline: none;
+    }
+    .overlay-msg {
+      position: absolute;
+      color: #fff;
+      font-size: 0.95rem;
+      background: rgba(15,23,42,0.85);
+      padding: 12px 20px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 20px;
+      background: rgba(15,23,42,0.6);
+      border-top: 1px solid var(--border);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text);
+      background: #334155;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.15s ease;
+    }
+    .btn:hover {
+      background: #475569;
+    }
+    .btn.primary {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .btn.primary:hover {
+      background: var(--primary-dark);
+    }
+    .btn.active {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .speed-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .speed-btn {
+      padding: 4px 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title-group">
+        <span style="font-size: 1.3rem;">⏱️</span>
         <div>
-          <h3 style="font-size:1.05rem; font-weight:700; display:flex; align-items:center; gap:6px;">⏱️ 12-Hour Timelapse</h3>
-          <div style="font-size:0.75rem; color:var(--text-muted);" id="timelapse-modal-sub">1:60 playback rate &bull; Rolling 12-hour ring buffer</div>
+          <h1 style="display:flex; align-items:center; gap:8px;">
+            <span>Timelapse</span>
+            <span style="font-size:0.75rem; background:rgba(66,153,225,0.15); color:#60a5fa; padding:2px 8px; border-radius:6px; font-weight:600;">1:60</span>
+          </h1>
+          <div style="font-size: 0.75rem; color: var(--text-muted);">Momcozy BM04</div>
         </div>
-        <button class="btn" onclick="closeTimelapseModal()" style="padding:4px 10px; font-size:1rem; line-height:1;" title="Close">✕</button>
       </div>
-      <div style="position:relative; background:#000; display:flex; align-items:center; justify-content:center; min-height:280px; max-height:65vh;">
-        <video id="timelapse-video" controls playsinline style="width:100%; max-height:65vh; background:#000;"></video>
-        <div id="timelapse-loading" style="display:none; position:absolute; color:#fff; font-size:0.9rem; background:rgba(0,0,0,0.7); padding:10px 16px; border-radius:8px;">Preparing timelapse video...</div>
+      <div>
+        <a href="/" class="btn">← Back to Dashboard</a>
       </div>
-      <div style="padding:10px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; border-top:1px solid var(--border); background:var(--bg);">
-        <div style="display:flex; gap:6px; align-items:center; font-size:0.8rem;">
-          <span>Speed:</span>
-          <button class="btn" style="padding:3px 7px; font-size:0.75rem;" onclick="setTimelapseSpeed(1)">1x</button>
-          <button class="btn" style="padding:3px 7px; font-size:0.75rem;" onclick="setTimelapseSpeed(2)">2x</button>
-          <button class="btn" style="padding:3px 7px; font-size:0.75rem;" onclick="setTimelapseSpeed(4)">4x</button>
-        </div>
-        <div style="display:flex; gap:8px; align-items:center;">
-          <select id="timelapse-codec-select" onchange="switchTimelapseCodec(this.value)" style="padding:4px 8px; font-size:0.75rem; border-radius:6px; border:1px solid var(--border);">
-            <option value="hevc">Native HEVC (Fastest, 0% CPU)</option>
-            <option value="h264">H.264 (Universal Compatibility)</option>
-          </select>
-          <a id="timelapse-modal-dl" href="/api/timelapse/video.mp4?download=1" download="timelapse.mp4" class="btn primary" style="text-decoration:none; padding:5px 12px; font-size:0.78rem;">⬇ Download MP4</a>
-        </div>
+    </div>
+    <div class="video-container">
+      <video id="timelapse-video" controls autoplay playsinline loop></video>
+      <div id="loading" class="overlay-msg">
+        <div class="spinner"></div>
+        <span>Preparing timelapse playback...</span>
+      </div>
+      <div id="error-box" class="overlay-msg" style="display:none; color:#f87171;">
+        <span>⚠️ Unable to play video in browser. Please download the file to view.</span>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="speed-group">
+        <span>Speed:</span>
+        <button class="btn speed-btn active" onclick="setSpeed(1, this)">1x</button>
+        <button class="btn speed-btn" onclick="setSpeed(2, this)">2x</button>
+        <button class="btn speed-btn" onclick="setSpeed(4, this)">4x</button>
+        <button class="btn speed-btn" onclick="setSpeed(8, this)">8x</button>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <button class="btn" onclick="reloadVideo()">🔄 Refresh</button>
+        <a id="dl-btn" href="/api/timelapse/video.mp4?download=1" class="btn primary" download="momcozy_timelapse.mp4">⬇ Download MP4</a>
       </div>
     </div>
   </div>
+
+  <script>
+    const video = document.getElementById('timelapse-video');
+    const loading = document.getElementById('loading');
+    const errorBox = document.getElementById('error-box');
+    const dlBtn = document.getElementById('dl-btn');
+
+    function canPlayHevc() {
+      const v = document.createElement('video');
+      const types = [
+        'video/mp4; codecs="hvc1.1.6.L150.B0"',
+        'video/mp4; codecs="hev1.1.6.L150.B0"',
+        'video/mp4; codecs="hvc1.1.6.L93.B0"',
+        'video/mp4; codecs="hvc1"'
+      ];
+      for (const t of types) {
+        const can = v.canPlayType(t);
+        if (can === 'probably' || can === 'maybe') return true;
+      }
+      return false;
+    }
+
+    let activeCodec = canPlayHevc() ? 'hevc' : 'h264';
+    let fallbackAttempted = false;
+
+    function loadPlayback(codec) {
+      activeCodec = codec;
+      loading.style.display = 'flex';
+      errorBox.style.display = 'none';
+      const url = `/api/timelapse/video.mp4?codec=${codec}&t=${Date.now()}`;
+      video.src = url;
+      if (dlBtn) {
+        dlBtn.href = `/api/timelapse/video.mp4?codec=${codec}&download=1`;
+      }
+      video.load();
+      video.play().catch(function() {});
+    }
+
+    video.onloadeddata = function() {
+      loading.style.display = 'none';
+    };
+
+    video.onerror = function(e) {
+      console.warn('[Timelapse Player] Video error with codec ' + activeCodec, e);
+      if (activeCodec === 'hevc' && !fallbackAttempted) {
+        console.info('[Timelapse Player] Retrying with H.264 fallback...');
+        fallbackAttempted = true;
+        loadPlayback('h264');
+        return;
+      }
+      loading.style.display = 'none';
+      errorBox.style.display = 'flex';
+    };
+
+    function setSpeed(rate, btn) {
+      video.playbackRate = rate;
+      document.querySelectorAll('.speed-btn').forEach(function(b) {
+        b.classList.remove('active');
+      });
+      if (btn) btn.classList.add('active');
+    }
+
+    function reloadVideo() {
+      fallbackAttempted = false;
+      loadPlayback(activeCodec);
+    }
+
+    loadPlayback(activeCodec);
+  </script>
 </body>
 </html>
 """
@@ -1822,6 +2006,7 @@ class WebServer:
         self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
         self.app.router.add_get("/api/timelapse/status", self.handle_timelapse_status)
         self.app.router.add_get("/api/timelapse/video.mp4", self.handle_timelapse_video)
+        self.app.router.add_get("/timelapse", self.handle_timelapse_page)
 
     async def handle_favicon(self, request: web.Request) -> web.Response:
         return web.Response(
@@ -2422,6 +2607,10 @@ class WebServer:
                 "Content-Disposition": disposition,
             },
         )
+
+    async def handle_timelapse_page(self, request: web.Request) -> web.Response:
+        """Serve the standalone timelapse player page."""
+        return web.Response(text=HTML_TIMELAPSE_PLAYER, content_type="text/html")
 
     async def run(self) -> None:
         """Run the server until interrupted."""

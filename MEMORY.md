@@ -55,18 +55,21 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
 
 ### 6. 12-Hour Circular Disk-Backed Timelapse Buffer
 * **Rate & Duration:** 1:60 speedup ratio compresses 12 hours of real time into 12 minutes (720 seconds) of video.
-* **Framerate & Sampling:** At 30 fps playback, 1 frame is sampled every 2.0 seconds of real time.
+* **Real-Time Duration & Cadence Tracking:**
+  * Real time elapsed is tracked via monotonic timestamps per slot (`time.monotonic() - slot_start_monotonic`) rather than multiplying frame count by nominal sampling interval, ensuring accurate 1:1 real-time second counting regardless of camera GOP length.
+  * FFmpeg remuxing sets `-r 15` so that keyframes recorded at the camera's native keyframe cadence playback at the exact 1:60 speedup ratio.
 * **Direct Overwrite Circular Ring Buffer (Zero Periodic Scavengers):**
-  * 72 static slot files on disk (`slot_00.hevc` .. `slot_71.hevc`), each representing 10 minutes of real time (300 keyframes, 10 seconds of video).
+  * 72 static slot files on disk (`slot_00.hevc` .. `slot_71.hevc`), each representing 10 minutes of real time.
   * As the buffer advances (`current_slot = (current_slot + 1) % 72`), the incoming slot is opened in `"wb"` mode, immediately truncating and overwriting the 12-hour-old file on disk.
   * Total disk usage is strictly hard-capped (~700 MB - 1 GB), eliminating background cron jobs or periodic file deletion scans.
 * **Zero Transcoding During Recording:**
   * Directly writes Annex B HEVC keyframes (VPS/SPS/PPS + IDR slices) from `VideoStreamer.subscribe_hevc()`.
   * Non-keyframes are dropped without decoding; server CPU consumption during recording is literally 0.0%.
-* **Stream-Copy Browser Playback:**
-  * `export_mp4()` concatenates chronologically ordered slots using FFmpeg's concat demuxer in stream-copy mode (`-c:v copy -tag:v hvc1 -movflags +faststart`).
-  * Instantaneous packaging (< 1 second) with zero transcoding, cached for instant repeat requests.
-  * Served via `GET /api/timelapse/video.mp4` with HTTP Range support (`Accept-Ranges: bytes`) enabling seamless timeline scrubbing in HTML5 `<video>` controls with native 1x/2x/4x speed adjustment.
-  * Provides optional on-demand H.264 fallback (`?codec=h264`) for older browsers.
+* **Standalone Browser Playback (`/timelapse`):**
+  * The dashboard "▶ Watch" button opens `/timelapse` in a dedicated new browser window.
+  * Automatically detects native HEVC support using `canPlayType` with `hvc1.1.6.L150.B0`. If supported, plays native HEVC with 0% CPU; silently falls back to `codec=h264` on decoding errors. No codec dropdowns are exposed to users.
+  * Stream-copy packaging via FFmpeg (`-c:v copy -tag:v hvc1 -movflags +faststart`) is instantaneous (< 1s) and cached for instant scrub-seeking with HTTP Range support (`Accept-Ranges: bytes`).
+* **Dev Server Port & SSL:**
+  * Port 8421 runs HTTPS (`momcozy.py serve --ssl`). Healthchecks and WebCodecs APIs require HTTPS on this port. Plain HTTP for LAN/Chromecast is hosted on port 8420.
 
 

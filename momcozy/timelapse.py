@@ -65,7 +65,7 @@ class TimelapseRecorder:
         total_slots: int = 72,
         slot_duration_sec: float = 600.0,
         sample_interval_sec: float = 2.0,
-        fps: int = 30,
+        fps: int = 15,
     ) -> None:
         self.streamer = streamer
         self.storage_dir = Path(storage_dir or os.getenv("MOMCOZY_TIMELAPSE_DIR", "timelapse"))
@@ -216,8 +216,12 @@ class TimelapseRecorder:
         if self._frames_in_slot > 0:
             p = self.slot_path(self._current_slot)
             sz = p.stat().st_size if p.exists() else self._bytes_in_slot
+            elapsed = 0.0
+            if self._slot_start_monotonic > 0:
+                elapsed = min(self.slot_duration_sec, time.monotonic() - self._slot_start_monotonic)
             self._slots_meta[str(self._current_slot)] = {
                 "mtime": time.time(),
+                "duration": round(elapsed, 1),
                 "frames": self._frames_in_slot,
                 "bytes": sz,
             }
@@ -332,18 +336,26 @@ class TimelapseRecorder:
         ordered = self.get_ordered_slots()
         total_frames = 0
         total_bytes = 0
+        total_real_time_sec = 0.0
 
         for idx, path, meta in ordered:
-            if idx == self._current_slot and self._frames_in_slot > 0:
+            if idx == self._current_slot and self.is_recording:
+                active_elapsed = max(0.0, time.monotonic() - self._slot_start_monotonic)
+                total_real_time_sec += min(self.slot_duration_sec, active_elapsed)
                 total_frames += self._frames_in_slot
                 total_bytes += self._bytes_in_slot
             else:
+                dur = meta.get("duration")
+                if dur is None:
+                    frames = meta.get("frames", 0)
+                    dur = min(self.slot_duration_sec, frames * 4.0 if frames > 0 else 0.0)
+                total_real_time_sec += float(dur)
                 total_frames += meta.get("frames", 0)
                 total_bytes += meta.get("bytes", path.stat().st_size if path.exists() else 0)
 
-        # Real time buffered: frames * sample_interval
-        real_time_sec = total_frames * self.sample_interval_sec
-        video_sec = total_frames / self.fps if self.fps > 0 else 0.0
+        max_duration = self.total_slots * self.slot_duration_sec
+        total_real_time_sec = min(total_real_time_sec, max_duration)
+        video_sec = total_real_time_sec / 60.0
 
         return {
             "is_recording": self.is_recording,
@@ -351,8 +363,8 @@ class TimelapseRecorder:
             "filled_slots": len(ordered),
             "current_slot": self._current_slot,
             "total_frames": total_frames,
-            "buffered_seconds": round(real_time_sec, 1),
-            "buffered_formatted": format_duration(real_time_sec),
+            "buffered_seconds": round(total_real_time_sec, 1),
+            "buffered_formatted": format_duration(total_real_time_sec),
             "video_duration_seconds": round(video_sec, 1),
             "video_duration_formatted": format_video_duration(video_sec),
             "speed_ratio": "1:60",
@@ -428,6 +440,8 @@ class TimelapseRecorder:
                 cmd = [
                     "ffmpeg",
                     "-y",
+                    "-r",
+                    str(self.fps),
                     "-f",
                     "concat",
                     "-safe",
