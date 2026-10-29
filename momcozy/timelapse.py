@@ -164,12 +164,53 @@ class TimelapseRecorder:
         except Exception as exc:
             logger.debug("Failed saving timelapse meta.json: %s", exc)
 
-    async def start(self) -> None:
-        """Start recording the circular timelapse."""
+    def clear(self) -> None:
+        """Clear all previous timelapse slot recordings and metadata."""
+        if self._active_file:
+            try:
+                self._active_file.close()
+            except Exception:
+                pass
+            self._active_file = None
+
+        self._current_slot = 0
+        self._frames_in_slot = 0
+        self._bytes_in_slot = 0
+        self._slot_start_monotonic = time.monotonic()
+        self._slot_start_wall = time.time()
+        self._slots_meta = {}
+        self._cached_mp4_path = None
+        self._cached_mp4_mtime = 0.0
+
+        if self.storage_dir.exists():
+            for p in self.storage_dir.glob("slot_*.hevc"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            for p in self.storage_dir.glob("timelapse_cache_*.mp4*"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            if self.meta_file.exists():
+                try:
+                    self.meta_file.unlink()
+                except OSError:
+                    pass
+
+    async def start(self, fresh: bool = True) -> None:
+        """Start recording the circular timelapse.
+
+        If fresh is True (default), starts a brand new recording session,
+        wiping any old slots and cache so the timelapse starts fresh.
+        """
         async with self._lock:
             if self._running:
                 return
             self.storage_dir.mkdir(parents=True, exist_ok=True)
+            if fresh:
+                self.clear()
             self._running = True
 
             # If streamer is not running, start it
@@ -179,10 +220,11 @@ class TimelapseRecorder:
 
             self._record_task = asyncio.create_task(self._record_loop())
             logger.info(
-                "Timelapse recording started (storage=%s, slots=%d, slot_duration=%.0fs, rate=1:60)",
+                "Timelapse recording started (storage=%s, slots=%d, slot_duration=%.0fs, rate=1:60, fresh=%s)",
                 self.storage_dir,
                 self.total_slots,
                 self.slot_duration_sec,
+                fresh,
             )
 
     async def stop(self) -> None:

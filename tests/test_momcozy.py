@@ -1708,6 +1708,14 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             # Verify slot 0 content was overwritten with NEW_DATA
             self.assertEqual(recorder.slot_path(0).read_bytes(), b"NEW_DATA")
 
+            # Test starting fresh clears previous recordings
+            self.assertTrue(recorder.slot_path(0).exists())
+            recorder.clear()
+            self.assertEqual(recorder._current_slot, 0)
+            self.assertEqual(recorder._frames_in_slot, 0)
+            self.assertEqual(len(recorder._slots_meta), 0)
+            self.assertFalse(recorder.slot_path(0).exists())
+
             # Check format utilities
             self.assertEqual(format_duration(3600), "1h 00m")
             self.assertEqual(format_duration(45), "0m 45s")

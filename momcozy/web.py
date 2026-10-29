@@ -1588,7 +1588,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const res = await fetch(endpoint, { method: 'POST' });
         const d = await res.json();
         if (d.success) {
-          showToast(isCurrentlyRecording ? 'Timelapse recording stopped.' : '12-hour circular timelapse recording started!', 'success', 3500);
+          showToast(isCurrentlyRecording ? 'Timelapse recording stopped.' : 'New timelapse recording started!', 'success', 3500);
           updateTimelapseUI(d.timelapse);
         } else {
           showToast('Timelapse error: ' + (d.error || 'Failed to toggle recording'), 'error', 4000);
@@ -2543,14 +2543,14 @@ class WebServer:
             return web.json_response({"status": "error", "error": str(e)}, status=502)
 
     async def handle_timelapse_start(self, request: web.Request) -> web.Response:
-        """Start recording the 12-hour circular timelapse."""
+        """Start recording the 12-hour circular timelapse fresh."""
         if not self.timelapse:
             return web.json_response(
                 {"success": False, "error": "Timelapse recorder not configured (missing video streamer)."},
                 status=503,
             )
         try:
-            await self.timelapse.start()
+            await self.timelapse.start(fresh=True)
             return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
         except Exception as exc:
             logger.error("Error starting timelapse: %s", exc)
