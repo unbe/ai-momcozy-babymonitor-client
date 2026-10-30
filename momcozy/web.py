@@ -1815,12 +1815,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         <div>
           <h1 style="display:flex; align-items:center; gap:8px;">
             <span>Timelapse</span>
-            <select id="player-ratio-select" onchange="changePlayerRatio(this.value)" style="background:rgba(66,153,225,0.15); color:#60a5fa; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(66,153,225,0.3); outline:none; cursor:pointer;" title="Playback Speed Ratio">
-              <option value="15">1:15</option>
-              <option value="30">1:30</option>
-              <option value="60" selected>1:60</option>
-              <option value="90">1:90</option>
-            </select>
+            <span id="player-ratio-badge" style="background:rgba(66,153,225,0.15); color:#60a5fa; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(66,153,225,0.3);" title="Timelapse Recording Speed Ratio">1:60</span>
           </h1>
           <div style="font-size: 0.75rem; color: var(--text-muted);">Momcozy BM04</div>
         </div>
@@ -1925,19 +1920,6 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       if (btn) btn.classList.add('active');
     }
 
-    async function changePlayerRatio(val) {
-      currentRatio = parseInt(val, 10);
-      try {
-        await fetch('/api/timelapse/ratio', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ratio: currentRatio })
-        });
-      } catch (e) {}
-      fallbackAttempted = false;
-      loadPlayback(activeCodec);
-    }
-
     function reloadVideo() {
       fallbackAttempted = false;
       loadPlayback(activeCodec);
@@ -1949,8 +1931,8 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         const st = await res.json();
         if (st.speed_ratio_val) {
           currentRatio = st.speed_ratio_val;
-          const sel = document.getElementById('player-ratio-select');
-          if (sel) sel.value = String(currentRatio);
+          const badge = document.getElementById('player-ratio-badge');
+          if (badge) badge.textContent = `1:${currentRatio}`;
         }
       } catch (e) {}
       loadPlayback(activeCodec);

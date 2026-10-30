@@ -1806,13 +1806,20 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp_page.status, 200)
             self.assertEqual(resp_page.content_type, "text/html")
             self.assertIn("Timelapse", resp_page.text)
-            self.assertIn("1:15", resp_page.text)
-            self.assertIn("1:30", resp_page.text)
-            self.assertIn("1:60", resp_page.text)
-            self.assertIn("1:90", resp_page.text)
+            self.assertIn("player-ratio-badge", resp_page.text)
+            self.assertNotIn("player-ratio-select", resp_page.text)
             self.assertIn("canPlayHevc", resp_page.text)
             # Verify no codec dropdown is present
             self.assertNotIn("timelapse-codec-select", resp_page.text)
+
+            # Test GET / dashboard index includes timelapse ratio options
+            req_idx = make_mocked_request("GET", "/")
+            resp_idx = await server.handle_index(req_idx)
+            self.assertIn("timelapse-ratio-select", resp_idx.text)
+            self.assertIn("1:15", resp_idx.text)
+            self.assertIn("1:30", resp_idx.text)
+            self.assertIn("1:60", resp_idx.text)
+            self.assertIn("1:90", resp_idx.text)
 
             # Test status endpoint includes timelapse info
             req_status = make_mocked_request("GET", "/api/status")
