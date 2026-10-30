@@ -83,6 +83,13 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **In-Flight Export Deduplication (Thundering Herd Prevention):** Multiple concurrent requests or HTTP retries (e.g. `wget` reconnecting on timeout) for the same `(codec, ratio)` export await a shared running `asyncio.Task` (`_in_flight_exports`), eliminating duplicate concurrent FFmpeg processes from pegging host CPU/GPU cores.
   * **Cache TTL Window During Active Recording:** During active recording, slot files are appended every 2 seconds. A sliding cache TTL (20s for HEVC, 60s for H.264) avoids invalidating and regenerating exports on every keyframe, providing instant (< 5ms) responses for scrubbing, page reloads, and downloads.
   * **Hardware-Accelerated H.264 Encoding:** `TimelapseRecorder._generate_mp4` auto-detects `/dev/dri/renderD128` and runs `-c:v h264_vaapi -vf format=nv12,hwupload` on the GPU, with a clean multithreaded fallback to `libx264 -preset ultrafast -threads 0`.
+* **Motion Events on Recording Timeline (0% CPU Hardware Integration):**
+  * **Zero Recording Overhead:** No video frames are analyzed or decoded on the server. Instead, `MomcozyMonitor`'s native camera hardware detection alerts (DP 185 `ipc_motion`, `ipc_human`, `ipc_crying` and DP 115/127 alarm statuses) arriving over the local network socket are logged with timestamps in `meta.json`. Events within 15 seconds are automatically debounced, and historical events older than the 12-hour circular buffer window are automatically pruned.
+  * **Timeline Coordinate Projection:** Each event's video timeline second and percentage is calculated dynamically based on the recording start time:
+    $$\text{Elapsed Real Time} = \text{Event Timestamp} - \text{Buffer Start Time}$$
+    $$\text{Video Second} = \frac{\text{Elapsed Real Time}}{\text{Speed Ratio}}$$
+    $$\text{Scrubber Percent} = \frac{\text{Elapsed Real Time}}{\text{Total Buffered Time}} \times 100\%$$
+  * **Interactive Scrubber Markers & Navigation:** In `/timelapse`, motion events appear as glowing amber notches on the timeline scrubber. Hovering over a marker shows the event label, wall-clock time, and video timestamp. Clicking any marker seeks directly to that moment. Next (`N`) and Previous (`P`) motion navigation buttons allow jumping between highlights. The main dashboard Timelapse card displays an active count badge (`🏃 N events`).
 * **Dev Server Port & SSL:**
   * Port 8421 runs HTTPS (`momcozy.py serve --ssl`). Healthchecks and WebCodecs APIs require HTTPS on this port. Plain HTTP for LAN/Chromecast is hosted on port 8420.
 

@@ -92,6 +92,9 @@ class TimelapseRecorder:
         # Metadata tracking: slot_idx -> {"mtime": float, "frames": int, "bytes": int}
         self._slots_meta: Dict[str, Dict[str, Any]] = {}
 
+        # Recorded motion/detection events list: [{"time": float, "type": str, "label": str}]
+        self._events: List[Dict[str, Any]] = []
+
         # Cache for exported MP4: cache_key -> {"path": Path, "created_at": float, "mtime": float}
         self._exports_cache: Dict[str, Dict[str, Any]] = {}
         # In-flight export tasks deduplication: cache_key -> asyncio.Task
@@ -156,6 +159,7 @@ class TimelapseRecorder:
                 data = json.loads(self.meta_file.read_text(encoding="utf-8"))
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
+                self._events = data.get("events", [])
                 if "speed_ratio" in data:
                     try:
                         r = int(data["speed_ratio"])
@@ -202,6 +206,7 @@ class TimelapseRecorder:
                 "speed_ratio": self.speed_ratio,
                 "current_slot": self._current_slot,
                 "slots": self._slots_meta,
+                "events": self._events,
             }
             tmp_meta = self.storage_dir / "meta.json.tmp"
             tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -224,6 +229,7 @@ class TimelapseRecorder:
         self._slot_start_monotonic = time.monotonic()
         self._slot_start_wall = time.time()
         self._slots_meta = {}
+        self._events = []
         self._exports_cache.clear()
         for task in list(self._in_flight_exports.values()):
             if not task.done():
@@ -246,6 +252,37 @@ class TimelapseRecorder:
                     self.meta_file.unlink()
                 except OSError:
                     pass
+
+    def record_event(
+        self,
+        event_type: str = "motion",
+        label: str = "Motion Alert",
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Record a motion or detection event with a timestamp.
+
+        Debounces events within 15 seconds to avoid duplicates.
+        Prunes events older than the circular buffer's retention window.
+        """
+        ts = float(timestamp if timestamp is not None else time.time())
+        # Debounce: if an event of the same type occurred within the last 15s, skip
+        for ev in reversed(self._events):
+            if ev.get("type") == event_type and abs(float(ev.get("time", 0.0)) - ts) < 15.0:
+                return False
+
+        self._events.append({
+            "time": round(ts, 1),
+            "type": event_type,
+            "label": label,
+        })
+        # Keep events within the circular ring buffer's historical retention window
+        max_history_sec = self.total_slots * self.slot_duration_sec
+        latest_ts = max([float(ev.get("time", 0.0)) for ev in self._events] + [ts])
+        cutoff = latest_ts - max_history_sec
+        self._events = [ev for ev in self._events if float(ev.get("time", 0.0)) >= cutoff]
+        self._save_meta()
+        logger.info("Recorded timelapse %s event: '%s' at timestamp %.1f", event_type, label, ts)
+        return True
 
     async def start(self, fresh: bool = True) -> None:
         """Start recording the circular timelapse.
@@ -447,6 +484,33 @@ class TimelapseRecorder:
         total_real_time_sec = min(total_real_time_sec, max_duration)
         video_sec = total_real_time_sec / self.speed_ratio if self.speed_ratio > 0 else 0.0
 
+        # Calculate event timeline positions relative to the start of recorded video
+        events_list: List[Dict[str, Any]] = []
+        if ordered and total_real_time_sec > 0:
+            first_slot_meta = ordered[0][2]
+            first_slot_path = ordered[0][1]
+            first_slot_mtime = float(first_slot_meta.get("mtime") or (first_slot_path.stat().st_mtime if first_slot_path.exists() else time.time()))
+            first_slot_dur = float(first_slot_meta.get("duration") or min(self.slot_duration_sec, total_real_time_sec))
+            start_wall_time = first_slot_mtime - first_slot_dur
+
+            for ev in self._events:
+                ev_time = float(ev.get("time", 0.0))
+                elapsed_sec = max(0.0, ev_time - start_wall_time)
+                if elapsed_sec <= total_real_time_sec + 30.0:  # within current buffer window
+                    percent = min(100.0, max(0.0, round((elapsed_sec / total_real_time_sec) * 100.0, 1)))
+                    ev_video_sec = round(elapsed_sec / self.speed_ratio, 1) if self.speed_ratio > 0 else 0.0
+                    events_list.append({
+                        "time": ev_time,
+                        "time_str": time.strftime("%I:%M:%S %p", time.localtime(ev_time)),
+                        "type": ev.get("type", "motion"),
+                        "label": ev.get("label", "Motion Alert"),
+                        "elapsed_sec": round(elapsed_sec, 1),
+                        "video_sec": ev_video_sec,
+                        "video_formatted": format_video_duration(ev_video_sec),
+                        "percent": percent,
+                    })
+            events_list.sort(key=lambda x: x["elapsed_sec"])
+
         return {
             "is_recording": self.is_recording,
             "total_slots": self.total_slots,
@@ -463,6 +527,8 @@ class TimelapseRecorder:
             "disk_bytes": total_bytes,
             "disk_formatted": format_bytes(total_bytes),
             "has_content": total_frames > 0,
+            "events": events_list,
+            "motion_events_count": len(events_list),
         }
 
     async def export_mp4(self, codec: str = "hevc", ratio: Optional[int] = None) -> Optional[Path]:

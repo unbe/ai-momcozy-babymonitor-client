@@ -7,6 +7,7 @@ real-time sensor telemetry (temperature, alerts), and full remote control.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -662,6 +663,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <span id="timelapse-buffered">0m 00s</span>
             <span style="color:var(--text-muted); font-weight:normal; font-size:0.8rem;"> (<span id="timelapse-vlen">0:00</span> video)</span>
           </span>
+        </div>
+        <div class="control-row">
+          <span>Motion Events</span>
+          <span id="timelapse-events-badge" class="badge" style="background:rgba(255,255,255,0.08); color:var(--text-muted); font-size:0.75rem;">0 events</span>
         </div>
         <div class="control-row">
           <span>Storage</span>
@@ -1572,6 +1577,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (storageEl) storageEl.innerText = tl.disk_formatted || '0.0 MB';
       if (ratioSelect && tl.speed_ratio_val) ratioSelect.value = String(tl.speed_ratio_val);
 
+      const evBadge = document.getElementById('timelapse-events-badge');
+      if (evBadge) {
+        const evCount = tl.motion_events_count || 0;
+        evBadge.innerText = `${evCount} event${evCount === 1 ? '' : 's'}`;
+        if (evCount > 0) {
+          evBadge.style.background = 'rgba(245, 158, 11, 0.2)';
+          evBadge.style.color = '#f59e0b';
+          evBadge.style.border = '1px solid rgba(245, 158, 11, 0.4)';
+        } else {
+          evBadge.style.background = 'rgba(255, 255, 255, 0.08)';
+          evBadge.style.color = 'var(--text-muted)';
+          evBadge.style.border = '1px solid transparent';
+        }
+      }
+
       if (tl.is_recording) {
         if (badge) {
           badge.className = 'badge active';
@@ -1805,6 +1825,131 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     .speed-btn {
       padding: 4px 10px;
     }
+    .timeline-card {
+      padding: 12px 20px 8px 20px;
+      background: rgba(15,23,42,0.7);
+      border-top: 1px solid var(--border);
+    }
+    .timeline-bar-wrapper {
+      position: relative;
+      padding: 8px 0;
+      cursor: pointer;
+    }
+    .timeline-bar {
+      position: relative;
+      width: 100%;
+      height: 8px;
+      background: rgba(255, 255, 255, 0.12);
+      border-radius: 4px;
+      overflow: visible;
+      transition: height 0.15s ease;
+    }
+    .timeline-bar-wrapper:hover .timeline-bar {
+      height: 10px;
+    }
+    .timeline-progress {
+      position: absolute;
+      left: 0;
+      top: 0;
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--primary), #fb7185);
+      border-radius: 4px;
+      pointer-events: none;
+    }
+    .timeline-thumb {
+      position: absolute;
+      top: 50%;
+      left: 0%;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 0 6px rgba(0,0,0,0.6);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      transition: transform 0.1s ease;
+    }
+    .timeline-bar-wrapper:hover .timeline-thumb {
+      transform: translate(-50%, -50%) scale(1.25);
+    }
+    .timeline-marker {
+      position: absolute;
+      top: 50%;
+      width: 6px;
+      height: 16px;
+      border-radius: 3px;
+      background: #f59e0b;
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.9);
+      transform: translate(-50%, -50%);
+      cursor: pointer;
+      z-index: 10;
+      transition: all 0.15s ease;
+    }
+    .timeline-marker:hover {
+      width: 8px;
+      height: 20px;
+      background: #fbbf24;
+      box-shadow: 0 0 12px rgba(251, 191, 36, 1);
+    }
+    .timeline-tooltip {
+      position: absolute;
+      top: -30px;
+      left: 0;
+      transform: translateX(-50%);
+      background: rgba(15, 23, 42, 0.95);
+      color: #f8fafc;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      white-space: nowrap;
+      pointer-events: none;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      display: none;
+      z-index: 50;
+    }
+    .timeline-meta-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 6px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .timeline-nav-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .nav-event-btn {
+      padding: 3px 8px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border-radius: 6px;
+      background: #334155;
+      border: 1px solid var(--border);
+      color: var(--text);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .nav-event-btn:hover {
+      background: rgba(245, 158, 11, 0.25);
+      border-color: rgba(245, 158, 11, 0.6);
+      color: #fbbf24;
+    }
+    .event-counter-badge {
+      background: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
   </style>
 </head>
 <body>
@@ -1832,6 +1977,26 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       </div>
       <div id="error-box" class="overlay-msg" style="display:none; color:#f87171;">
         <span>⚠️ Unable to play video in browser. Please download the file to view.</span>
+      </div>
+    </div>
+    <div class="timeline-card">
+      <div class="timeline-bar-wrapper" id="timeline-wrapper">
+        <div class="timeline-bar" id="timeline-bar" onclick="seekFromTimeline(event)">
+          <div class="timeline-progress" id="timeline-progress"></div>
+          <div class="timeline-markers" id="timeline-markers"></div>
+          <div class="timeline-thumb" id="timeline-thumb"></div>
+        </div>
+        <div id="timeline-tooltip" class="timeline-tooltip"></div>
+      </div>
+      <div class="timeline-meta-row">
+        <div class="timeline-time-info">
+          <span id="current-time-text">0:00</span> / <span id="duration-time-text">0:00</span>
+        </div>
+        <div class="timeline-nav-group">
+          <button class="nav-event-btn" id="prev-event-btn" onclick="jumpToPrevEvent()" title="Jump to previous motion event (Key: P)">⏮️ Prev Motion</button>
+          <span id="events-counter-badge" class="badge event-counter-badge">🏃 0 Motion Events</span>
+          <button class="nav-event-btn" id="next-event-btn" onclick="jumpToNextEvent()" title="Jump to next motion event (Key: N)">Next Motion ⏭️</button>
+        </div>
       </div>
     </div>
     <div class="footer">
@@ -1912,6 +2077,111 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       errorBox.style.display = 'flex';
     };
 
+    let motionEvents = [];
+
+    function formatTimeSec(seconds) {
+      const s = Math.max(0, Math.floor(seconds));
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      return `${m}:${rem < 10 ? '0' : ''}${rem}`;
+    }
+
+    function renderTimelineMarkers() {
+      const container = document.getElementById('timeline-markers');
+      if (!container) return;
+      container.innerHTML = '';
+      const counter = document.getElementById('events-counter-badge');
+      if (counter) {
+        counter.textContent = `🏃 ${motionEvents.length} Motion Event${motionEvents.length === 1 ? '' : 's'}`;
+      }
+
+      motionEvents.forEach((ev) => {
+        const el = document.createElement('div');
+        el.className = 'timeline-marker';
+        el.style.left = `${ev.percent}%`;
+
+        el.addEventListener('mouseenter', () => {
+          const tt = document.getElementById('timeline-tooltip');
+          if (tt) {
+            tt.textContent = `🏃 ${ev.label} • ${ev.time_str} (${ev.video_formatted})`;
+            tt.style.left = `${ev.percent}%`;
+            tt.style.display = 'block';
+          }
+        });
+        el.addEventListener('mouseleave', () => {
+          const tt = document.getElementById('timeline-tooltip');
+          if (tt) tt.style.display = 'none';
+        });
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          seekToSec(ev.video_sec);
+        });
+        container.appendChild(el);
+      });
+    }
+
+    function seekToSec(sec) {
+      if (video.duration) {
+        video.currentTime = Math.min(video.duration, Math.max(0, sec));
+        video.play().catch(() => {});
+      }
+    }
+
+    function seekFromTimeline(e) {
+      const bar = document.getElementById('timeline-bar');
+      if (!bar || !video.duration) return;
+      const rect = bar.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      video.currentTime = ratio * video.duration;
+    }
+
+    function jumpToNextEvent() {
+      if (!motionEvents.length || !video.duration) return;
+      const cur = video.currentTime;
+      const next = motionEvents.find(ev => ev.video_sec > cur + 0.8);
+      if (next) {
+        seekToSec(next.video_sec);
+      } else if (motionEvents.length) {
+        seekToSec(motionEvents[0].video_sec);
+      }
+    }
+
+    function jumpToPrevEvent() {
+      if (!motionEvents.length || !video.duration) return;
+      const cur = video.currentTime;
+      const prev = [...motionEvents].reverse().find(ev => ev.video_sec < cur - 0.8);
+      if (prev) {
+        seekToSec(prev.video_sec);
+      } else if (motionEvents.length) {
+        seekToSec(motionEvents[motionEvents.length - 1].video_sec);
+      }
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+      if (e.key === 'n' || e.key === 'N') jumpToNextEvent();
+      else if (e.key === 'p' || e.key === 'P') jumpToPrevEvent();
+    });
+
+    video.addEventListener('timeupdate', () => {
+      const curEl = document.getElementById('current-time-text');
+      const durEl = document.getElementById('duration-time-text');
+      const progress = document.getElementById('timeline-progress');
+      const thumb = document.getElementById('timeline-thumb');
+      if (curEl) curEl.textContent = formatTimeSec(video.currentTime);
+      if (durEl && video.duration) durEl.textContent = formatTimeSec(video.duration);
+      if (video.duration) {
+        const pct = Math.min(100, Math.max(0, (video.currentTime / video.duration) * 100));
+        if (progress) progress.style.width = `${pct}%`;
+        if (thumb) thumb.style.left = `${pct}%`;
+      }
+    });
+
+    video.addEventListener('loadedmetadata', () => {
+      const durEl = document.getElementById('duration-time-text');
+      if (durEl && video.duration) durEl.textContent = formatTimeSec(video.duration);
+    });
+
     function setSpeed(rate, btn) {
       video.playbackRate = rate;
       document.querySelectorAll('.speed-btn').forEach(function(b) {
@@ -1933,6 +2203,10 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
           currentRatio = st.speed_ratio_val;
           const badge = document.getElementById('player-ratio-badge');
           if (badge) badge.textContent = `1:${currentRatio}`;
+        }
+        if (st.events) {
+          motionEvents = st.events;
+          renderTimelineMarkers();
         }
       } catch (e) {}
       loadPlayback(activeCodec);
@@ -2072,6 +2346,7 @@ class WebServer:
         self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
         self.app.router.add_post("/api/timelapse/ratio", self.handle_timelapse_ratio)
         self.app.router.add_get("/api/timelapse/status", self.handle_timelapse_status)
+        self.app.router.add_post("/api/timelapse/event", self.handle_timelapse_record_event)
         self.app.router.add_get("/api/timelapse/video.mp4", self.handle_timelapse_video)
         self.app.router.add_get("/timelapse", self.handle_timelapse_page)
 
@@ -2503,6 +2778,19 @@ class WebServer:
             raw_bucket = getattr(status, "latest_event_bucket", "")
             latest_event_bucket = str(raw_bucket) if isinstance(raw_bucket, str) else ""
 
+            if self.timelapse and self.timelapse.is_recording:
+                if latest_event_cmd in ("ipc_motion", "ipc_human", "ipc_crying", "ipc_alarm") and latest_event_time:
+                    self.timelapse.record_event(
+                        event_type="motion",
+                        label=latest_event_name or "Motion Alert",
+                        timestamp=float(latest_event_time),
+                    )
+                elif getattr(status, "motion_detected", False):
+                    self.timelapse.record_event(
+                        event_type="motion",
+                        label="Motion Detected",
+                    )
+
             return web.json_response({
                 "online": True,
                 "temperature_c": status.temperature_c,
@@ -2668,6 +2956,25 @@ class WebServer:
             return web.json_response({"is_recording": False, "has_content": False})
         return web.json_response(self.timelapse.get_status())
 
+    async def handle_timelapse_record_event(self, request: web.Request) -> web.Response:
+        """Manually or externally record a motion/detection event."""
+        if not self.timelapse:
+            return web.json_response({"success": False, "error": "Timelapse recorder not configured."}, status=503)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        ev_type = str(data.get("type", "motion"))
+        label = str(data.get("label", "Motion Alert"))
+        ts = data.get("timestamp")
+        timestamp = float(ts) if isinstance(ts, (int, float)) else None
+        recorded = self.timelapse.record_event(event_type=ev_type, label=label, timestamp=timestamp)
+        return web.json_response({
+            "success": True,
+            "recorded": recorded,
+            "events_count": len(self.timelapse._events),
+        })
+
     async def handle_timelapse_video(self, request: web.Request) -> web.StreamResponse:
         """Serve exported timelapse MP4 with HTTP Range support for scrubbing."""
         if not self.timelapse:
@@ -2712,6 +3019,37 @@ class WebServer:
         """Serve the standalone timelapse player page."""
         return web.Response(text=HTML_TIMELAPSE_PLAYER, content_type="text/html")
 
+    async def _motion_monitor_loop(self) -> None:
+        """Lightweight background loop capturing camera motion events while timelapse is recording."""
+        last_ev_time = 0.0
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                if not self.timelapse or not self.timelapse.is_recording:
+                    continue
+                if not self.monitor:
+                    continue
+                status = await asyncio.to_thread(self.monitor.get_status)
+                ev_cmd = getattr(status, "latest_event_cmd", "")
+                ev_time = getattr(status, "latest_event_time", None)
+                if ev_cmd in ("ipc_motion", "ipc_human", "ipc_crying", "ipc_alarm") and ev_time:
+                    if float(ev_time) != last_ev_time:
+                        last_ev_time = float(ev_time)
+                        self.timelapse.record_event(
+                            event_type="motion",
+                            label=getattr(status, "latest_event_name", "Motion Alert") or "Motion Alert",
+                            timestamp=float(ev_time),
+                        )
+                elif getattr(status, "motion_detected", False):
+                    self.timelapse.record_event(
+                        event_type="motion",
+                        label="Motion Detected",
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Error in timelapse motion monitor loop: %s", exc)
+
     async def run(self) -> None:
         """Run the server until interrupted."""
         if self.streamer and not self.streamer.is_running:
@@ -2735,10 +3073,14 @@ class WebServer:
             except Exception as e:
                 logger.warning("Could not bind HTTP media port %d: %s. Chromecast may fail on self-signed HTTPS.", self.http_port, e)
 
+        motion_task = asyncio.create_task(self._motion_monitor_loop())
         try:
             while True:
                 await asyncio.sleep(3600)
         finally:
+            motion_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await motion_task
             if self.timelapse and self.timelapse.is_recording:
                 await self.timelapse.stop()
             if self.hls:

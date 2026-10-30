@@ -1808,18 +1808,34 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Timelapse", resp_page.text)
             self.assertIn("player-ratio-badge", resp_page.text)
             self.assertNotIn("player-ratio-select", resp_page.text)
+            self.assertIn("timeline-markers", resp_page.text)
+            self.assertIn("events-counter-badge", resp_page.text)
+            self.assertIn("prev-event-btn", resp_page.text)
+            self.assertIn("next-event-btn", resp_page.text)
             self.assertIn("canPlayHevc", resp_page.text)
             # Verify no codec dropdown is present
             self.assertNotIn("timelapse-codec-select", resp_page.text)
 
-            # Test GET / dashboard index includes timelapse ratio options
+            # Test GET / dashboard index includes timelapse ratio options and motion events badge
             req_idx = make_mocked_request("GET", "/")
             resp_idx = await server.handle_index(req_idx)
             self.assertIn("timelapse-ratio-select", resp_idx.text)
+            self.assertIn("timelapse-events-badge", resp_idx.text)
             self.assertIn("1:15", resp_idx.text)
             self.assertIn("1:30", resp_idx.text)
             self.assertIn("1:60", resp_idx.text)
             self.assertIn("1:90", resp_idx.text)
+
+            # Test POST /api/timelapse/event
+            req_ev = make_mocked_request("POST", "/api/timelapse/event")
+            req_ev._read_bytes = b'{"type": "motion", "label": "Motion Alert", "timestamp": 1730332800.0}'
+            resp_ev = await server.handle_timelapse_record_event(req_ev)
+            self.assertEqual(resp_ev.status, 200)
+            import json
+            ev_data = json.loads(resp_ev.text)
+            self.assertTrue(ev_data["success"])
+            self.assertTrue(ev_data["recorded"])
+            self.assertEqual(ev_data["events_count"], 1)
 
             # Test status endpoint includes timelapse info
             req_status = make_mocked_request("GET", "/api/status")
@@ -1984,6 +2000,75 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 p2 = await recorder.export_mp4(codec="h264", ratio=60)
                 self.assertEqual(call_count, 1)  # Still 1, cache hit!
                 self.assertEqual(p1, p2)
+
+    def test_timelapse_motion_events_timeline(self):
+        """Verify motion events recording, debouncing, persistence, and timeline mapping."""
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=4,
+                slot_duration_sec=600.0,
+                speed_ratio=60,
+            )
+
+            # Record slot 0 with 600s duration ending at t=10000.0 (started at 9400.0)
+            s0 = recorder.slot_path(0)
+            s0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 50)
+            recorder._slots_meta["0"] = {"mtime": 10000.0, "duration": 600.0, "frames": 300, "bytes": 56}
+
+            # 1. Record an event at t=9700.0 (300s into the 600s recording -> 50%)
+            rec1 = recorder.record_event(event_type="motion", label="Motion Alert", timestamp=9700.0)
+            self.assertTrue(rec1)
+
+            # 2. Try recording duplicate within 15s -> should be debounced
+            rec2 = recorder.record_event(event_type="motion", label="Motion Alert", timestamp=9705.0)
+            self.assertFalse(rec2)
+            self.assertEqual(len(recorder._events), 1)
+
+            # 3. Record second event at t=9850.0 (450s into 600s recording -> 75%)
+            rec3 = recorder.record_event(event_type="motion", label="Baby Motion", timestamp=9850.0)
+            self.assertTrue(rec3)
+            self.assertEqual(len(recorder._events), 2)
+
+            # 4. Check status timeline calculation
+            st = recorder.get_status()
+            self.assertEqual(st["motion_events_count"], 2)
+            evs = st["events"]
+            self.assertEqual(len(evs), 2)
+
+            # Ev 1: elapsed 300s, video_sec = 300 / 60 = 5.0s, percent = 50.0%
+            self.assertEqual(evs[0]["elapsed_sec"], 300.0)
+            self.assertEqual(evs[0]["video_sec"], 5.0)
+            self.assertEqual(evs[0]["video_formatted"], "0:05")
+            self.assertEqual(evs[0]["percent"], 50.0)
+
+            # Ev 2: elapsed 450s, video_sec = 450 / 60 = 7.5s, percent = 75.0%
+            self.assertEqual(evs[1]["elapsed_sec"], 450.0)
+            self.assertEqual(evs[1]["video_sec"], 7.5)
+            self.assertEqual(evs[1]["percent"], 75.0)
+
+            # 5. Verify persistence across instances via meta.json
+            recorder2 = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=4,
+                slot_duration_sec=600.0,
+                speed_ratio=60,
+            )
+            self.assertEqual(len(recorder2._events), 2)
+            st2 = recorder2.get_status()
+            self.assertEqual(st2["motion_events_count"], 2)
 
 
 if __name__ == "__main__":
