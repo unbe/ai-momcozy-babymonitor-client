@@ -1887,6 +1887,97 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mp4_h264.exists())
             self.assertGreater(mp4_h264.stat().st_size, 1000)
 
+    async def test_timelapse_concurrent_export_deduplication(self):
+        """Verify concurrent requests for the same export share a single in-flight task."""
+        import asyncio
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=2,
+            )
+
+            # Create a slot file
+            s0 = recorder.slot_path(0)
+            s0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 50)
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "frames": 1, "bytes": 56}
+
+            call_count = 0
+            original_generate = recorder._generate_mp4
+
+            def mock_generate(slots, out, codec, fps):
+                nonlocal call_count
+                call_count += 1
+                time.sleep(0.05)
+                out.write_bytes(b"dummy_mp4_data")
+                return True
+
+            with unittest.mock.patch.object(recorder, "_generate_mp4", side_effect=mock_generate):
+                # Launch two concurrent exports
+                t1 = asyncio.create_task(recorder.export_mp4(codec="h264", ratio=60))
+                t2 = asyncio.create_task(recorder.export_mp4(codec="h264", ratio=60))
+
+                res1, res2 = await asyncio.gather(t1, t2)
+                self.assertEqual(res1, res2)
+                self.assertEqual(call_count, 1)  # Only called once! Deduplication worked!
+
+    async def test_timelapse_cache_ttl_during_active_recording(self):
+        """Verify cache is preserved within TTL even while active slot is continuously appended."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=2,
+            )
+
+            s0 = recorder.slot_path(0)
+            s0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 50)
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "frames": 1, "bytes": 56}
+
+            call_count = 0
+            def mock_generate(slots, out, codec, fps):
+                nonlocal call_count
+                call_count += 1
+                out.write_bytes(b"cached_video_bytes")
+                return True
+
+            with unittest.mock.patch.object(recorder, "_generate_mp4", side_effect=mock_generate):
+                recorder._running = True  # Simulate active recording
+                recorder._record_task = MagicMock()
+                recorder._record_task.done.return_value = False
+                self.assertTrue(recorder.is_recording)
+
+                # First export: generates cache
+                p1 = await recorder.export_mp4(codec="h264", ratio=60)
+                self.assertEqual(call_count, 1)
+
+                # Simulate new frame arrived in active slot 1 second later
+                s0.write_bytes(s0.read_bytes() + b"\x00" * 20)
+
+                # Second export: should reuse cache without re-encoding!
+                p2 = await recorder.export_mp4(codec="h264", ratio=60)
+                self.assertEqual(call_count, 1)  # Still 1, cache hit!
+                self.assertEqual(p1, p2)
+
 
 if __name__ == "__main__":
     unittest.main()

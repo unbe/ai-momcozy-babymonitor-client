@@ -1847,9 +1847,10 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         <button class="btn speed-btn" onclick="setSpeed(4, this)">4x</button>
         <button class="btn speed-btn" onclick="setSpeed(8, this)">8x</button>
       </div>
-      <div style="display:flex; gap:10px;">
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
         <button class="btn" onclick="reloadVideo()">🔄 Refresh</button>
-        <a id="dl-btn" href="/api/timelapse/video.mp4?download=1" class="btn primary" download="momcozy_timelapse.mp4">⬇ Download MP4</a>
+        <a id="dl-btn" href="/api/timelapse/video.mp4?codec=hevc&download=1" class="btn primary" download="momcozy_timelapse.mp4" title="Native fast HEVC stream-copy (instant download)">⬇ Download MP4</a>
+        <a id="dl-h264-btn" href="/api/timelapse/video.mp4?codec=h264&download=1" class="btn" download="momcozy_timelapse_h264.mp4" title="H.264 version for legacy players" style="font-size:0.75rem;">⬇ Download H.264</a>
       </div>
     </div>
   </div>
@@ -1879,15 +1880,23 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     let fallbackAttempted = false;
     let currentRatio = 60;
 
+    function updateDownloadLinks() {
+      if (dlBtn) {
+        dlBtn.href = `/api/timelapse/video.mp4?codec=hevc&ratio=${currentRatio}&download=1`;
+      }
+      const dlH264 = document.getElementById('dl-h264-btn');
+      if (dlH264) {
+        dlH264.href = `/api/timelapse/video.mp4?codec=h264&ratio=${currentRatio}&download=1`;
+      }
+    }
+
     function loadPlayback(codec) {
       activeCodec = codec;
       loading.style.display = 'flex';
       errorBox.style.display = 'none';
       const url = `/api/timelapse/video.mp4?codec=${codec}&ratio=${currentRatio}&t=${Date.now()}`;
       video.src = url;
-      if (dlBtn) {
-        dlBtn.href = `/api/timelapse/video.mp4?codec=${codec}&ratio=${currentRatio}&download=1`;
-      }
+      updateDownloadLinks();
       video.load();
       video.play().catch(function() {});
     }
@@ -2685,9 +2694,15 @@ class WebServer:
                 text="Timelapse recorder not configured.",
                 content_type="text/plain",
             )
-        codec = request.query.get("codec", "hevc").lower()
-        if codec not in ("hevc", "h264"):
+        codec = request.query.get("codec")
+        is_download = request.query.get("download") == "1"
+        if not codec:
+            # Default to fast stream-copy HEVC for instant downloads & high performance
             codec = "hevc"
+        else:
+            codec = codec.lower().strip()
+            if codec not in ("hevc", "h264"):
+                codec = "hevc"
         ratio_param = request.query.get("ratio")
         ratio = int(ratio_param) if (ratio_param and ratio_param.isdigit()) else None
         try:
@@ -2699,8 +2714,8 @@ class WebServer:
         if not mp4_path or not mp4_path.exists():
             return web.Response(status=404, text="No timelapse video frames recorded yet.", content_type="text/plain")
 
-        is_download = request.query.get("download") == "1"
-        disposition = f'attachment; filename="momcozy_timelapse_{codec}.mp4"' if is_download else "inline"
+        effective_ratio = ratio or self.timelapse.speed_ratio
+        disposition = f'attachment; filename="momcozy_timelapse_{codec}_r{effective_ratio}.mp4"' if is_download else "inline"
 
         return SafeFileResponse(
             mp4_path,

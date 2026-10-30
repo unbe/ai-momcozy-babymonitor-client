@@ -92,12 +92,32 @@ class TimelapseRecorder:
         # Metadata tracking: slot_idx -> {"mtime": float, "frames": int, "bytes": int}
         self._slots_meta: Dict[str, Dict[str, Any]] = {}
 
-        # Cache for exported MP4
-        self._cached_mp4_path: Optional[Path] = None
-        self._cached_mp4_mtime: float = 0.0
-        self._cached_mp4_codec: str = ""
+        # Cache for exported MP4: cache_key -> {"path": Path, "created_at": float, "mtime": float}
+        self._exports_cache: Dict[str, Dict[str, Any]] = {}
+        # In-flight export tasks deduplication: cache_key -> asyncio.Task
+        self._in_flight_exports: Dict[str, asyncio.Task] = {}
 
         self._load_meta()
+
+    def _detect_vaapi_device(self) -> Optional[str]:
+        """Detect available VA-API device path for hardware acceleration."""
+        hwaccel = os.getenv("MOMCOZY_HWACCEL", "auto").lower()
+        if hwaccel in ("none", "cpu", "disabled", "false", "0"):
+            return None
+
+        vaapi_dev = os.getenv("MOMCOZY_VAAPI_DEVICE")
+        if vaapi_dev:
+            if Path(vaapi_dev).exists() or hwaccel in ("vaapi", "force"):
+                return vaapi_dev
+
+        for dev in ("/dev/dri/renderD128", "/dev/dri/card0"):
+            if Path(dev).exists():
+                return dev
+
+        if hwaccel in ("vaapi", "force"):
+            return "/dev/dri/renderD128"
+
+        return None
 
     def set_speed_ratio(self, ratio: int | str) -> int:
         """Set the speed ratio (15, 30, 60, 90)."""
@@ -110,7 +130,7 @@ class TimelapseRecorder:
             raise ValueError(f"Invalid speed ratio: {ratio}. Options are 1:15, 1:30, 1:60, 1:90.")
         if self.speed_ratio != r:
             self.speed_ratio = r
-            self._cached_mp4_path = None
+            self._exports_cache.clear()
             self._save_meta()
         return self.speed_ratio
 
@@ -204,8 +224,11 @@ class TimelapseRecorder:
         self._slot_start_monotonic = time.monotonic()
         self._slot_start_wall = time.time()
         self._slots_meta = {}
-        self._cached_mp4_path = None
-        self._cached_mp4_mtime = 0.0
+        self._exports_cache.clear()
+        for task in list(self._in_flight_exports.values()):
+            if not task.done():
+                task.cancel()
+        self._in_flight_exports.clear()
 
         if self.storage_dir.exists():
             for p in self.storage_dir.glob("slot_*.hevc"):
@@ -445,7 +468,9 @@ class TimelapseRecorder:
     async def export_mp4(self, codec: str = "hevc", ratio: Optional[int] = None) -> Optional[Path]:
         """Concatenate ordered slots and remux to MP4 using stream-copy (zero transcoding).
 
-        If codec=='h264' is explicitly requested, transcodes using libx264 as fallback.
+        If codec=='h264' is explicitly requested, attempts Intel VA-API hardware acceleration
+        with fallback to libx264. Multiple concurrent requests for the same export share the
+        same in-flight task to prevent thundering-herd duplicate transcodes.
         """
         ordered = self.get_ordered_slots()
         if not ordered:
@@ -459,21 +484,38 @@ class TimelapseRecorder:
                 pass
 
         effective_ratio = ratio if (isinstance(ratio, int) and ratio in (15, 30, 60, 90)) else self.speed_ratio
+        norm_codec = "h264" if str(codec).lower().strip() == "h264" else "hevc"
+        cache_key = f"{norm_codec}_r{effective_ratio}"
 
         # Determine latest mtime among active slots
         latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
 
-        out_name = f"timelapse_cache_{codec}_r{effective_ratio}.mp4"
-        out_path = self.storage_dir / out_name
-
         # Check if cache is fresh
-        if (
-            self._cached_mp4_path == out_path
-            and out_path.exists()
-            and self._cached_mp4_mtime >= latest_mtime
-            and self._cached_mp4_codec == f"{codec}_r{effective_ratio}"
-        ):
-            return out_path
+        cache_entry = self._exports_cache.get(cache_key)
+        if cache_entry and cache_entry.get("path") and cache_entry["path"].exists():
+            out_path = cache_entry["path"]
+            created_at = float(cache_entry.get("created_at", 0.0))
+            if not self.is_recording:
+                # Slot recordings are static; cache is valid if built after or at latest slot mtime
+                if created_at >= latest_mtime:
+                    return out_path
+            else:
+                # While recording is active, slot files are written every 2-4 seconds.
+                # Use TTL (20s for HEVC, 60s for H.264) to prevent re-encoding on every keyframe
+                ttl = 20.0 if norm_codec == "hevc" else 60.0
+                if (time.time() - created_at) < ttl:
+                    return out_path
+
+        # If an export for this cache_key is already in flight, await it to avoid thundering-herd FFmpeg processes
+        if cache_key in self._in_flight_exports:
+            task = self._in_flight_exports[cache_key]
+            if not task.done():
+                logger.info("Timelapse export for %s is already in flight, awaiting existing task...", cache_key)
+                try:
+                    return await asyncio.shield(task)
+                except Exception as exc:
+                    logger.warning("Existing timelapse export failed: %s", exc)
+                    return None
 
         # Compute dynamic fps so video duration matches real_time / effective_ratio
         st = self.get_status()
@@ -482,15 +524,34 @@ class TimelapseRecorder:
         target_video_sec = max(0.1, real_time_sec / effective_ratio)
         export_fps = max(1.0, round(total_frames / target_video_sec, 2))
 
-        loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(None, self._generate_mp4, ordered, out_path, codec, export_fps)
-        if success and out_path.exists():
-            self._cached_mp4_path = out_path
-            self._cached_mp4_mtime = time.time()
-            self._cached_mp4_codec = f"{codec}_r{effective_ratio}"
-            return out_path
+        out_name = f"timelapse_cache_{norm_codec}_r{effective_ratio}.mp4"
+        out_path = self.storage_dir / out_name
 
-        return None
+        async def _do_export() -> Optional[Path]:
+            try:
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(
+                    None,
+                    self._generate_mp4,
+                    ordered,
+                    out_path,
+                    norm_codec,
+                    export_fps,
+                )
+                if success and out_path.exists():
+                    self._exports_cache[cache_key] = {
+                        "path": out_path,
+                        "created_at": time.time(),
+                        "mtime": latest_mtime,
+                    }
+                    return out_path
+                return None
+            finally:
+                self._in_flight_exports.pop(cache_key, None)
+
+        task = asyncio.create_task(_do_export())
+        self._in_flight_exports[cache_key] = task
+        return await task
 
     def _generate_mp4(
         self,
@@ -499,7 +560,12 @@ class TimelapseRecorder:
         codec: str,
         fps: float = 15.0,
     ) -> bool:
-        """Run FFmpeg to concatenate slots into an MP4 container."""
+        """Run FFmpeg to concatenate slots into an MP4 container.
+
+        Uses native stream-copy for HEVC (0% CPU, instant).
+        For H.264, uses Intel VA-API hardware acceleration if available,
+        falling back cleanly to multi-threaded libx264.
+        """
         if shutil.which("ffmpeg") is None:
             logger.error("FFmpeg not found. Cannot export timelapse MP4.")
             return False
@@ -515,48 +581,82 @@ class TimelapseRecorder:
                 f_list.flush()
 
                 tmp_out = output_file.with_suffix(".tmp.mp4")
-
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-r",
-                    str(fps),
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    list_path,
-                ]
+                env = os.environ.copy()
+                if "LIBVA_DRIVER_NAME" not in env:
+                    # Intel Haswell Gen 7.5 uses i965 driver
+                    env["LIBVA_DRIVER_NAME"] = "i965"
 
                 if codec.lower() == "h264":
-                    cmd.extend([
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-tune",
-                        "zerolatency",
-                        "-pix_fmt",
-                        "yuv420p",
-                    ])
+                    vaapi_dev = self._detect_vaapi_device()
+                    if vaapi_dev:
+                        logger.info("Attempting VA-API hardware accelerated H.264 export via %s...", vaapi_dev)
+                        va_cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-init_hw_device", f"vaapi=hw:{vaapi_dev}",
+                            "-filter_hw_device", "hw",
+                            "-r", str(fps),
+                            "-f", "concat",
+                            "-safe", "0",
+                            "-i", list_path,
+                            "-vf", "format=nv12,hwupload",
+                            "-c:v", "h264_vaapi",
+                            "-b:v", "3000k",
+                            "-maxrate", "5000k",
+                            "-bufsize", "6000k",
+                            "-movflags", "+faststart",
+                            str(tmp_out),
+                        ]
+                        proc = subprocess.run(va_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
+                        if proc.returncode == 0 and tmp_out.exists():
+                            tmp_out.replace(output_file)
+                            logger.info(
+                                "Timelapse MP4 created successfully via VA-API: %s (h264, %d bytes)",
+                                output_file.name,
+                                output_file.stat().st_size,
+                            )
+                            return True
+                        logger.warning(
+                            "VA-API H.264 export failed (code %s): %s. Falling back to libx264 software encoding.",
+                            proc.returncode,
+                            proc.stderr[-300:] if proc.stderr else "unknown error",
+                        )
+                        if tmp_out.exists():
+                            tmp_out.unlink()
+
+                    # Software libx264 fallback with multithreading
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-threads", "0",
+                        "-r", str(fps),
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", list_path,
+                        "-c:v", "libx264",
+                        "-preset", "ultrafast",
+                        "-tune", "zerolatency",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        str(tmp_out),
+                    ]
                 else:
                     # Stream copy HEVC: 0% CPU, ultrafast remux
-                    cmd.extend([
-                        "-c:v",
-                        "copy",
-                        "-tag:v",
-                        "hvc1",
-                    ])
-
-                cmd.extend([
-                    "-movflags",
-                    "+faststart",
-                    str(tmp_out),
-                ])
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-r", str(fps),
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", list_path,
+                        "-c:v", "copy",
+                        "-tag:v", "hvc1",
+                        "-movflags", "+faststart",
+                        str(tmp_out),
+                    ]
 
                 logger.info("Generating timelapse MP4 (%s) with cmd: %s", codec, " ".join(cmd[:12]))
-                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
                 if proc.returncode != 0:
                     logger.error("FFmpeg timelapse export failed: %s", proc.stderr[-300:] if proc.stderr else "unknown error")
                     if tmp_out.exists():
