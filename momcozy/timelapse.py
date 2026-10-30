@@ -95,6 +95,11 @@ class TimelapseRecorder:
         # Recorded motion/detection events list: [{"time": float, "type": str, "label": str}]
         self._events: List[Dict[str, Any]] = []
 
+        # Night vision sync automation state
+        self.sync_night_vision: bool = False
+        self.last_session_type: str = "manual"  # "manual" | "auto"
+        self.current_session_type: Optional[str] = None
+
         # Cache for exported MP4: cache_key -> {"path": Path, "created_at": float, "mtime": float}
         self._exports_cache: Dict[str, Dict[str, Any]] = {}
         # In-flight export tasks deduplication: cache_key -> asyncio.Task
@@ -160,6 +165,8 @@ class TimelapseRecorder:
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
                 self._events = data.get("events", [])
+                self.sync_night_vision = bool(data.get("sync_night_vision", False))
+                self.last_session_type = str(data.get("last_session_type", "manual"))
                 if "speed_ratio" in data:
                     try:
                         r = int(data["speed_ratio"])
@@ -207,12 +214,21 @@ class TimelapseRecorder:
                 "current_slot": self._current_slot,
                 "slots": self._slots_meta,
                 "events": self._events,
+                "sync_night_vision": self.sync_night_vision,
+                "last_session_type": self.last_session_type,
             }
             tmp_meta = self.storage_dir / "meta.json.tmp"
             tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             tmp_meta.replace(self.meta_file)
         except Exception as exc:
             logger.debug("Failed saving timelapse meta.json: %s", exc)
+
+    def set_sync_night_vision(self, enabled: bool) -> bool:
+        """Enable or disable automatic timelapse synchronization with Night Vision."""
+        self.sync_night_vision = bool(enabled)
+        self._save_meta()
+        logger.info("Timelapse Night Vision sync set to: %s", self.sync_night_vision)
+        return self.sync_night_vision
 
     def clear(self) -> None:
         """Clear all previous timelapse slot recordings and metadata."""
@@ -284,11 +300,12 @@ class TimelapseRecorder:
         logger.info("Recorded timelapse %s event: '%s' at timestamp %.1f", event_type, label, ts)
         return True
 
-    async def start(self, fresh: bool = True) -> None:
+    async def start(self, fresh: bool = True, session_type: str = "manual") -> None:
         """Start recording the circular timelapse.
 
         If fresh is True (default), starts a brand new recording session,
         wiping any old slots and cache so the timelapse starts fresh.
+        If fresh is False, appends into the existing circular buffer.
         """
         async with self._lock:
             if self._running:
@@ -297,6 +314,9 @@ class TimelapseRecorder:
             if fresh:
                 self.clear()
             self._running = True
+            self.current_session_type = session_type
+            self.last_session_type = session_type
+            self._save_meta()
 
             # If streamer is not running, start it
             if not self.streamer.is_running:
@@ -305,11 +325,13 @@ class TimelapseRecorder:
 
             self._record_task = asyncio.create_task(self._record_loop())
             logger.info(
-                "Timelapse recording started (storage=%s, slots=%d, slot_duration=%.0fs, rate=1:60, fresh=%s)",
+                "Timelapse recording started (storage=%s, slots=%d, slot_duration=%.0fs, rate=1:%d, fresh=%s, session_type=%s)",
                 self.storage_dir,
                 self.total_slots,
                 self.slot_duration_sec,
+                self.speed_ratio,
                 fresh,
+                session_type,
             )
 
     async def stop(self) -> None:
@@ -318,6 +340,9 @@ class TimelapseRecorder:
             if not self._running:
                 return
             self._running = False
+            if self.current_session_type:
+                self.last_session_type = self.current_session_type
+                self.current_session_type = None
             if self._record_task:
                 self._record_task.cancel()
                 try:
@@ -328,7 +353,7 @@ class TimelapseRecorder:
 
             self._close_active_slot()
             self._save_meta()
-            logger.info("Timelapse recording stopped.")
+            logger.info("Timelapse recording stopped (session=%s).", self.last_session_type)
 
     def _close_active_slot(self) -> None:
         """Close active file handle and update slot metadata."""
@@ -529,6 +554,9 @@ class TimelapseRecorder:
             "has_content": total_frames > 0,
             "events": events_list,
             "motion_events_count": len(events_list),
+            "sync_night_vision": self.sync_night_vision,
+            "last_session_type": self.last_session_type,
+            "current_session_type": self.current_session_type,
         }
 
     async def export_mp4(self, codec: str = "hevc", ratio: Optional[int] = None) -> Optional[Path]:

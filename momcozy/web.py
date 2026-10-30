@@ -26,7 +26,7 @@ aiohttp.web_fileresponse.NOSENDFILE = True
 
 from aiohttp import web
 
-from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection
+from .constants import DP, LULLABY_TRACKS, NightVisionMode, PtzDirection
 from .device import MomcozyMonitor
 from .hls import HlsTranscoder
 from .stream import VideoStreamer
@@ -675,6 +675,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div style="display:flex; gap:8px; margin-top:12px;">
           <button class="btn primary" id="timelapse-toggle-btn" style="flex:1;" onclick="toggleTimelapseRecord()">⏺ Start Recording</button>
           <button class="btn" id="timelapse-watch-btn" style="flex:1;" onclick="openTimelapsePlayback()" disabled>▶ Watch</button>
+        </div>
+        <div style="margin-top:8px;">
+          <button id="timelapse-sync-nv-btn" class="btn" style="width:100%; font-size:0.82rem; transition:all 0.2s;" onclick="toggleNightVisionSync()" title="Automatically start/resume timelapse on night vision (>=60s) and stop on daylight (>=120s)">🌙 Sync with Night Vision: OFF</button>
         </div>
       </div>
 
@@ -1595,9 +1598,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (tl.is_recording) {
         if (badge) {
           badge.className = 'badge active';
-          badge.style.background = '#FED7D7';
-          badge.style.color = '#C53030';
-          badge.innerText = 'Recording';
+          if (tl.last_session_type === 'auto') {
+            badge.style.background = '#EDE9FE';
+            badge.style.color = '#7C3AED';
+            badge.innerText = '🌙 Auto-Recording';
+          } else {
+            badge.style.background = '#FED7D7';
+            badge.style.color = '#C53030';
+            badge.innerText = 'Recording';
+          }
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏹ Stop Recording';
@@ -1607,15 +1616,51 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       } else {
         if (badge) {
           badge.className = 'badge';
-          badge.style.background = '#EDF2F7';
-          badge.style.color = 'var(--text-muted)';
-          badge.innerText = tl.has_content ? 'Ready' : 'Stopped';
+          if (tl.sync_state === 'activating') {
+            badge.style.background = '#EDE9FE';
+            badge.style.color = '#7C3AED';
+            badge.innerText = `🌙 Activating (${Math.round(tl.sync_timer_remaining || 0)}s)`;
+          } else {
+            badge.style.background = '#EDF2F7';
+            badge.style.color = 'var(--text-muted)';
+            badge.innerText = tl.has_content ? 'Ready' : 'Stopped';
+          }
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏺ Start Recording';
           toggleBtn.className = 'btn primary';
         }
         if (ctrlBtn) ctrlBtn.classList.remove('active');
+      }
+
+      const syncBtn = document.getElementById('timelapse-sync-nv-btn');
+      if (syncBtn) {
+        const syncOn = !!tl.sync_night_vision;
+        if (syncOn) {
+          let label = '🌙 Sync with Night Vision: ON';
+          if (tl.sync_state === 'activating') {
+            const sec = Math.round(tl.sync_timer_remaining || 0);
+            label = `🌙 Night Vision Active (Starts in ${sec}s)`;
+          } else if (tl.sync_state === 'stopping') {
+            const sec = Math.round(tl.sync_timer_remaining || 0);
+            label = `☀️ Day Mode Detected (Stops in ${sec}s)`;
+          } else if (tl.is_recording && tl.last_session_type === 'auto') {
+            label = '🌙 Sync: Auto-Recording (Active)';
+          } else if (tl.night_vision_active) {
+            label = '🌙 Sync with Night Vision: ON (Active)';
+          }
+          syncBtn.innerText = label;
+          syncBtn.style.background = 'rgba(147, 51, 234, 0.2)';
+          syncBtn.style.borderColor = 'rgba(147, 51, 234, 0.5)';
+          syncBtn.style.color = '#c084fc';
+          syncBtn.style.fontWeight = '600';
+        } else {
+          syncBtn.innerText = '🌙 Sync with Night Vision: OFF';
+          syncBtn.style.background = '';
+          syncBtn.style.borderColor = '';
+          syncBtn.style.color = '';
+          syncBtn.style.fontWeight = '';
+        }
       }
 
       if (watchBtn) {
@@ -1660,6 +1705,30 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         showToast('Network error toggling timelapse: ' + e.message, 'error', 4000);
       } finally {
         if (toggleBtn) toggleBtn.disabled = false;
+        updateStatus();
+      }
+    }
+
+    async function toggleNightVisionSync() {
+      const syncBtn = document.getElementById('timelapse-sync-nv-btn');
+      try {
+        if (syncBtn) syncBtn.disabled = true;
+        const res = await fetch('/api/timelapse/sync_night_vision', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const d = await res.json();
+        if (d.success) {
+          showToast(d.sync_night_vision ? '🌙 Night Vision timelapse sync ENABLED (Automation runs server-side).' : '🌙 Night Vision timelapse sync DISABLED.', 'info', 4000);
+          if (d.timelapse) updateTimelapseUI(d.timelapse);
+        } else {
+          showToast('Failed to toggle Night Vision sync: ' + (d.error || ''), 'error', 4000);
+        }
+      } catch (e) {
+        showToast('Network error setting Night Vision sync: ' + e.message, 'error', 4000);
+      } finally {
+        if (syncBtn) syncBtn.disabled = false;
         updateStatus();
       }
     }
@@ -1961,6 +2030,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
           <h1 style="display:flex; align-items:center; gap:8px;">
             <span>Timelapse</span>
             <span id="player-ratio-badge" style="background:rgba(66,153,225,0.15); color:#60a5fa; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(66,153,225,0.3);" title="Timelapse Recording Speed Ratio">1:60</span>
+            <span id="player-nv-sync-badge" style="display:none; background:rgba(147,51,234,0.18); color:#c084fc; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(147,51,234,0.4);" title="Timelapse is synchronized with Night Vision">🌙 NV Sync</span>
           </h1>
           <div style="font-size: 0.75rem; color: var(--text-muted);">Momcozy BM04</div>
         </div>
@@ -2208,6 +2278,10 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
           motionEvents = st.events;
           renderTimelineMarkers();
         }
+        if (st.sync_night_vision) {
+          const nvBadge = document.getElementById('player-nv-sync-badge');
+          if (nvBadge) nvBadge.style.display = 'inline-block';
+        }
       } catch (e) {}
       loadPlayback(activeCodec);
     }
@@ -2325,6 +2399,8 @@ class WebServer:
         )
         self._cached_status: Optional[Any] = None
         self._cached_status_time: float = 0.0
+        self._nv_active_start: Optional[float] = None
+        self._nv_inactive_start: Optional[float] = None
         self.app = web.Application()
         self._setup_routes()
 
@@ -2345,6 +2421,7 @@ class WebServer:
         self.app.router.add_post("/api/timelapse/start", self.handle_timelapse_start)
         self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
         self.app.router.add_post("/api/timelapse/ratio", self.handle_timelapse_ratio)
+        self.app.router.add_post("/api/timelapse/sync_night_vision", self.handle_timelapse_sync_night_vision)
         self.app.router.add_get("/api/timelapse/status", self.handle_timelapse_status)
         self.app.router.add_post("/api/timelapse/event", self.handle_timelapse_record_event)
         self.app.router.add_get("/api/timelapse/video.mp4", self.handle_timelapse_video)
@@ -2646,6 +2723,77 @@ class WebServer:
                 "Cache-Control": "public, max-age=3600",
             },
         )
+
+    def is_night_vision_active(self, status: Optional[Any]) -> bool:
+        """Check whether Night Vision is currently engaged on the monitor."""
+        if not status:
+            return False
+        nv = getattr(status, "night_vision", None)
+        if str(nv).lower() in ("2", "on", "true"):
+            return True
+        raw = getattr(status, "raw_dps", {}) or {}
+        if str(raw.get("108", "")).lower() in ("2", "on", "true"):
+            return True
+        if str(raw.get(str(int(DP.BASIC_NIGHTVISION)), "")).lower() in ("2", "on", "true"):
+            return True
+        if raw.get("ir_cut") is True or raw.get("ir_status") in ("1", "2", True):
+            return True
+        return False
+
+    def _get_timelapse_status(self) -> Dict[str, Any]:
+        """Return enriched timelapse status including night vision sync state and countdowns."""
+        if not self.timelapse:
+            return {
+                "is_recording": False,
+                "has_content": False,
+                "total_slots": 72,
+                "filled_slots": 0,
+                "current_slot": 0,
+                "total_frames": 0,
+                "buffered_seconds": 0.0,
+                "buffered_formatted": "0m 00s",
+                "video_duration_seconds": 0.0,
+                "video_duration_formatted": "0:00",
+                "speed_ratio": "1:60",
+                "speed_ratio_val": 60,
+                "speed_ratio_options": ["1:15", "1:30", "1:60", "1:90"],
+                "disk_bytes": 0,
+                "disk_formatted": "0.0 MB",
+                "events": [],
+                "motion_events_count": 0,
+                "sync_night_vision": False,
+                "last_session_type": "manual",
+                "current_session_type": None,
+                "night_vision_active": False,
+                "sync_state": "disabled",
+                "sync_timer_remaining": None,
+            }
+
+        status_dict = self.timelapse.get_status()
+        now_mono = time.monotonic()
+        is_nv = self.is_night_vision_active(self._cached_status) if self._cached_status else False
+
+        sync_state = "disabled"
+        timer_remaining: Optional[float] = None
+        if self.timelapse.sync_night_vision:
+            if self.timelapse.is_recording:
+                if self._nv_inactive_start is not None:
+                    sync_state = "stopping"
+                    timer_remaining = max(0.0, 120.0 - (now_mono - self._nv_inactive_start))
+                else:
+                    sync_state = "recording"
+            else:
+                if self._nv_active_start is not None:
+                    sync_state = "activating"
+                    timer_remaining = max(0.0, 60.0 - (now_mono - self._nv_active_start))
+                else:
+                    sync_state = "idle"
+
+        status_dict["night_vision_active"] = is_nv
+        status_dict["sync_state"] = sync_state
+        status_dict["sync_timer_remaining"] = round(timer_remaining, 1) if timer_remaining is not None else None
+        return status_dict
+
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
         raw_sm = getattr(self.streamer, "stream_mode", "none") if self.streamer else "none"
@@ -2731,25 +2879,7 @@ class WebServer:
             "server_lan_ip": self.get_local_lan_ip(),
             "server_port": self.port,
             "server_http_port": self.http_port,
-            "timelapse": (
-                self.timelapse.get_status()
-                if self.timelapse
-                else {
-                    "is_recording": False,
-                    "has_content": False,
-                    "total_slots": 72,
-                    "filled_slots": 0,
-                    "current_slot": 0,
-                    "total_frames": 0,
-                    "buffered_seconds": 0,
-                    "buffered_formatted": "0m 00s",
-                    "video_duration_seconds": 0,
-                    "video_duration_formatted": "0:00",
-                    "speed_ratio": "1:60",
-                    "disk_bytes": 0,
-                    "disk_formatted": "0.0 MB",
-                }
-            ),
+            "timelapse": self._get_timelapse_status(),
         }
         try:
             now = time.monotonic()
@@ -2890,7 +3020,22 @@ class WebServer:
             elif action == "lullaby_volume":
                 vol = data.get("volume", 50)
                 await asyncio.to_thread(self.monitor.set_lullaby_volume, vol)
+            elif action == "timelapse_sync_night_vision":
+                if not self.timelapse:
+                    return web.json_response({"status": "error", "error": "Timelapse recorder not available"}, status=503)
+                enabled = data.get("enabled")
+                if enabled is None:
+                    enabled = not self.timelapse.sync_night_vision
+                self.timelapse.set_sync_night_vision(bool(enabled))
+                self._nv_active_start = None
+                self._nv_inactive_start = None
+                return web.json_response({
+                    "status": "ok",
+                    "sync_night_vision": self.timelapse.sync_night_vision,
+                    "timelapse": self._get_timelapse_status(),
+                })
 
+            self._cached_status = None
             return web.json_response({"status": "ok"})
         except Exception as e:
             action_name = data.get("action", "unknown") if isinstance(data, dict) else "unknown"
@@ -2898,7 +3043,7 @@ class WebServer:
             return web.json_response({"status": "error", "error": str(e)}, status=502)
 
     async def handle_timelapse_start(self, request: web.Request) -> web.Response:
-        """Start recording the 12-hour circular timelapse fresh."""
+        """Start recording the 12-hour circular timelapse fresh (manual session)."""
         if not self.timelapse:
             return web.json_response(
                 {"success": False, "error": "Timelapse recorder not configured (missing video streamer)."},
@@ -2913,8 +3058,8 @@ class WebServer:
                         self.timelapse.set_speed_ratio(ratio)
                 except Exception:
                     pass
-            await self.timelapse.start(fresh=True)
-            return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
+            await self.timelapse.start(fresh=True, session_type="manual")
+            return web.json_response({"success": True, "timelapse": self._get_timelapse_status()})
         except Exception as exc:
             logger.error("Error starting timelapse: %s", exc)
             return web.json_response({"success": False, "error": str(exc)}, status=500)
@@ -2928,7 +3073,7 @@ class WebServer:
             )
         try:
             await self.timelapse.stop()
-            return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
+            return web.json_response({"success": True, "timelapse": self._get_timelapse_status()})
         except Exception as exc:
             logger.error("Error stopping timelapse: %s", exc)
             return web.json_response({"success": False, "error": str(exc)}, status=500)
@@ -2943,18 +3088,40 @@ class WebServer:
             if ratio is None:
                 return web.json_response({"success": False, "error": "Missing 'ratio' parameter."}, status=400)
             self.timelapse.set_speed_ratio(ratio)
-            return web.json_response({"success": True, "timelapse": self.timelapse.get_status()})
+            return web.json_response({"success": True, "timelapse": self._get_timelapse_status()})
         except ValueError as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=400)
         except Exception as exc:
             logger.error("Error setting timelapse speed ratio: %s", exc)
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
+    async def handle_timelapse_sync_night_vision(self, request: web.Request) -> web.Response:
+        """Toggle or configure automatic timelapse synchronization with Night Vision."""
+        if not self.timelapse:
+            return web.json_response({"success": False, "error": "Timelapse recorder not configured."}, status=503)
+        try:
+            data = await request.json() if request.can_read_body else {}
+        except Exception:
+            data = {}
+        if "enabled" in data and data["enabled"] is not None:
+            enabled = bool(data["enabled"])
+        else:
+            enabled = not self.timelapse.sync_night_vision
+
+        self.timelapse.set_sync_night_vision(enabled)
+        self._nv_active_start = None
+        self._nv_inactive_start = None
+
+        logger.info("Timelapse Night Vision synchronization set to %s", self.timelapse.sync_night_vision)
+        return web.json_response({
+            "success": True,
+            "sync_night_vision": self.timelapse.sync_night_vision,
+            "timelapse": self._get_timelapse_status(),
+        })
+
     async def handle_timelapse_status(self, request: web.Request) -> web.Response:
         """Get timelapse recorder status."""
-        if not self.timelapse:
-            return web.json_response({"is_recording": False, "has_content": False})
-        return web.json_response(self.timelapse.get_status())
+        return web.json_response(self._get_timelapse_status())
 
     async def handle_timelapse_record_event(self, request: web.Request) -> web.Response:
         """Manually or externally record a motion/detection event."""
@@ -3019,36 +3186,99 @@ class WebServer:
         """Serve the standalone timelapse player page."""
         return web.Response(text=HTML_TIMELAPSE_PLAYER, content_type="text/html")
 
-    async def _motion_monitor_loop(self) -> None:
-        """Lightweight background loop capturing camera motion events while timelapse is recording."""
+    async def _background_monitor_loop(self) -> None:
+        """Server-side background loop managing:
+        1. Night Vision timelapse automation (start on >=60s active, stop on >=120s inactive).
+        2. Hardware motion event logging while recording.
+        Runs entirely server-side without requiring any connected clients.
+        """
         last_ev_time = 0.0
         while True:
             try:
-                await asyncio.sleep(5.0)
-                if not self.timelapse or not self.timelapse.is_recording:
+                await asyncio.sleep(4.0)
+                if not self.monitor or not self.timelapse:
                     continue
-                if not self.monitor:
+
+                # If timelapse is neither recording nor configured to sync with Night Vision,
+                # reset debounce timers and idle to minimize camera queries.
+                if not self.timelapse.is_recording and not self.timelapse.sync_night_vision:
+                    self._nv_active_start = None
+                    self._nv_inactive_start = None
                     continue
-                status = await asyncio.to_thread(self.monitor.get_status)
-                ev_cmd = getattr(status, "latest_event_cmd", "")
-                ev_time = getattr(status, "latest_event_time", None)
-                if ev_cmd in ("ipc_motion", "ipc_human", "ipc_crying", "ipc_alarm") and ev_time:
-                    if float(ev_time) != last_ev_time:
-                        last_ev_time = float(ev_time)
+
+                now_mono = time.monotonic()
+                # Query device telemetry
+                try:
+                    status = await asyncio.to_thread(self.monitor.get_status)
+                    self._cached_status = status
+                    self._cached_status_time = now_mono
+                except Exception as poll_err:
+                    logger.debug("Background monitor failed to poll camera status: %s", poll_err)
+                    continue
+
+                # 1. Night Vision Automation
+                if self.timelapse.sync_night_vision:
+                    is_nv = self.is_night_vision_active(status)
+                    if is_nv:
+                        # Night vision is active
+                        self._nv_inactive_start = None
+                        if self._nv_active_start is None:
+                            self._nv_active_start = now_mono
+                            logger.info("🌙 Night Vision active detected on camera. Starting 60s activation timer...")
+                        elif not self.timelapse.is_recording:
+                            active_sec = now_mono - self._nv_active_start
+                            if active_sec >= 60.0:
+                                # 1 minute continuous night vision reached
+                                # "If the previous timelapse for automatic, the next automatic one appends to that, not restart."
+                                fresh = (self.timelapse.last_session_type != "auto")
+                                logger.info(
+                                    "🌙 Night Vision active for >= 60s (%.1fs). Auto-starting timelapse (fresh=%s, prev_session=%s)...",
+                                    active_sec,
+                                    fresh,
+                                    self.timelapse.last_session_type,
+                                )
+                                await self.timelapse.start(fresh=fresh, session_type="auto")
+                    else:
+                        # Night vision is inactive
+                        self._nv_active_start = None
+                        if self._nv_inactive_start is None:
+                            self._nv_inactive_start = now_mono
+                            logger.info("☀️ Night Vision inactive detected on camera. Starting 120s deactivation timer...")
+                        elif self.timelapse.is_recording:
+                            inactive_sec = now_mono - self._nv_inactive_start
+                            if inactive_sec >= 120.0:
+                                # 2 minutes continuous daylight/inactive reached
+                                logger.info(
+                                    "☀️ Night Vision inactive for >= 120s (%.1fs). Auto-stopping timelapse...",
+                                    inactive_sec,
+                                )
+                                await self.timelapse.stop()
+
+                # 2. Motion Events Tracking (while recording)
+                if self.timelapse.is_recording:
+                    ev_cmd = getattr(status, "latest_event_cmd", "")
+                    ev_time = getattr(status, "latest_event_time", None)
+                    if ev_cmd in ("ipc_motion", "ipc_human", "ipc_crying", "ipc_alarm") and ev_time:
+                        if float(ev_time) != last_ev_time:
+                            last_ev_time = float(ev_time)
+                            self.timelapse.record_event(
+                                event_type="motion",
+                                label=getattr(status, "latest_event_name", "Motion Alert") or "Motion Alert",
+                                timestamp=float(ev_time),
+                            )
+                    elif getattr(status, "motion_detected", False):
                         self.timelapse.record_event(
                             event_type="motion",
-                            label=getattr(status, "latest_event_name", "Motion Alert") or "Motion Alert",
-                            timestamp=float(ev_time),
+                            label="Motion Detected",
                         )
-                elif getattr(status, "motion_detected", False):
-                    self.timelapse.record_event(
-                        event_type="motion",
-                        label="Motion Detected",
-                    )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.debug("Error in timelapse motion monitor loop: %s", exc)
+                logger.debug("Error in server background monitor loop: %s", exc)
+
+    async def _motion_monitor_loop(self) -> None:
+        """Alias for backward compatibility."""
+        await self._background_monitor_loop()
 
     async def run(self) -> None:
         """Run the server until interrupted."""
@@ -3073,14 +3303,14 @@ class WebServer:
             except Exception as e:
                 logger.warning("Could not bind HTTP media port %d: %s. Chromecast may fail on self-signed HTTPS.", self.http_port, e)
 
-        motion_task = asyncio.create_task(self._motion_monitor_loop())
+        bg_task = asyncio.create_task(self._background_monitor_loop())
         try:
             while True:
                 await asyncio.sleep(3600)
         finally:
-            motion_task.cancel()
+            bg_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await motion_task
+                await bg_task
             if self.timelapse and self.timelapse.is_recording:
                 await self.timelapse.stop()
             if self.hls:

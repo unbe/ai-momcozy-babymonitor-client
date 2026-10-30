@@ -90,6 +90,18 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     $$\text{Video Second} = \frac{\text{Elapsed Real Time}}{\text{Speed Ratio}}$$
     $$\text{Scrubber Percent} = \frac{\text{Elapsed Real Time}}{\text{Total Buffered Time}} \times 100\%$$
   * **Interactive Scrubber Markers & Navigation:** In `/timelapse`, motion events appear as glowing amber notches on the timeline scrubber. Hovering over a marker shows the event label, wall-clock time, and video timestamp. Clicking any marker seeks directly to that moment. Next (`N`) and Previous (`P`) motion navigation buttons allow jumping between highlights. The main dashboard Timelapse card displays an active count badge (`🏃 N events`).
+* **Server-Side Night Vision Timelapse Automation (0% Client Overhead):**
+  * **Completely Headless & Server-Side:** The automation runs entirely inside `WebServer._background_monitor_loop()` on the host/container. It operates autonomously without requiring any browser window, tab, or client socket to remain open.
+  * **Persistent Configuration:** Toggling the sync feature via `[🌙 Sync with Night Vision: ON]` persists `"sync_night_vision": true` and `"last_session_type"` in `timelapse/meta.json`. Server restarts immediately restore the monitoring loop.
+  * **Debounce Timing Logic:**
+    * **Activation Threshold (1 Minute = 60s):** When camera reports Night Vision active (`status.night_vision == "2"`, `DP.BASIC_NIGHTVISION == "2"`, or IR active), a monotonic timer starts. If Night Vision remains continuously active for $\ge 60.0$ seconds and timelapse is not currently recording, it automatically starts/resumes. Transient darkness or light fluctuations under 60 seconds are safely ignored.
+    * **Deactivation Threshold (2 Minutes = 120s):** When camera reports daylight / Night Vision inactive, an inactive monotonic timer starts. If daylight persists continuously for $\ge 120.0$ seconds and timelapse is currently recording, it automatically stops. Temporary lighting (e.g. room lights briefly turned on or car headlights) under 120 seconds does not interrupt recording.
+  * **Session Continuity (Append vs. Restart):**
+    * When auto-start triggers:
+      * If `last_session_type == "auto"` (the previous timelapse was automatic), it calls `timelapse.start(fresh=False, session_type="auto")`. This appends the new night session directly into the circular buffer without clearing previous slots.
+      * If `last_session_type == "manual"` (previous recording was manually started), it starts fresh (`fresh=True`), wiping manual records to begin the auto session.
+    * When auto-stop triggers, it marks `last_session_type = "auto"`.
+  * **Zero Recording Overhead Preserved:** Video recording continues to write pure Annex B HEVC keyframes via stream-copy directly from `VideoStreamer.subscribe_hevc()` with 0% CPU consumption.
 * **Dev Server Port & SSL:**
   * Port 8421 runs HTTPS (`momcozy.py serve --ssl`). Healthchecks and WebCodecs APIs require HTTPS on this port. Plain HTTP for LAN/Chromecast is hosted on port 8420.
 

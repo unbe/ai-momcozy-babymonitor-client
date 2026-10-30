@@ -1,6 +1,11 @@
 """Unit tests for Momcozy BM04 Python Client."""
 
+import json
+import tempfile
+import time
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from momcozy.constants import (
     DP,
@@ -12,6 +17,8 @@ from momcozy.constants import (
 from momcozy.cloud import MomcozyCloudApi, hash_password
 from momcozy.device import BM04Status, MomcozyMonitor, celsius_to_fahrenheit
 from momcozy.cli import build_parser
+from momcozy.timelapse import TimelapseRecorder
+from momcozy.web import WebServer
 
 
 class TestMomcozyConstants(unittest.TestCase):
@@ -2069,6 +2076,230 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(recorder2._events), 2)
             st2 = recorder2.get_status()
             self.assertEqual(st2["motion_events_count"], 2)
+
+
+class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
+    """Test server-side timelapse synchronization with Night Vision."""
+
+    async def test_recorder_sync_nv_state_and_meta(self):
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = False
+
+            rec = TimelapseRecorder(streamer=mock_streamer, storage_dir=storage_dir)
+            self.assertFalse(rec.sync_night_vision)
+            self.assertEqual(rec.last_session_type, "manual")
+
+            # Enable Night Vision sync
+            rec.set_sync_night_vision(True)
+            self.assertTrue(rec.sync_night_vision)
+
+            # Check meta.json
+            self.assertTrue(rec.meta_file.exists())
+            meta_data = json.loads(rec.meta_file.read_text())
+            self.assertTrue(meta_data.get("sync_night_vision"))
+            self.assertEqual(meta_data.get("last_session_type"), "manual")
+
+            # Reload into new instance
+            rec2 = TimelapseRecorder(streamer=mock_streamer, storage_dir=storage_dir)
+            self.assertTrue(rec2.sync_night_vision)
+            self.assertEqual(rec2.last_session_type, "manual")
+
+    async def test_session_type_append_vs_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            async def dummy_hevc():
+                if False:
+                    yield b"", True
+
+            mock_streamer.subscribe_hevc = dummy_hevc
+
+            rec = TimelapseRecorder(streamer=mock_streamer, storage_dir=storage_dir)
+
+            # 1. Manual session starts fresh
+            await rec.start(fresh=True, session_type="manual")
+            self.assertEqual(rec.current_session_type, "manual")
+            self.assertEqual(rec.last_session_type, "manual")
+
+            # Simulate writing slot 0
+            s0 = rec.slot_path(0)
+            s0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 20)
+            rec._slots_meta["0"] = {"mtime": time.time(), "frames": 10, "bytes": 26}
+            rec._save_meta()
+
+            await rec.stop()
+            self.assertIsNone(rec.current_session_type)
+            self.assertEqual(rec.last_session_type, "manual")
+
+            # 2. First automatic session after manual:
+            # Rule: "If the previous timelapse for automatic, the next automatic one appends to that, not restart."
+            # Since previous was manual, it starts fresh!
+            fresh_needed = (rec.last_session_type != "auto")
+            self.assertTrue(fresh_needed)
+            await rec.start(fresh=fresh_needed, session_type="auto")
+            self.assertEqual(rec.current_session_type, "auto")
+            self.assertEqual(rec.last_session_type, "auto")
+
+            # Simulate writing slot 0 during this auto session
+            s0 = rec.slot_path(0)
+            s0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 30)
+            rec._slots_meta["0"] = {"mtime": time.time(), "frames": 15, "bytes": 36}
+            rec._save_meta()
+
+            await rec.stop()
+            self.assertEqual(rec.last_session_type, "auto")
+
+            # 3. Next automatic session:
+            # Since previous was auto, it MUST APPEND (fresh=False), not restart!
+            fresh_needed = (rec.last_session_type != "auto")
+            self.assertFalse(fresh_needed)
+            await rec.start(fresh=fresh_needed, session_type="auto")
+            self.assertEqual(rec.last_session_type, "auto")
+
+            # Check that slot 0 from prior auto session was preserved, not wiped!
+            self.assertTrue(s0.exists())
+            self.assertEqual(s0.stat().st_size, 36)
+            await rec.stop()
+
+    def test_webserver_is_night_vision_active(self):
+        server = WebServer(monitor=MagicMock(), streamer=None)
+
+        self.assertFalse(server.is_night_vision_active(None))
+        self.assertFalse(server.is_night_vision_active(BM04Status(night_vision="0")))
+        self.assertFalse(server.is_night_vision_active(BM04Status(night_vision="1")))
+        self.assertTrue(server.is_night_vision_active(BM04Status(night_vision="2")))
+        self.assertTrue(server.is_night_vision_active(BM04Status(night_vision="ON")))
+        self.assertTrue(server.is_night_vision_active(BM04Status(raw_dps={"108": "2"})))
+        self.assertTrue(server.is_night_vision_active(BM04Status(raw_dps={"ir_cut": True})))
+        self.assertTrue(server.is_night_vision_active(BM04Status(raw_dps={"ir_status": "1"})))
+
+    async def test_api_timelapse_sync_night_vision(self):
+        from aiohttp.test_utils import make_mocked_request
+        with tempfile.TemporaryDirectory() as td:
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = False
+            mock_monitor = MagicMock()
+            mock_monitor.get_status.return_value = BM04Status(night_vision="0")
+
+            server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td)
+
+            # 1. Enable via POST /api/timelapse/sync_night_vision
+            req = make_mocked_request("POST", "/api/timelapse/sync_night_vision")
+            req._read_bytes = b'{"enabled": true}'
+            resp = await server.handle_timelapse_sync_night_vision(req)
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.text)
+            self.assertTrue(data["success"])
+            self.assertTrue(data["sync_night_vision"])
+            self.assertTrue(server.timelapse.sync_night_vision)
+
+            # 2. Check /api/timelapse/status
+            req_st = make_mocked_request("GET", "/api/timelapse/status")
+            resp_st = await server.handle_timelapse_status(req_st)
+            st_data = json.loads(resp_st.text)
+            self.assertTrue(st_data["sync_night_vision"])
+            self.assertEqual(st_data["sync_state"], "idle")
+
+            # 3. Toggle via POST /api/timelapse/sync_night_vision without body
+            req_toggle = make_mocked_request("POST", "/api/timelapse/sync_night_vision")
+            req_toggle._read_bytes = b""
+            resp_toggle = await server.handle_timelapse_sync_night_vision(req_toggle)
+            data_toggle = json.loads(resp_toggle.text)
+            self.assertFalse(data_toggle["sync_night_vision"])
+            self.assertFalse(server.timelapse.sync_night_vision)
+
+            # 4. Check action timelapse_sync_night_vision via /api/control
+            req_ctrl = make_mocked_request("POST", "/api/control")
+            req_ctrl._read_bytes = b'{"action": "timelapse_sync_night_vision", "enabled": true}'
+            resp_ctrl = await server.handle_api_control(req_ctrl)
+            self.assertEqual(resp_ctrl.status, 200)
+            self.assertTrue(server.timelapse.sync_night_vision)
+
+            # 5. Check index page contains sync button
+            req_idx = make_mocked_request("GET", "/")
+            resp_idx = await server.handle_index(req_idx)
+            self.assertIn("timelapse-sync-nv-btn", resp_idx.text)
+            self.assertIn("toggleNightVisionSync", resp_idx.text)
+
+    async def test_sync_night_vision_debounce_simulation(self):
+        """Verify the 60s activation threshold and 120s deactivation threshold."""
+        with tempfile.TemporaryDirectory() as td:
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+            rec = TimelapseRecorder(streamer=mock_streamer, storage_dir=td)
+            rec.sync_night_vision = True
+            rec.last_session_type = "auto"
+
+            # Simulation state
+            nv_active_start = None
+            nv_inactive_start = None
+            started_calls = []
+            stopped_calls = []
+
+            async def fake_start(fresh, session_type):
+                started_calls.append((fresh, session_type))
+                rec._running = True
+                mock_task = MagicMock()
+                mock_task.done.return_value = False
+                rec._record_task = mock_task
+
+            async def fake_stop():
+                stopped_calls.append(True)
+                rec._running = False
+                rec._record_task = None
+
+            rec.start = fake_start
+            rec.stop = fake_stop
+
+            # Step 1: Night Vision becomes active at t=100.0
+            t = 100.0
+            is_nv = True
+            if is_nv:
+                nv_inactive_start = None
+                if nv_active_start is None:
+                    nv_active_start = t
+
+            # Step 2: At t=130.0 (30s later) -> Under 60s, should NOT start
+            t = 130.0
+            if (t - nv_active_start) < 60.0:
+                pass  # not triggered
+            self.assertEqual(len(started_calls), 0)
+
+            # Step 3: At t=161.0 (61s later) -> Exceeds 60s, triggers auto-start!
+            t = 161.0
+            if is_nv and not rec.is_recording and (t - nv_active_start) >= 60.0:
+                fresh = (rec.last_session_type != "auto")
+                await rec.start(fresh=fresh, session_type="auto")
+            self.assertEqual(len(started_calls), 1)
+            # Since last_session_type was "auto", fresh should be False (appended)!
+            self.assertEqual(started_calls[0], (False, "auto"))
+
+            # Step 4: Daylight/inactive occurs at t=200.0
+            t = 200.0
+            is_nv = False
+            nv_active_start = None
+            if nv_inactive_start is None:
+                nv_inactive_start = t
+
+            # Step 5: At t=280.0 (80s of daylight) -> Under 120s, should NOT stop
+            t = 280.0
+            if rec.is_recording and (t - nv_inactive_start) < 120.0:
+                pass  # not triggered
+            self.assertEqual(len(stopped_calls), 0)
+
+            # Step 6: At t=325.0 (125s of daylight) -> Exceeds 120s, triggers auto-stop!
+            t = 325.0
+            if not is_nv and rec.is_recording and (t - nv_inactive_start) >= 120.0:
+                await rec.stop()
+                rec.last_session_type = "auto"
+
+            self.assertEqual(len(stopped_calls), 1)
+            self.assertEqual(rec.last_session_type, "auto")
 
 
 if __name__ == "__main__":
