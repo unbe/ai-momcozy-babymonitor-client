@@ -36,6 +36,7 @@ RUN mkdir -p /config
 
 # Environment defaults
 ENV PYTHONUNBUFFERED=1 \
+    AIOHTTP_NOSENDFILE=1 \
     MOMCOZY_CONFIG=/config/.momcozy.json
 
 # Expose web dashboard (8421) and Chromecast LAN streaming port (8420)

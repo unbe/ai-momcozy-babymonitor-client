@@ -1770,8 +1770,16 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 req = make_mocked_request("GET", "/api/timelapse/video.mp4")
                 resp = await server.handle_timelapse_video(req)
                 self.assertEqual(resp.status, 200)
+                from momcozy.web import SafeFileResponse
+                self.assertIsInstance(resp, SafeFileResponse)
                 self.assertEqual(resp.headers.get("Accept-Ranges"), "bytes")
                 self.assertIn("inline", resp.headers.get("Content-Disposition", ""))
+
+                # Verify SafeFileResponse streams chunks and handles premature client disconnect cleanly
+                req_disconnect = make_mocked_request("GET", "/api/timelapse/video.mp4")
+                req_disconnect.writer.write = AsyncMock(side_effect=ConnectionResetError(104, "Connection reset by peer"))
+                with self.assertRaises(ConnectionError):
+                    await resp.prepare(req_disconnect)
 
                 # With download query param
                 req_dl = make_mocked_request("GET", "/api/timelapse/video.mp4?download=1")

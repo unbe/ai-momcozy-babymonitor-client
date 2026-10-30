@@ -5,6 +5,11 @@ Supports video streaming, sensor readings (temperature, crying, noise, motion),
 and settings control (night vision, PTZ, alarms, lullabies).
 """
 
+import os
+
+# Disable aiohttp sendfile system call to prevent Python asyncio sslproto _set_app_protocol crash on client disconnect over HTTPS
+os.environ.setdefault("AIOHTTP_NOSENDFILE", "1")
+
 from .cloud import MomcozyCloudApi, TuyaCredentials, hash_password
 from .constants import (
     DP,

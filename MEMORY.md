@@ -73,6 +73,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * The dashboard "▶ Watch" button opens `/timelapse` in a dedicated new browser window.
   * Automatically detects native HEVC support using `canPlayType` with `hvc1.1.6.L150.B0`. If supported, plays native HEVC with 0% CPU; silently falls back to `codec=h264` on decoding errors. No codec dropdowns are exposed to users.
   * Stream-copy packaging via FFmpeg (`-c:v copy -tag:v hvc1 -movflags +faststart`) is instantaneous (< 1s) and cached for instant scrub-seeking with HTTP Range support (`Accept-Ranges: bytes`).
+* **`SafeFileResponse` & `AIOHTTP_NOSENDFILE` (Asyncio SSL Protocol Teardown Fix):**
+  * When streaming video files via `web.FileResponse` over HTTPS, client scrub/seek actions or window closures trigger `ConnectionResetError: [Errno 104] Connection reset by peer`.
+  * Python standard library `asyncio` (`base_events.py` `_sendfile_fallback`) wraps SSL transports with `_SendfileProtocol`. Upon connection reset, `_SendfileProtocol.restore()` attempts `self._transport.set_protocol(self._proto)`. On Python 3.12/3.13, `_SSLProtocolTransport`'s internal `_ssl_protocol` is already `None`, crashing with `AttributeError: 'NoneType' object has no attribute '_set_app_protocol'`. This masked `ConnectionError` and logged unhandled server exceptions.
+  * Resolved by forcing `AIOHTTP_NOSENDFILE=1` and utilizing `SafeFileResponse` in `handle_timelapse_video`. This streams file chunks directly via aiohttp's writer without invoking `loop.sendfile()`, allowing `aiohttp.web_protocol` to cleanly catch `ConnectionError` as an expected premature client disconnect.
 * **Dev Server Port & SSL:**
   * Port 8421 runs HTTPS (`momcozy.py serve --ssl`). Healthchecks and WebCodecs APIs require HTTPS on this port. Plain HTTP for LAN/Chromecast is hosted on port 8420.
 

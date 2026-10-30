@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
+# Disable aiohttp sendfile to prevent Python asyncio sslproto _set_app_protocol crash on client disconnect over HTTPS
+os.environ.setdefault("AIOHTTP_NOSENDFILE", "1")
+
 import argparse
 import asyncio
 import getpass

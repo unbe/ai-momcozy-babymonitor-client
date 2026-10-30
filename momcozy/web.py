@@ -9,12 +9,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 import socket
 import ssl
 import subprocess
 import time
-from typing import Optional
+from typing import Any, Optional
+
+# Disable aiohttp sendfile to prevent Python asyncio sslproto _set_app_protocol crash on client disconnect over HTTPS
+os.environ.setdefault("AIOHTTP_NOSENDFILE", "1")
+
+import aiohttp.web_fileresponse
+aiohttp.web_fileresponse.NOSENDFILE = True
 
 from aiohttp import web
 
@@ -25,6 +32,17 @@ from .stream import VideoStreamer
 from .timelapse import TimelapseRecorder
 
 logger = logging.getLogger(__name__)
+
+
+class SafeFileResponse(web.FileResponse):
+    """FileResponse that streams chunks to prevent Python asyncio loop.sendfile SSL crashes."""
+
+    async def _sendfile(
+        self, request: Any, fobj: Any, offset: int, count: int
+    ) -> Any:
+        writer = await web.StreamResponse.prepare(self, request)
+        assert writer is not None
+        return await self._sendfile_fallback(writer, fobj, offset, count)
 
 HTML_DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
@@ -2684,7 +2702,7 @@ class WebServer:
         is_download = request.query.get("download") == "1"
         disposition = f'attachment; filename="momcozy_timelapse_{codec}.mp4"' if is_download else "inline"
 
-        return web.FileResponse(
+        return SafeFileResponse(
             mp4_path,
             headers={
                 "Accept-Ranges": "bytes",
