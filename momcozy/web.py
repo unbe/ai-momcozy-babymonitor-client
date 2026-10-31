@@ -652,16 +652,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <!-- Timelapse Card -->
       <div class="card" id="timelapse-card">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <h2 style="margin:0; display:flex; align-items:center; gap:8px;">
-            <span>⏱️ Timelapse</span>
-            <select id="timelapse-ratio-select" onchange="changeTimelapseRatio(this.value)" style="background:rgba(66,153,225,0.12); color:var(--accent-blue); font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:6px; border:1px solid rgba(66,153,225,0.3); outline:none; cursor:pointer;" title="Select Timelapse Speed Ratio">
-              <option value="15">1:15</option>
-              <option value="30">1:30</option>
-              <option value="60" selected>1:60</option>
-              <option value="90">1:90</option>
-            </select>
-          </h2>
-          <span class="badge" id="timelapse-badge" style="white-space:nowrap; flex-shrink:0;">Stopped</span>
+          <h2 style="margin:0; white-space:nowrap;">⏱️ Timelapse</h2>
+          <span class="badge" id="timelapse-badge">Stopped</span>
+        </div>
+        <div class="control-row">
+          <span>Speed Ratio</span>
+          <select id="timelapse-ratio-select" onchange="changeTimelapseRatio(this.value)" style="font-size:0.82rem; font-weight:600; cursor:pointer;" title="Select Timelapse Speed Ratio">
+            <option value="15">1:15</option>
+            <option value="30">1:30</option>
+            <option value="60" selected>1:60</option>
+            <option value="90">1:90</option>
+          </select>
         </div>
         <div class="control-row">
           <span>Time Recorded</span>
