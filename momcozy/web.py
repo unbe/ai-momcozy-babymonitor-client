@@ -1616,7 +1616,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           toggleBtn.innerText = '⏹ Stop Recording';
           toggleBtn.className = 'btn';
         }
-        if (ctrlBtn) ctrlBtn.classList.add('active');
         if (eraseBtn) eraseBtn.disabled = true;
       } else {
         if (badge) {
@@ -1639,7 +1638,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           }
           toggleBtn.className = 'btn primary';
         }
-        if (ctrlBtn) ctrlBtn.classList.remove('active');
         if (eraseBtn) eraseBtn.disabled = !tl.has_content;
       }
 
@@ -1655,15 +1653,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const sec = Math.round(tl.sync_timer_remaining || 0);
             label = `☀️ Day Mode Detected (Stops in ${sec}s)`;
           } else if (tl.is_recording && tl.last_session_type === 'auto') {
-            label = '🌙 Sync: Recording';
+            label = 'Sync: Recording 🌙';
           } else if (tl.night_vision_active) {
             label = '🌙 Sync with Night Vision: Active';
           }
           syncBtn.innerText = label;
-          syncBtn.style.background = 'rgba(147, 51, 234, 0.2)';
-          syncBtn.style.borderColor = 'rgba(147, 51, 234, 0.5)';
-          syncBtn.style.color = '#c084fc';
-          syncBtn.style.fontWeight = '600';
+          if (tl.is_recording && tl.last_session_type === 'auto') {
+            syncBtn.style.background = '#FED7D7';
+            syncBtn.style.borderColor = '#FEB2B2';
+            syncBtn.style.color = '#C53030';
+            syncBtn.style.fontWeight = '600';
+          } else {
+            syncBtn.style.background = 'rgba(147, 51, 234, 0.2)';
+            syncBtn.style.borderColor = 'rgba(147, 51, 234, 0.5)';
+            syncBtn.style.color = '#c084fc';
+            syncBtn.style.fontWeight = '600';
+          }
         } else {
           syncBtn.innerText = '🌙 Sync with Night Vision: OFF';
           syncBtn.style.background = '';
@@ -2468,6 +2473,8 @@ class WebServer:
         self.app.router.add_get("/detection_snapshot.jpg", self.handle_detection_snapshot)
         self.app.router.add_get("/api/detection_snapshot", self.handle_detection_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
+        self.app.router.add_get("/health", self.handle_health)
+        self.app.router.add_get("/api/health", self.handle_health)
         self.app.router.add_post("/api/control", self.handle_api_control)
         self.app.router.add_post("/api/timelapse/start", self.handle_timelapse_start)
         self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
@@ -2479,6 +2486,14 @@ class WebServer:
         self.app.router.add_post("/api/timelapse/event", self.handle_timelapse_record_event)
         self.app.router.add_get("/api/timelapse/video.mp4", self.handle_timelapse_video)
         self.app.router.add_get("/timelapse", self.handle_timelapse_page)
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        """Lightweight local health check that never issues external/cloud requests."""
+        return web.json_response({
+            "status": "ok",
+            "timelapse_recording": bool(self.timelapse and self.timelapse.is_recording),
+            "stream_running": bool(self.streamer and self.streamer.is_running),
+        })
 
     async def handle_favicon(self, request: web.Request) -> web.Response:
         return web.Response(

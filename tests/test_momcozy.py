@@ -527,6 +527,23 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body["online"])
         self.assertIn("Check device key", body["error"])
 
+    async def test_handle_health(self):
+        from unittest.mock import MagicMock
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.web import WebServer
+        import json
+
+        mock_monitor = MagicMock()
+        server = WebServer(monitor=mock_monitor)
+        req = make_mocked_request("GET", "/health")
+        resp = await server.handle_health(req)
+
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.text)
+        self.assertEqual(body["status"], "ok")
+        # Verify monitor.get_status was NEVER called during health check
+        mock_monitor.get_status.assert_not_called()
+
     async def test_handle_api_control_error_resilience(self):
         from unittest.mock import MagicMock
         from aiohttp.test_utils import make_mocked_request

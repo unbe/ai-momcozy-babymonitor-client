@@ -42,9 +42,9 @@ ENV PYTHONUNBUFFERED=1 \
 # Expose web dashboard (8421) and Chromecast LAN streaming port (8420)
 EXPOSE 8420 8421
 
-# Health check to ensure the dashboard status API is responding (supports HTTP and HTTPS)
+# Health check to ensure the server is responding (supports HTTP and HTTPS) without external requests
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f -k http://localhost:8421/api/status || curl -f -k https://localhost:8421/api/status || exit 1
+    CMD curl -f -k http://localhost:8421/health || curl -f -k https://localhost:8421/health || exit 1
 
 # Default entrypoint and command: run web server on 0.0.0.0:8421
 ENTRYPOINT ["python3", "/app/momcozy.py"]

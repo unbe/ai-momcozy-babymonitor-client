@@ -156,5 +156,11 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Zero Recording Overhead Preserved:** Video recording continues to write pure Annex B HEVC keyframes via stream-copy directly from `VideoStreamer.subscribe_hevc()` with 0% CPU consumption.
 * **Dev Server Port & SSL:**
   * Port 8421 runs HTTPS (`momcozy.py serve --ssl`). Healthchecks and WebCodecs APIs require HTTPS on this port. Plain HTTP for LAN/Chromecast is hosted on port 8420.
+* **Docker Health Check & Local Telemetry Endpoints:**
+  * Dedicated `/health` and `/api/health` endpoints return `200 OK` with JSON (`{"status": "ok", ...}`) reading strictly local in-memory server state.
+  * Unlike `/api/status` (which queries Tuya Cloud when camera DP status is needed), `/health` never issues network requests to Tuya Cloud or camera hardware, ensuring Docker container healthchecks run with zero external network activity.
+* **Active Timelapse UI Representation:**
+  * Active timelapse is not displayed on the video overlay player control buttons (`#timelapse-ctrl-btn` remains an unhighlighted tool button).
+  * On the dashboard, active timelapse is unified between the timelapse card header badge (`Recording 🌙`) and the night vision sync button (`Sync: Recording 🌙`), both sharing the consistent red recording status palette (`#FED7D7` background, `#C53030` text).
 
 
