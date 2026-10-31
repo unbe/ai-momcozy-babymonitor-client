@@ -171,6 +171,12 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **0% Recording CPU & Silent Handheld Monitor:** No video frames are analyzed during recording, and the camera's hardware `motion_switch` remains completely OFF, guaranteeing the 5" handheld parent monitor tablet never beeps or wakes up.
   * **State-Difference Invariance:** Leveraging that scene states do not spontaneously return to the identical millimeter posture after motion, the detector evaluates coarse anchor intervals (e.g. 1 minute). If $\Delta(Frame(A), Frame(B)) < \text{threshold}$, the entire interval is skipped in $O(1)$.
   * **Divide-and-Conquer Subdivision:** Only intervals where $\Delta \ge \text{threshold}$ are recursively divided in half to pinpoint movement onsets. Subsamples the Y (luma) plane directly via single-threaded PyAV in under 10ms per keyframe, reducing frames decoded by >90% (e.g. 53 decodes across 1,537 frames).
+  * **Localized Sub-Block Luma Metric (Small Subject Sensitivity):**
+    * When a baby occupies ~1/10th of the full frame and the surrounding room remains static, global mean difference over a 16x16 grid (256 points) dilutes large localized movement (individual pixel changes of 30–50) down to < 2.5, falling below static noise thresholds.
+    * `luma_fingerprint_diff` slides a 4x4 sub-block window (step 2) across the 16x16 fingerprint and computes the maximum localized block mean difference. Each 4x4 block covers 1/16th (~6.25%) of the frame, matching the subject's area. Still room sensor noise remains $\le 3.0$, while baby movements hit $20.0\text{--}50.0+$, cleanly detected with `threshold = 5.0`.
+  * **Slot-Aware Timeline Mapping Across Gapped Slots:**
+    * If recording was paused and resumed, gaps between slot files exist in wall-clock time, but FFmpeg concatenates slots consecutively with linear presentation timestamps (`setts=pts=N:dts=N`).
+    * Timeline position mapping in `get_status()` projects each event's wall-clock timestamp onto its containing slot and adds the cumulative duration of preceding slots, matching the concatenated video player timeline exactly.
   * **On-Demand Playback Integration:** Triggered during playback (`/timelapse` loading or `GET /api/timelapse/status`), runs asynchronously in thread pool executor, and caches results to `meta.json`. Events are plotted as interactive markers on the timelapse scrubber timeline.
 
 

@@ -2154,7 +2154,20 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(evs[1]["video_sec"], 7.5)
             self.assertEqual(evs[1]["percent"], 75.0)
 
-            # 5. Verify persistence across instances via meta.json
+            # 5. Verify timeline calculation with multi-slot gap within retention window
+            s1 = recorder.slot_path(1)
+            s1.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 50)
+            # Slot 1 is recorded later (mtime 11000.0, dur 600.0 -> started at 10400, gap of 400s)
+            recorder._slots_meta["1"] = {"mtime": 11000.0, "duration": 600.0, "frames": 300, "bytes": 56}
+            recorder.record_event(event_type="motion", label="Later Motion", timestamp=10700.0)
+            st_multi = recorder.get_status()
+            evs_multi = st_multi["events"]
+            self.assertEqual(len(evs_multi), 3)
+            # Ev 3 in slot 1: 600s (slot 0) + 300s (half of slot 1) = 900.0s elapsed (NOT 1300s!)
+            self.assertEqual(evs_multi[2]["elapsed_sec"], 900.0)
+            self.assertEqual(evs_multi[2]["video_sec"], 15.0)
+
+            # 6. Verify persistence across instances via meta.json
             recorder2 = TimelapseRecorder(
                 streamer=mock_streamer,
                 storage_dir=storage_dir,
@@ -2162,9 +2175,9 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 slot_duration_sec=600.0,
                 speed_ratio=60,
             )
-            self.assertEqual(len(recorder2._events), 2)
+            self.assertEqual(len(recorder2._events), 3)
             st2 = recorder2.get_status()
-            self.assertEqual(st2["motion_events_count"], 2)
+            self.assertEqual(st2["motion_events_count"], 3)
 
     async def test_timelapse_playback_motion_detection_binary_search(self):
         """Verify on-demand playback motion detection using adaptive binary search and state invariance."""
@@ -2178,13 +2191,21 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             luma_fingerprint_diff,
         )
 
-        # 1. Test fingerprint comparison helper
+        # 1. Test fingerprint comparison helper with localized baby-sized movement
         fp_a = b"\x10" * 256
         fp_b = b"\x10" * 256
         fp_c = b"\x30" * 256
         self.assertEqual(luma_fingerprint_diff(fp_a, fp_b), 0.0)
         self.assertEqual(luma_fingerprint_diff(fp_a, fp_c), 32.0)
         self.assertEqual(luma_fingerprint_diff(None, fp_a), 999.0)
+
+        # Localized motion: baby occupies ~1/10th of frame (e.g. 4x4 tile changed by 30, rest 0)
+        # Global mean diff would be 16 * 30 / 256 = 1.875, but localized max block diff is 30.0!
+        fp_local = bytearray(b"\x10" * 256)
+        for r in range(4):
+            for c in range(4):
+                fp_local[(r + 4) * 16 + (c + 4)] = 0x10 + 30
+        self.assertEqual(luma_fingerprint_diff(fp_a, bytes(fp_local)), 30.0)
 
         with tempfile.TemporaryDirectory() as td:
             storage_dir = Path(td)

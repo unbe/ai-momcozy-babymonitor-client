@@ -87,11 +87,38 @@ def extract_hevc_keyframe_luma(chunk: bytes, grid_size: int = 16) -> Optional[by
         return None
 
 
-def luma_fingerprint_diff(fp1: Optional[bytes], fp2: Optional[bytes]) -> float:
-    """Compute mean absolute difference between two luma fingerprints (0.0 to 255.0)."""
+def luma_fingerprint_diff(
+    fp1: Optional[bytes],
+    fp2: Optional[bytes],
+    grid_size: int = 16,
+    block_size: int = 4,
+    step: int = 2,
+) -> float:
+    """Compute maximum localized block difference between two luma fingerprints (0.0 to 255.0).
+
+    Uses a sliding block_size x block_size window across the grid_size x grid_size fingerprint.
+    Computing the maximum mean absolute difference across localized blocks ensures that
+    localized movement (such as a baby occupying ~1/10th of a room) is clearly detected
+    and not diluted by a large, static room background.
+    """
     if not fp1 or not fp2 or len(fp1) != len(fp2):
         return 999.0
-    return sum(abs(a - b) for a, b in zip(fp1, fp2)) / len(fp1)
+    if len(fp1) != grid_size * grid_size:
+        return sum(abs(a - b) for a, b in zip(fp1, fp2)) / len(fp1)
+
+    max_block_diff = 0.0
+    for br in range(0, grid_size - block_size + 1, step):
+        for bc in range(0, grid_size - block_size + 1, step):
+            b_sum = 0
+            for r in range(block_size):
+                row = (br + r) * grid_size
+                for c in range(block_size):
+                    b_sum += abs(fp1[row + bc + c] - fp2[row + bc + c])
+            b_diff = b_sum / (block_size * block_size)
+            if b_diff > max_block_diff:
+                max_block_diff = b_diff
+
+    return max_block_diff
 
 
 class TimelapseRecorder:
@@ -355,9 +382,10 @@ class TimelapseRecorder:
 
     def detect_motion_events(
         self,
-        threshold: float = 4.5,
+        threshold: float = 5.0,
         coarse_step: int = 30,
         min_window: int = 2,
+        debounce_sec: float = 20.0,
     ) -> List[Dict[str, Any]]:
         """Run adaptive binary search motion detection across recorded timelapse slots on playback.
 
@@ -365,6 +393,8 @@ class TimelapseRecorder:
         Leverages state-difference invariance: if Frame(A) ≈ Frame(B), no motion occurred
         in interval [A, B] and the entire block is skipped in O(1).
         Only intervals with diff >= threshold are recursively subdivided to pinpoint motion onsets.
+        Uses localized block luma differences so movements occupying ~1/10th of the frame
+        are detected reliably without dilution from a static background.
         """
         ordered = self.get_ordered_slots()
         if not ordered:
@@ -459,7 +489,7 @@ class TimelapseRecorder:
         raw_timestamps = sorted([indexed_frames[idx][3] for idx in motion_frame_indices])
         clustered: List[Dict[str, Any]] = []
         for ts in raw_timestamps:
-            if not clustered or (ts - float(clustered[-1]["time"])) >= 15.0:
+            if not clustered or (ts - float(clustered[-1]["time"])) >= debounce_sec:
                 clustered.append({
                     "time": round(ts, 1),
                     "type": "motion",
@@ -735,18 +765,30 @@ class TimelapseRecorder:
         total_real_time_sec = min(total_real_time_sec, max_duration)
         video_sec = total_real_time_sec / self.speed_ratio if self.speed_ratio > 0 else 0.0
 
-        # Calculate event timeline positions relative to the start of recorded video
+        # Calculate event timeline positions mapped across concatenated recorded slots
         events_list: List[Dict[str, Any]] = []
         if ordered and total_real_time_sec > 0:
-            first_slot_meta = ordered[0][2]
-            first_slot_path = ordered[0][1]
-            first_slot_mtime = float(first_slot_meta.get("mtime") or (first_slot_path.stat().st_mtime if first_slot_path.exists() else time.time()))
-            first_slot_dur = float(first_slot_meta.get("duration") or min(self.slot_duration_sec, total_real_time_sec))
-            start_wall_time = first_slot_mtime - first_slot_dur
-
             for ev in self._events:
                 ev_time = float(ev.get("time", 0.0))
-                elapsed_sec = max(0.0, ev_time - start_wall_time)
+                cum_dur = 0.0
+                elapsed_sec = None
+                for idx, path, meta in ordered:
+                    if idx == self._current_slot and self.is_recording:
+                        dur = min(self.slot_duration_sec, max(0.0, time.monotonic() - self._slot_start_monotonic))
+                        end_t = time.time()
+                    else:
+                        dur = float(meta.get("duration") or min(self.slot_duration_sec, (meta.get("frames", 0) * 4.0 if meta.get("frames", 0) > 0 else self.slot_duration_sec)))
+                        end_t = float(meta.get("mtime") or (path.stat().st_mtime if path.exists() else time.time()))
+                    start_t = end_t - dur
+                    if ev_time <= end_t:
+                        offset = max(0.0, min(ev_time - start_t, dur))
+                        elapsed_sec = cum_dur + offset
+                        break
+                    cum_dur += dur
+
+                if elapsed_sec is None:
+                    elapsed_sec = min(cum_dur, total_real_time_sec)
+
                 if elapsed_sec <= total_real_time_sec + 30.0:  # within current buffer window
                     percent = min(100.0, max(0.0, round((elapsed_sec / total_real_time_sec) * 100.0, 1)))
                     ev_video_sec = round(elapsed_sec / self.speed_ratio, 1) if self.speed_ratio > 0 else 0.0
