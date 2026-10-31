@@ -592,7 +592,12 @@ class TimelapseRecorder:
             "current_session_type": self.current_session_type,
         }
 
-    async def export_mp4(self, codec: str = "hevc", ratio: Optional[int] = None) -> Optional[Path]:
+    async def export_mp4(
+        self,
+        codec: str = "hevc",
+        ratio: Optional[int] = None,
+        allow_cache_only: bool = False,
+    ) -> Optional[Path]:
         """Concatenate ordered slots and remux to MP4 using stream-copy (zero transcoding).
 
         If codec=='h264' is explicitly requested, attempts Intel VA-API hardware acceleration
@@ -622,6 +627,8 @@ class TimelapseRecorder:
         if cache_entry and cache_entry.get("path") and cache_entry["path"].exists():
             out_path = cache_entry["path"]
             created_at = float(cache_entry.get("created_at", 0.0))
+            if allow_cache_only:
+                return out_path
             if not self.is_recording:
                 # Slot recordings are static; cache is valid if built after or at latest slot mtime
                 if created_at >= latest_mtime:
@@ -768,7 +775,7 @@ class TimelapseRecorder:
                         str(tmp_out),
                     ]
                 else:
-                    # Stream copy HEVC: 0% CPU, ultrafast remux
+                    # Stream copy HEVC: 0% CPU, ultrafast remux with monotonic sequential timestamps
                     cmd = [
                         "ffmpeg",
                         "-y",
@@ -777,6 +784,7 @@ class TimelapseRecorder:
                         "-safe", "0",
                         "-i", list_path,
                         "-c:v", "copy",
+                        "-bsf:v", "setts=pts=N:dts=N",
                         "-tag:v", "hvc1",
                         "-movflags", "+faststart",
                         str(tmp_out),

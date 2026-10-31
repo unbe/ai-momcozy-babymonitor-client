@@ -2041,6 +2041,62 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(call_count, 1)  # Still 1, cache hit!
                 self.assertEqual(p1, p2)
 
+    async def test_timelapse_export_mp4_range_cache_stability(self):
+        """Verify that Range requests (allow_cache_only=True) preserve cached file even when TTL expired."""
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=2,
+            )
+
+            s0 = recorder.slot_path(0)
+            s0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 50)
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "frames": 1, "bytes": 56}
+
+            call_count = 0
+            captured_cmds = []
+            original_generate = recorder._generate_mp4
+
+            def mock_generate(slots, out, codec, fps):
+                nonlocal call_count
+                call_count += 1
+                out.write_bytes(b"cached_video_bytes")
+                return True
+
+            with unittest.mock.patch.object(recorder, "_generate_mp4", side_effect=mock_generate):
+                recorder._running = True
+                recorder._record_task = MagicMock()
+                recorder._record_task.done.return_value = False
+
+                # Initial export generates cache
+                p1 = await recorder.export_mp4(codec="hevc", ratio=60)
+                self.assertEqual(call_count, 1)
+
+                # Artificially expire the cache TTL
+                cache_key = "hevc_r60"
+                recorder._exports_cache[cache_key]["created_at"] = time.time() - 100.0
+
+                # Range seek request (allow_cache_only=True) must NOT regenerate the file
+                p2 = await recorder.export_mp4(codec="hevc", ratio=60, allow_cache_only=True)
+                self.assertEqual(call_count, 1)  # Reused existing file without running FFmpeg
+                self.assertEqual(p1, p2)
+
+                # Non-range request (e.g. reload) should regenerate
+                p3 = await recorder.export_mp4(codec="hevc", ratio=60, allow_cache_only=False)
+                self.assertEqual(call_count, 2)
+                self.assertEqual(p1, p3)
+
     def test_timelapse_motion_events_timeline(self):
         """Verify motion events recording, debouncing, persistence, and timeline mapping."""
         import tempfile

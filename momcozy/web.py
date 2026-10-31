@@ -2150,6 +2150,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     let activeCodec = canPlayHevc() ? 'hevc' : 'h264';
     let fallbackAttempted = false;
+    let initialPlaySucceeded = false;
     let currentRatio = 60;
 
     function updateDownloadLinks() {
@@ -2175,10 +2176,33 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     video.onloadeddata = function() {
       loading.style.display = 'none';
+      initialPlaySucceeded = true;
+    };
+
+    video.onplaying = function() {
+      initialPlaySucceeded = true;
     };
 
     video.onerror = function(e) {
-      console.warn('[Timelapse Player] Video error with codec ' + activeCodec, e);
+      const err = video.error;
+      console.warn('[Timelapse Player] Video error with codec ' + activeCodec, err ? { code: err.code, message: err.message } : e);
+
+      // Code 1: MEDIA_ERR_ABORTED - User / browser aborted previous range request while scrubbing
+      if (err && err.code === 1) {
+        return;
+      }
+
+      // If HEVC already successfully loaded metadata / played, this was a transient seek glitch, NOT an unsupported codec!
+      if (initialPlaySucceeded) {
+        console.info('[Timelapse Player] Transient seek/playback glitch on HEVC, recovering playback...');
+        const dur = video.duration || 1.0;
+        const cur = Math.max(0.05, Math.min(dur - 0.05, video.currentTime || 0.05));
+        video.load();
+        video.currentTime = cur;
+        video.play().catch(function() {});
+        return;
+      }
+
       if (activeCodec === 'hevc' && !fallbackAttempted) {
         console.info('[Timelapse Player] Retrying with H.264 fallback...');
         fallbackAttempted = true;
@@ -2188,6 +2212,13 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       loading.style.display = 'none';
       errorBox.style.display = 'flex';
     };
+
+    video.addEventListener('seeking', function() {
+      // Prevent 0.000 boundary underflow in native hardware decoders
+      if (video.currentTime < 0.05 && video.duration > 0.1) {
+        video.currentTime = 0.05;
+      }
+    });
 
     let motionEvents = [];
 
@@ -2234,7 +2265,8 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     function seekToSec(sec) {
       if (video.duration) {
-        video.currentTime = Math.min(video.duration, Math.max(0, sec));
+        const target = Math.max(0.05, Math.min(video.duration - 0.05, sec));
+        video.currentTime = target;
         video.play().catch(() => {});
       }
     }
@@ -2244,7 +2276,34 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       if (!bar || !video.duration) return;
       const rect = bar.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      video.currentTime = ratio * video.duration;
+      const target = Math.max(0.05, Math.min(video.duration - 0.05, ratio * video.duration));
+      video.currentTime = target;
+    }
+
+    const timelineWrapper = document.getElementById('timeline-wrapper');
+    let isDraggingTimeline = false;
+    let seekRaf = null;
+
+    function throttledTimelineSeek(e) {
+      if (seekRaf) cancelAnimationFrame(seekRaf);
+      seekRaf = requestAnimationFrame(() => {
+        seekFromTimeline(e);
+      });
+    }
+
+    if (timelineWrapper) {
+      timelineWrapper.addEventListener('mousedown', (e) => {
+        isDraggingTimeline = true;
+        throttledTimelineSeek(e);
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (isDraggingTimeline) {
+          throttledTimelineSeek(e);
+        }
+      });
+      window.addEventListener('mouseup', () => {
+        isDraggingTimeline = false;
+      });
     }
 
     function jumpToNextEvent() {
@@ -2304,6 +2363,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     function reloadVideo() {
       fallbackAttempted = false;
+      initialPlaySucceeded = false;
       loadPlayback(activeCodec);
     }
 
@@ -3255,8 +3315,15 @@ class WebServer:
                 codec = "hevc"
         ratio_param = request.query.get("ratio")
         ratio = int(ratio_param) if (ratio_param and ratio_param.isdigit()) else None
+
+        # For Range requests (seeking/scrubbing), do not regenerate MP4 mid-stream to avoid swapping out the file
+        has_range = bool(request.headers.get("Range"))
         try:
-            mp4_path = await self.timelapse.export_mp4(codec=codec, ratio=ratio)
+            mp4_path = await self.timelapse.export_mp4(
+                codec=codec,
+                ratio=ratio,
+                allow_cache_only=has_range,
+            )
         except Exception as exc:
             logger.error("Error generating timelapse MP4: %s", exc)
             return web.Response(status=500, text=f"Error exporting timelapse: {exc}", content_type="text/plain")
