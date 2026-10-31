@@ -1755,7 +1755,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         });
         const d = await res.json();
         if (d.success) {
-          showToast(d.sync_night_vision ? '🌙 Night Vision timelapse sync ENABLED (Automation runs server-side).' : '🌙 Night Vision timelapse sync DISABLED.', 'info', 4000);
+          showToast(d.sync_night_vision ? '🌙 Night Vision timelapse sync ENABLED.' : '🌙 Night Vision timelapse sync DISABLED.', 'info', 4000);
           if (d.timelapse) updateTimelapseUI(d.timelapse);
         } else {
           showToast('Failed to toggle Night Vision sync: ' + (d.error || ''), 'error', 4000);
