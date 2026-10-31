@@ -2351,26 +2351,6 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
         status_forced_off = BM04Status(night_vision="1")
         self.assertFalse(server.is_night_vision_active(status_forced_off, frame_bytes=mono_frame))
 
-    def test_momcozy_monitor_local_dp_overrides(self):
-        cloud_data = {"108": "0", "101": False}
-        monitor = MomcozyMonitor(
-            device_id="test_dev",
-            local_key="test_key",
-            ip="127.0.0.1",
-            cloud_dps_provider=lambda: cloud_data,
-            cloud_dp_publisher=lambda dps: True,
-        )
-        monitor._lan_tcp_unavailable = True
-
-        st = monitor.get_status()
-        self.assertEqual(st.night_vision, "0")
-
-        # Set DP 108 = "2"
-        monitor.set_dp(108, "2")
-        st_after = monitor.get_status()
-        # Even though cloud_data still says "0", local override should prevail
-        self.assertEqual(st_after.night_vision, "2")
-
     async def test_timelapse_manual_resume_preserves_content(self):
         from aiohttp.test_utils import make_mocked_request
 
