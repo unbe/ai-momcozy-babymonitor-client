@@ -197,7 +197,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       background: #EBF8FF;
       color: var(--accent-blue);
       white-space: nowrap;
-      flex-shrink: 0;
     }
     .badge.active { background: #F0FFF4; color: var(--accent-green); }
     .badge.alert { background: #FFF5F5; color: #E53E3E; }
@@ -651,10 +650,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       <!-- Timelapse Card -->
       <div class="card" id="timelapse-card">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <h2 style="margin:0; white-space:nowrap;">⏱️ Timelapse</h2>
-          <span class="badge" id="timelapse-badge">Stopped</span>
-        </div>
+        <h2>⏱️ Timelapse <span class="badge" id="timelapse-badge">Stopped</span></h2>
         <div class="control-row">
           <span>Speed Ratio</span>
           <select id="timelapse-ratio-select" onchange="changeTimelapseRatio(this.value)" style="font-size:0.82rem; font-weight:600; cursor:pointer;" title="Select Timelapse Speed Ratio">
@@ -1608,9 +1604,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           badge.className = 'badge active';
           badge.style.background = '#FED7D7';
           badge.style.color = '#C53030';
-          badge.style.whiteSpace = 'nowrap';
-          badge.style.flexShrink = '0';
-          badge.innerText = tl.last_session_type === 'auto' ? 'Recording\u00A0🌙' : 'Recording';
+          badge.innerText = tl.last_session_type === 'auto' ? 'Recording 🌙' : 'Recording';
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏹ Stop Recording';
