@@ -510,10 +510,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </svg>
           <span id="cast-btn-text">Cast</span>
         </button>
-        <button class="video-ctrl-btn" id="timelapse-ctrl-btn" onclick="openTimelapsePlayback()" title="Watch 12-Hour Timelapse">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          <span id="timelapse-ctrl-text">Timelapse</span>
-        </button>
         <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
           <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
           <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
@@ -1583,7 +1579,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const vlenEl = document.getElementById('timelapse-vlen');
       const storageEl = document.getElementById('timelapse-storage');
       const ratioSelect = document.getElementById('timelapse-ratio-select');
-      const ctrlBtn = document.getElementById('timelapse-ctrl-btn');
 
       if (bufferedEl) bufferedEl.innerText = tl.buffered_formatted || '0m 00s';
       if (vlenEl) vlenEl.innerText = tl.video_duration_formatted || '0:00';

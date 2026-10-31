@@ -161,7 +161,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * Unlike `/api/status` (which queries Tuya Cloud when camera DP status is needed), `/health` never issues network requests to Tuya Cloud or camera hardware, ensuring Docker container healthchecks run with zero external network activity.
   * **No Aliases Rule:** Never create alias routes or multiple endpoints for the same purpose (e.g. choose `/health`, do not add `/api/health`). One canonical endpoint is sufficient.
 * **Active Timelapse UI Representation:**
-  * Active timelapse is not displayed on the video overlay player control buttons (`#timelapse-ctrl-btn` remains an unhighlighted tool button).
+  * `#timelapse-ctrl-btn` was removed from the video player controls to prevent duplicate controls (the dedicated `[▶ Watch]` button on the Timelapse card handles playback).
   * On the dashboard, active timelapse is unified between the timelapse card header badge (`Recording 🌙`) and the night vision sync button (`Sync: Recording 🌙`), both sharing the consistent red recording status palette (`#FED7D7` background, `#C53030` text).
 
 
