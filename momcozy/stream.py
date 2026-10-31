@@ -786,6 +786,7 @@ class VideoStreamer:
         self._snapshot_requests: Set[object] = set()
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
+        self.is_keepalive_required: Optional[Callable[[], bool]] = None
         self._lock = asyncio.Lock()
 
     @property
@@ -918,6 +919,8 @@ class VideoStreamer:
             return
         if self.total_listener_count > 0:
             return
+        if self.is_keepalive_required and self.is_keepalive_required():
+            return
         try:
             loop = asyncio.get_running_loop()
             self._idle_task = loop.create_task(self._idle_stop_timer())
@@ -941,7 +944,13 @@ class VideoStreamer:
                 int(self.idle_timeout),
             )
             await asyncio.sleep(self.idle_timeout)
-            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running:
+            if (
+                not self._listeners
+                and not self._audio_listeners
+                and not self._hevc_listeners
+                and self._running
+                and not (self.is_keepalive_required and self.is_keepalive_required())
+            ):
                 logger.info(
                     "No stream clients connected for %d minutes (%ds). Disconnecting cloud video stream to conserve resources.",
                     int(self.idle_timeout // 60),

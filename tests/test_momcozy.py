@@ -2224,6 +2224,20 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
             self.assertIn("timelapse-sync-nv-btn", resp_idx.text)
             self.assertIn("toggleNightVisionSync", resp_idx.text)
 
+    async def test_streamer_idle_stop_suppressed_when_night_vision_sync_enabled(self):
+        from momcozy.stream import VideoStreamer
+        streamer = VideoStreamer(device_id="dev1", local_key="key1", idle_timeout=10.0)
+        # Without keepalive:
+        streamer._schedule_idle_stop()
+        self.assertIsNotNone(streamer._idle_task)
+        streamer._cancel_idle_stop()
+        self.assertIsNone(streamer._idle_task)
+
+        # With keepalive required:
+        streamer.is_keepalive_required = lambda: True
+        streamer._schedule_idle_stop()
+        self.assertIsNone(streamer._idle_task)
+
     async def test_sync_night_vision_debounce_simulation(self):
         """Verify the 60s activation threshold and 120s deactivation threshold."""
         with tempfile.TemporaryDirectory() as td:

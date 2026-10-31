@@ -2462,6 +2462,12 @@ class WebServer:
         self.timelapse: Optional[TimelapseRecorder] = (
             TimelapseRecorder(streamer=self.streamer) if self.streamer else None
         )
+        if self.streamer:
+            self.streamer.is_keepalive_required = lambda: bool(
+                self.timelapse and (self.timelapse.is_recording or self.timelapse.sync_night_vision)
+            )
+            if self.timelapse and self.timelapse.sync_night_vision:
+                self.streamer._cancel_idle_stop()
         self._cached_status: Optional[Any] = None
         self._cached_status_time: float = 0.0
         self._nv_active_start: Optional[float] = None
@@ -3253,6 +3259,19 @@ class WebServer:
         self.timelapse.set_sync_night_vision(enabled)
         self._nv_active_start = None
         self._nv_inactive_start = None
+        if self.streamer:
+            if enabled:
+                if callable(getattr(self.streamer, "_cancel_idle_stop", None)):
+                    self.streamer._cancel_idle_stop()
+                if not getattr(self.streamer, "is_running", False):
+                    if callable(getattr(self.streamer, "start", None)):
+                        res = self.streamer.start()
+                        if asyncio.iscoroutine(res):
+                            asyncio.create_task(res)
+            else:
+                if not self.timelapse.is_recording and getattr(self.streamer, "total_listener_count", 0) == 0:
+                    if callable(getattr(self.streamer, "_schedule_idle_stop", None)):
+                        self.streamer._schedule_idle_stop()
         return web.json_response({
             "success": True,
             "sync_night_vision": self.timelapse.sync_night_vision,
