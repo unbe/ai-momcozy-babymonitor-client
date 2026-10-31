@@ -520,6 +520,7 @@ def _patch_tuya_stream_session() -> None:
                 pass
 
     def momcozy_on_hevc(self: Any, chunk: bytes, is_key: bool) -> None:
+        self._last_frame_at = time.monotonic()
         for subscriber in list(self._hevc_subscribers):
             if subscriber.full():
                 try:

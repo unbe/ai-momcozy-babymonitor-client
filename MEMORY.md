@@ -12,6 +12,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * Direct low-latency hardware decoding inside modern browsers (Chrome, Safari, Edge) via the WebCodecs API (`VideoDecoder`).
   * Emits raw HEVC Access Units prefixed with a 1-byte binary flag (`\x01` for keyframe, `\x00` for delta frame).
   * Consumes near-zero server CPU because no video transcoding is performed.
+  * **Tuya P2P SDK Watchdog Stall Prevention:** Native HEVC pass-through disables JPEG transcoding (`transcoding: False`). The Tuya IPC SDK watchdog (`_async_watch_for_stalls`) checks `time.monotonic() - self._last_frame_at >= 60s`, but the SDK only updates `_last_frame_at` when `_on_frame(jpeg_bytes)` is called. In `momcozy/stream.py`, `momcozy_on_hevc` updates `self._last_frame_at = time.monotonic()` for every arriving HEVC chunk, preventing the SDK from erroneously tearing down and restarting healthy sessions every 60 seconds.
 * **MJPEG Fallback (`/stream`):**
   * Transcodes HEVC into MJPEG using PyAV/OpenCV only when WebCodecs/HEVC is genuinely unsupported or repeatedly fails fatal decoding.
 * **HLS Pipeline (`/hls/stream.m3u8`):**
@@ -96,7 +97,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * To conserve camera battery/heat, bandwidth, and CPU, the camera P2P stream is **NOT kept running 24/7** when idle.
     * When timelapse is not recording and no client viewers are connected, the stream disconnects.
     * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), restarts the P2P stream via `VideoStreamer.get_clean_frame()`, captures a clean keyframe, and evaluates night vision status.
-    * If daylight is detected, the stream is immediately stopped until the next 5-minute check.
+    * If daylight is detected (or check completes with 0 active viewers), the stream disconnects immediately (`await self.streamer.stop()`) without waiting for the 300s idle timeout to expire, remaining stopped until the next 5-minute check.
     * If night vision is detected, the stream stays running, the 60s activation debounce starts, and timelapse recording auto-starts after 60s of continuous darkness.
     * While recording is active (or during the 60s activation window), `VideoStreamer.keepalive` keeps the stream running.
     * When daylight persists for 120s, timelapse stops, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.

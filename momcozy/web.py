@@ -3392,6 +3392,7 @@ class WebServer:
                     dp_108 = str(raw.get("108", nv_mode)).strip()
 
                     clean_frame: Optional[bytes] = None
+                    connected_for_nv_check: bool = False
 
                     if dp_108 == "0" and self.streamer:
                         streamer_running = getattr(self.streamer, "is_running", False)
@@ -3399,6 +3400,7 @@ class WebServer:
                             # Stream is stopped. Periodic check every 5 minutes (300s):
                             if (now_mono - self._last_nv_poll_time >= 300.0) or (self._last_nv_poll_time == 0.0):
                                 self._last_nv_poll_time = now_mono
+                                connected_for_nv_check = True
                                 logger.info("Checking night vision state (restarting camera stream for clean frame)...")
                                 try:
                                     if hasattr(self.streamer, "get_clean_frame"):
@@ -3488,18 +3490,18 @@ class WebServer:
                                 self._nv_inactive_start = None
                         else:
                             # Not recording and night vision is inactive:
-                            # If stream was restarted for periodic check and has 0 viewers, stop stream immediately
+                            # If we only connected to the stream to check for night vision, disconnect immediately!
                             if (
-                                clean_frame is not None
-                                and self.streamer
+                                self.streamer
                                 and getattr(self.streamer, "is_running", False)
                                 and getattr(self.streamer, "total_listener_count", 0) == 0
                                 and self._nv_active_start is None
                             ):
-                                logger.info("Night vision inactive (daylight) and no viewers connected. Stopping camera stream.")
-                                res = self.streamer.stop()
-                                if asyncio.iscoroutine(res):
-                                    await res
+                                if connected_for_nv_check or clean_frame is not None:
+                                    logger.info("Night vision inactive (daylight). Disconnecting camera stream immediately.")
+                                    res = self.streamer.stop()
+                                    if asyncio.iscoroutine(res):
+                                        await res
 
                 # 2. Motion Events Tracking (while recording)
                 if self.timelapse.is_recording:
