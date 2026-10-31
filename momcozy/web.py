@@ -2198,9 +2198,9 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       }
 
       // If HEVC already successfully loaded metadata / played and recovery is within retry limits
-      if (initialPlaySucceeded && recoveryAttempts < 2) {
+      if (initialPlaySucceeded && recoveryAttempts < 10) {
         recoveryAttempts++;
-        console.info('[Timelapse Player] Recovering playback (attempt ' + recoveryAttempts + '/2)...');
+        console.info('[Timelapse Player] Recovering playback (attempt ' + recoveryAttempts + '/10)...');
         const dur = video.duration || 1.0;
         const cur = Math.max(0.05, Math.min(dur - 0.05, video.currentTime || 0.05));
         const onLoadedMeta = function() {
