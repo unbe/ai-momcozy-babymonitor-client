@@ -2207,6 +2207,11 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 fp_local[(r + 4) * 16 + (c + 4)] = 0x10 + 30
         self.assertEqual(luma_fingerprint_diff(fp_a, bytes(fp_local)), 30.0)
 
+        # Single pixel spike (e.g. camera OSD clock seconds digit updating) is trimmed out
+        fp_spike = bytearray(b"\x10" * 256)
+        fp_spike[1 * 16 + 3] = 0x10 + 200
+        self.assertEqual(luma_fingerprint_diff(fp_a, bytes(fp_spike)), 0.0)
+
         with tempfile.TemporaryDirectory() as td:
             storage_dir = Path(td)
             mock_streamer = MagicMock()

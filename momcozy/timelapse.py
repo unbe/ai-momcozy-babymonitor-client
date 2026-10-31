@@ -93,13 +93,16 @@ def luma_fingerprint_diff(
     grid_size: int = 16,
     block_size: int = 4,
     step: int = 2,
+    drop_outliers: int = 1,
 ) -> float:
     """Compute maximum localized block difference between two luma fingerprints (0.0 to 255.0).
 
     Uses a sliding block_size x block_size window across the grid_size x grid_size fingerprint.
-    Computing the maximum mean absolute difference across localized blocks ensures that
-    localized movement (such as a baby occupying ~1/10th of a room) is clearly detected
-    and not diluted by a large, static room background.
+    Trims the highest outlier pixel in each block (drop_outliers=1) to eliminate false positives
+    from single-pixel fluctuations (such as on-screen camera clock digits, OSD text changes,
+    or sensor compression noise).
+    Computing the maximum difference across localized blocks ensures that localized movements
+    (such as a baby occupying ~1/10th of a room) are detected reliably.
     """
     if not fp1 or not fp2 or len(fp1) != len(fp2):
         return 999.0
@@ -109,12 +112,17 @@ def luma_fingerprint_diff(
     max_block_diff = 0.0
     for br in range(0, grid_size - block_size + 1, step):
         for bc in range(0, grid_size - block_size + 1, step):
-            b_sum = 0
+            deltas = []
             for r in range(block_size):
                 row = (br + r) * grid_size
                 for c in range(block_size):
-                    b_sum += abs(fp1[row + bc + c] - fp2[row + bc + c])
-            b_diff = b_sum / (block_size * block_size)
+                    deltas.append(abs(fp1[row + bc + c] - fp2[row + bc + c]))
+            if drop_outliers > 0 and len(deltas) > drop_outliers:
+                deltas.sort()
+                trimmed = deltas[:-drop_outliers]
+                b_diff = sum(trimmed) / len(trimmed)
+            else:
+                b_diff = sum(deltas) / len(deltas)
             if b_diff > max_block_diff:
                 max_block_diff = b_diff
 
@@ -382,10 +390,10 @@ class TimelapseRecorder:
 
     def detect_motion_events(
         self,
-        threshold: float = 5.0,
+        threshold: float = 4.5,
         coarse_step: int = 30,
         min_window: int = 2,
-        debounce_sec: float = 20.0,
+        debounce_sec: float = 25.0,
     ) -> List[Dict[str, Any]]:
         """Run adaptive binary search motion detection across recorded timelapse slots on playback.
 
