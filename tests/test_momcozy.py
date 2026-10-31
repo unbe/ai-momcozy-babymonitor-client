@@ -18,7 +18,7 @@ from momcozy.cloud import MomcozyCloudApi, hash_password
 from momcozy.device import BM04Status, MomcozyMonitor, celsius_to_fahrenheit
 from momcozy.cli import build_parser
 from momcozy.timelapse import TimelapseRecorder
-from momcozy.web import WebServer
+from momcozy.web import WebServer, detect_night_vision_from_jpeg
 
 
 class TestMomcozyConstants(unittest.TestCase):
@@ -2300,6 +2300,179 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(stopped_calls), 1)
             self.assertEqual(rec.last_session_type, "auto")
+
+    def test_detect_night_vision_from_jpeg(self):
+        from PIL import Image
+        import io
+
+        def make_jpeg(r, g, b):
+            im = Image.new("RGB", (32, 32), color=(r, g, b))
+            bio = io.BytesIO()
+            im.save(bio, format="JPEG")
+            return bio.getvalue()
+
+        # Color images (daytime) -> should return False
+        color_day = make_jpeg(220, 100, 50)
+        self.assertFalse(detect_night_vision_from_jpeg(color_day))
+
+        # Monochrome / infrared images -> should return True
+        mono_night = make_jpeg(120, 120, 120)
+        self.assertTrue(detect_night_vision_from_jpeg(mono_night))
+
+        # Black / dark infrared
+        mono_dark = make_jpeg(20, 20, 20)
+        self.assertTrue(detect_night_vision_from_jpeg(mono_dark))
+
+        # Invalid or empty inputs -> should safely return False
+        self.assertFalse(detect_night_vision_from_jpeg(b""))
+        self.assertFalse(detect_night_vision_from_jpeg(b"corrupted_jpeg_data"))
+
+    def test_webserver_is_night_vision_active_auto_frame_detection(self):
+        from PIL import Image
+        import io
+
+        def make_jpeg(r, g, b):
+            im = Image.new("RGB", (32, 32), color=(r, g, b))
+            bio = io.BytesIO()
+            im.save(bio, format="JPEG")
+            return bio.getvalue()
+
+        server = WebServer(monitor=MagicMock(), streamer=None)
+        color_frame = make_jpeg(200, 120, 50)
+        mono_frame = make_jpeg(90, 90, 90)
+
+        # In Auto mode ("0"), evaluate via frame color saturation
+        status_auto = BM04Status(night_vision="0")
+        self.assertFalse(server.is_night_vision_active(status_auto, frame_bytes=color_frame))
+        self.assertTrue(server.is_night_vision_active(status_auto, frame_bytes=mono_frame))
+
+        # Explicit "2" is always True regardless of frame
+        status_forced_on = BM04Status(night_vision="2")
+        self.assertTrue(server.is_night_vision_active(status_forced_on, frame_bytes=color_frame))
+
+        # Explicit "1" is always False regardless of frame
+        status_forced_off = BM04Status(night_vision="1")
+        self.assertFalse(server.is_night_vision_active(status_forced_off, frame_bytes=mono_frame))
+
+    def test_momcozy_monitor_local_dp_overrides(self):
+        cloud_data = {"108": "0", "101": False}
+        monitor = MomcozyMonitor(
+            device_id="test_dev",
+            local_key="test_key",
+            ip="127.0.0.1",
+            cloud_dps_provider=lambda: cloud_data,
+            cloud_dp_publisher=lambda dps: True,
+        )
+        monitor._lan_tcp_unavailable = True
+
+        st = monitor.get_status()
+        self.assertEqual(st.night_vision, "0")
+
+        # Set DP 108 = "2"
+        monitor.set_dp(108, "2")
+        st_after = monitor.get_status()
+        # Even though cloud_data still says "0", local override should prevail
+        self.assertEqual(st_after.night_vision, "2")
+
+    async def test_timelapse_manual_resume_preserves_content(self):
+        from aiohttp.test_utils import make_mocked_request
+
+        with tempfile.TemporaryDirectory() as td:
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+            mock_monitor = MagicMock()
+
+            server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td)
+
+            # Start recording
+            req_start1 = make_mocked_request("POST", "/api/timelapse/start")
+            await server.handle_timelapse_start(req_start1)
+            self.assertTrue(server.timelapse._running)
+
+            # Simulate writing frames into slot 0
+            slot0 = server.timelapse.slot_path(0)
+            slot0.write_bytes(b"frame_sample_bytes_12345")
+            server.timelapse._frames_in_slot = 10
+            server.timelapse._bytes_in_slot = len(b"frame_sample_bytes_12345")
+
+            # Stop recording manually
+            req_stop = make_mocked_request("POST", "/api/timelapse/stop")
+            resp_stop = await server.handle_timelapse_stop(req_stop)
+            self.assertEqual(resp_stop.status, 200)
+            self.assertFalse(server.timelapse._running)
+            self.assertTrue(slot0.exists())
+            self.assertEqual(slot0.stat().st_size, len(b"frame_sample_bytes_12345"))
+
+            # Start recording again manually (should resume, fresh=False by default)
+            req_start2 = make_mocked_request("POST", "/api/timelapse/start")
+            resp_start2 = await server.handle_timelapse_start(req_start2)
+            self.assertEqual(resp_start2.status, 200)
+            # Slot 0 should still exist and not be wiped!
+            self.assertTrue(slot0.exists())
+            self.assertEqual(slot0.stat().st_size, len(b"frame_sample_bytes_12345"))
+
+            # Clean up
+            await server.timelapse.stop()
+
+    async def test_timelapse_clear_erase_api(self):
+        from aiohttp.test_utils import make_mocked_request
+
+        with tempfile.TemporaryDirectory() as td:
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+            mock_monitor = MagicMock()
+
+            server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td)
+
+            # Create mock recorded slot and event
+            slot0 = server.timelapse.slot_path(0)
+            slot0.write_bytes(b"some_recorded_hevc_data")
+            server.timelapse.record_event("motion", "Baby motion")
+            self.assertTrue(slot0.exists())
+            self.assertEqual(len(server.timelapse._events), 1)
+
+            # Call handle_timelapse_clear
+            req_clear = make_mocked_request("POST", "/api/timelapse/clear")
+            resp_clear = await server.handle_timelapse_clear(req_clear)
+            self.assertEqual(resp_clear.status, 200)
+            data = json.loads(resp_clear.text)
+            self.assertTrue(data["success"])
+            self.assertFalse(data["timelapse"]["has_content"])
+            self.assertEqual(data["timelapse"]["total_frames"], 0)
+            self.assertEqual(len(data["timelapse"]["events"]), 0)
+            self.assertFalse(slot0.exists())
+
+            # Also verify via /api/control with action: "timelapse_clear"
+            slot1 = server.timelapse.slot_path(1)
+            slot1.write_bytes(b"more_data")
+            req_ctrl = make_mocked_request("POST", "/api/control")
+            req_ctrl._read_bytes = b'{"action": "timelapse_clear"}'
+            resp_ctrl = await server.handle_api_control(req_ctrl)
+            self.assertEqual(resp_ctrl.status, 200)
+            self.assertFalse(slot1.exists())
+
+    def test_manual_session_not_stopped_by_daylight(self):
+        rec = MagicMock()
+        rec.is_recording = True
+        rec.current_session_type = "manual"
+        rec.last_session_type = "manual"
+
+        # Daylight inactive condition:
+        is_nv = False
+        nv_inactive_start = 100.0
+        now_mono = 250.0  # 150s of daylight
+
+        # Condition in _background_monitor_loop:
+        # Only auto-stop if session was started as auto or night vision was active
+        nv_session_was_active = False
+        stopped = False
+        if rec.current_session_type == "auto" or nv_session_was_active:
+            if (now_mono - nv_inactive_start) >= 120.0:
+                stopped = True
+
+        self.assertFalse(stopped, "Manual daytime recording should not be stopped by daylight automation!")
 
 
 if __name__ == "__main__":

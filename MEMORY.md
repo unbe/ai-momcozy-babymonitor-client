@@ -93,9 +93,20 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
 * **Server-Side Night Vision Timelapse Automation (0% Client Overhead):**
   * **Completely Headless & Server-Side:** The automation runs entirely inside `WebServer._background_monitor_loop()` on the host/container. It operates autonomously without requiring any browser window, tab, or client socket to remain open.
   * **Persistent Configuration:** Toggling the sync feature via `[🌙 Sync with Night Vision: ON]` persists `"sync_night_vision": true` and `"last_session_type"` in `timelapse/meta.json`. Server restarts immediately restore the monitoring loop.
-  * **Debounce Timing Logic:**
-    * **Activation Threshold (1 Minute = 60s):** When camera reports Night Vision active (`status.night_vision == "2"`, `DP.BASIC_NIGHTVISION == "2"`, or IR active), a monotonic timer starts. If Night Vision remains continuously active for $\ge 60.0$ seconds and timelapse is not currently recording, it automatically starts/resumes. Transient darkness or light fluctuations under 60 seconds are safely ignored.
-    * **Deactivation Threshold (2 Minutes = 120s):** When camera reports daylight / Night Vision inactive, an inactive monotonic timer starts. If daylight persists continuously for $\ge 120.0$ seconds and timelapse is currently recording, it automatically stops. Temporary lighting (e.g. room lights briefly turned on or car headlights) under 120 seconds does not interrupt recording.
+  * **Auto Mode ("0") Night Vision Physical Detection via Frame Saturation:**
+    * On Tuya IPC cameras, `basic_nightvision` (DP 108) represents the configured mode (`"0"` = Auto, `"1"` = Off, `"2"` = On). In Auto mode (`"0"`), the camera hardware physically flips the IR-cut filter and activates the IR LEDs locally in darkness, but **DP 108 remains `"0"`** in telemetry.
+    * `detect_night_vision_from_jpeg()` inspects a 16x16 subsampled thumbnail of the camera frame (< 1.5ms computation). Daytime frames show strong color saturation ($|R-G| + |G-B| + |B-R| \gg 10.0$), whereas infrared night vision frames are monochrome grayscale where $R \approx G \approx B$ (mean diff $< 8.0$).
+    * In Auto mode, `is_night_vision_active()` checks frame saturation to accurately detect active IR night vision even when DP 108 is `"0"`.
+  * **Local DP Override Persistence:**
+    * In `MomcozyMonitor`, commands sent via `set_dp` / `set_dps` are cached in `_local_overrides` with timestamps (5-minute TTL). Stale cloud polling snapshots cannot clobber recently set local states.
+  * **Debounce Timing & Session Protection Logic:**
+    * **Activation Threshold (1 Minute = 60s):** When camera reports Night Vision active, a monotonic timer starts. If Night Vision remains continuously active for $\ge 60.0$ seconds and timelapse is not currently recording, it automatically starts/resumes. Transient darkness under 60 seconds is ignored.
+    * **Deactivation Threshold (2 Minutes = 120s):** When camera reports daylight / Night Vision inactive, an inactive monotonic timer starts. If daylight persists continuously for $\ge 120.0$ seconds and timelapse is recording, it stops *only if* the recording was auto-started or had night vision active. Manual daytime recordings are never killed by daylight.
+    * **Manual Stop Honor:** If the user manually stops recording during the night, auto-restart is suppressed for the remainder of that dark period until daylight resets it or the user clicks resume.
+  * **Manual Recording Resume vs. Erase:**
+    * `handle_timelapse_start` and `TimelapseRecorder.start()` default to `fresh=False`. When recording is stopped manually, previous slots are preserved. Starting again resumes and appends to the circular buffer.
+    * In the web UI, stopped recordings with existing footage display `[▶ Resume Recording]`.
+    * An explicit `[🗑️ Erase]` button (calling `POST /api/timelapse/clear`) allows users to wipe the recording buffer and reset counters to 0m 00s on demand.
   * **Session Continuity (Append vs. Restart):**
     * When auto-start triggers:
       * If `last_session_type == "auto"` (the previous timelapse was automatic), it calls `timelapse.start(fresh=False, session_type="auto")`. This appends the new night session directly into the circular buffer without clearing previous slots.

@@ -263,11 +263,7 @@ class TimelapseRecorder:
                     p.unlink()
                 except OSError:
                     pass
-            if self.meta_file.exists():
-                try:
-                    self.meta_file.unlink()
-                except OSError:
-                    pass
+        self._save_meta()
 
     def record_event(
         self,
@@ -300,12 +296,11 @@ class TimelapseRecorder:
         logger.info("Recorded timelapse %s event: '%s' at timestamp %.1f", event_type, label, ts)
         return True
 
-    async def start(self, fresh: bool = True, session_type: str = "manual") -> None:
+    async def start(self, fresh: bool = False, session_type: str = "manual") -> None:
         """Start recording the circular timelapse.
 
-        If fresh is True (default), starts a brand new recording session,
-        wiping any old slots and cache so the timelapse starts fresh.
-        If fresh is False, appends into the existing circular buffer.
+        If fresh is True, starts a brand new recording session, wiping any old slots and cache.
+        If fresh is False (default), resumes/appends into the existing circular buffer.
         """
         async with self._lock:
             if self._running:
@@ -405,17 +400,30 @@ class TimelapseRecorder:
         backoff = 1.0
 
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        target_frames_per_slot = int(self.slot_duration_sec / self.sample_interval_sec)
+
         # Open initial slot
         slot_p = self.slot_path(self._current_slot)
         slot_p.parent.mkdir(parents=True, exist_ok=True)
         # If continuing a recently modified slot, append, else truncate
         mode = "ab" if slot_p.exists() and str(self._current_slot) in self._slots_meta else "wb"
+        if mode == "ab":
+            meta = self._slots_meta.get(str(self._current_slot), {})
+            self._frames_in_slot = meta.get("frames", 0)
+            self._bytes_in_slot = meta.get("bytes", slot_p.stat().st_size if slot_p.exists() else 0)
+            prev_dur = float(meta.get("duration", 0.0))
+            self._slot_start_monotonic = time.monotonic() - prev_dur
+        else:
+            self._frames_in_slot = 0
+            self._bytes_in_slot = 0
+            self._slot_start_monotonic = time.monotonic()
+
         self._active_file = open(slot_p, mode)
-        self._slot_start_monotonic = time.monotonic()
         self._slot_start_wall = time.time()
         self._last_sample_monotonic = 0.0
 
-        target_frames_per_slot = int(self.slot_duration_sec / self.sample_interval_sec)
+        if self._frames_in_slot >= target_frames_per_slot:
+            self._rotate_slot()
 
         while self._running:
             try:

@@ -165,6 +165,7 @@ class MomcozyMonitor:
         self.cloud_dps_provider = cloud_dps_provider
         self.cloud_dp_publisher = cloud_dp_publisher
         self._cached_dps: Dict[str, Any] = dict(initial_dps) if initial_dps else {}
+        self._local_overrides: Dict[str, Tuple[float, Any]] = {}
         self._lan_tcp_unavailable: bool = False
         self._lan_status_unsupported: bool = False
         self._lock = threading.RLock()
@@ -438,12 +439,21 @@ class MomcozyMonitor:
             try:
                 cloud_dps = self.cloud_dps_provider()
                 if isinstance(cloud_dps, dict) and cloud_dps:
-                    dps = cloud_dps
+                    dps = dict(cloud_dps)
             except Exception as exc:
                 logger.debug("Cloud DPS provider fallback failed: %s", exc)
 
         if not dps and self._cached_dps:
-            dps = self._cached_dps
+            dps = dict(self._cached_dps)
+
+        # Apply recent local overrides (<=300s old) so stale cloud snapshots don't overwrite local changes
+        if self._local_overrides:
+            now = time.time()
+            for k, (ts, val) in list(self._local_overrides.items()):
+                if now - ts < 300.0:
+                    dps[k] = val
+                else:
+                    self._local_overrides.pop(k, None)
 
         if not dps:
             err = (data.get("Error") or data.get("Err")) if isinstance(data, dict) else None
@@ -467,6 +477,7 @@ class MomcozyMonitor:
         """Send a single DataPoint command to the camera."""
         dp_key = int(dp_id)
         logger.debug("Setting DP %s = %r", dp_key, value)
+        self._local_overrides[str(dp_key)] = (time.time(), value)
         last_error = None
 
         if self.ip and not self._lan_tcp_unavailable:
@@ -497,6 +508,9 @@ class MomcozyMonitor:
     def set_dps(self, dps_dict: Dict[int | DP | str, Any]) -> Dict[str, Any]:
         """Send multiple DataPoints in a single packet."""
         formatted = {str(int(k)): v for k, v in dps_dict.items()}
+        now = time.time()
+        for k, v in formatted.items():
+            self._local_overrides[k] = (now, v)
         last_error = None
 
         if self.ip and not self._lan_tcp_unavailable:
