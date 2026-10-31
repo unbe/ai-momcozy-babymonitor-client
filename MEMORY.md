@@ -44,8 +44,21 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * Up to 3 decoder errors or decode exceptions are recovered automatically by re-initializing the `VideoDecoder` and waiting for the next clean keyframe.
   * Successful frame rendering resets all retry and error counters.
 
-### 4. Snapshots & Rolling GOP Buffer
+### 4. Snapshots & Single Keyframe Extraction
 * Live snapshots burst-decode the in-memory rolling GOP (Group of Pictures) buffer using PyAV/OpenCV without interrupting or blocking pass-through HEVC consumers.
+* Single-keyframe extraction (`get_keyframe()`) resolves the next arriving or cached HEVC keyframe Access Unit with SPS/PPS prepended. This allows fast direct analysis (e.g., night vision thumbnail decoding) without holding or decoding the entire GOP.
+
+### 5. Lease-Based Stream Lifecycle & Monotonic Deadlines
+* **Problem:** Previously, stream lifetime relied on manual, ad-hoc cancellations and reschedulings of `_schedule_idle_stop` across multiple callers (WebSocket viewer connect/disconnect, timelapse start/stop, periodic night vision checks, snapshot requests). This led to race conditions where short-lived checks could either prematurely kill viewer lingering or postpone viewer disconnect deadlines.
+* **Lease Architecture (`VideoStreamer`):**
+  * Multiple components hold concurrent leases (`acquire(holder, linger=...)` and `release(holder, linger=...)` or `async with streamer.lease(...)`).
+  * While active leases exist, the camera P2P connection stays alive.
+  * When the last lease is released, `VideoStreamer` sets an idle shutdown deadline:
+    $$\text{deadline} = \max(\text{current\_deadline}, \text{now} + \text{linger})$$
+    This monotonic deadline guarantee ensures that a zero-linger release (such as an automatic 5-minute night vision check) never truncates an existing 300-second grace period from a disconnected user session.
+  * Re-acquiring a lease cancels any scheduled idle shutdown timer immediately.
+* **Keyframe-Aware Queue Resynchronization (`_hevc_resync`):**
+  * When a consumer's queue overflows under backpressure, `_hevc_resync` drops pending frames until the next valid keyframe (IDR slice with SPS/PPS) arrives, preventing decoder corruption in downstream clients.
 
 ### 5. Device Discovery & Dynamic IP Handling
 * **Local LAN Control:** Momcozy/Tuya Protocol 3.3 communicates directly with the camera over local TCP port 6668 for instant PTZ commands and sensor telemetry.
@@ -93,16 +106,22 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Interactive Scrubber Markers & Navigation:** In `/timelapse`, motion events appear as glowing amber notches on the timeline scrubber. Hovering over a marker shows the event label, wall-clock time, and video timestamp. Clicking any marker seeks directly to that moment. Next (`N`) and Previous (`P`) motion navigation buttons allow jumping between highlights. The main dashboard Timelapse card displays an active count badge (`🏃 N events`).
 * **Server-Side Night Vision Timelapse Automation (0% Client Overhead):**
   * **Completely Headless & Server-Side:** The automation runs entirely inside `WebServer._background_monitor_loop()` on the host/container. It operates autonomously without requiring any browser window, tab, or client socket to remain open.
+  * **Decoupled State Machine Architecture (`momcozy/nightvision.py`):**
+    * The debounce timing, suppression, and activation/deactivation logic is implemented as a pure, testable state machine `NightVisionAutomation`.
+    * It takes inputs `(now, is_dark, recording, session_auto)` and returns actions (`Action.NONE`, `Action.START_AUTO`, `Action.STOP_AUTO`, `Action.MARK_AUTO`). It has zero I/O or network dependencies, making testing instantaneous and deterministic without mocks.
+  * **Direct HEVC Keyframe Thumbnail Analysis (`analyze_hevc_keyframe`):**
+    * Decodes only the single incoming IDR HEVC keyframe directly into a 16x16 thumbnail using PyAV, completely bypassing GOP decoding and intermediate JPEG compression.
+    * Fallback functions (`analyze_night_vision_frame`, `detect_night_vision_from_jpeg`) remain available for JPEG inputs and backward compatibility.
   * **Idle Stream Disconnect & 5-Minute Periodic Detection Sampling:**
     * To conserve camera battery/heat, bandwidth, and CPU, the camera P2P stream is **NOT kept running 24/7** when idle.
     * When timelapse is not recording and no client viewers are connected, the stream disconnects.
-    * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), restarts the P2P stream via `VideoStreamer.get_clean_frame()`, captures a clean keyframe, and evaluates night vision status.
-    * If daylight is detected AND the stream was connected solely for this periodic check (`connected_for_nv_check == True`), the stream disconnects immediately (`await self.streamer.stop()`) without waiting for the 300s idle timeout to expire, remaining stopped until the next 5-minute check.
+    * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), acquires a zero-linger lease (`async with streamer.lease(linger=0)`), fetches a keyframe via `get_keyframe()`, and evaluates night vision status.
+    * If daylight is detected, the lease exits and the stream disconnects immediately without lingering, remaining stopped until the next 5-minute check.
     * If the stream was started by a viewer (or manual start), user disconnection triggers the standard 300s idle timer without being cut short by background night vision checks.
-    * While the stream is actively running, night vision is checked at a steady cadence (every 30s when idle/viewing, 15s during the 60s countdown or active recording) by decoding a keyframe from the rolling GOP buffer. Passive status queries (`/api/status`) do not alter or reset check timers.
-    * If night vision is detected, the stream stays running, the 60s activation debounce starts, and timelapse recording auto-starts after 60s of continuous darkness.
-    * While recording is active (or during the 60s activation window), `VideoStreamer.keepalive` keeps the stream running.
-    * When daylight persists for 120s, timelapse stops, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.
+    * While the stream is actively running, night vision is checked at a steady cadence (every 30s when idle/viewing, 15s during the 60s countdown or active recording) by decoding a keyframe. Passive status queries (`/api/status`) do not alter or reset check timers.
+    * If night vision is detected, the lease holds or re-acquires to keep the stream running, the 60s activation debounce starts, and timelapse recording auto-starts after 60s of continuous darkness.
+    * While recording is active (or during the 60s activation window), the timelapse recorder holds an active stream lease (`streamer.acquire("timelapse")`), keeping the stream running.
+    * When daylight persists for 120s, timelapse stops, releases its lease, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.
   * **Logging Conventions:**
     * Log messages must use clean, readable plain text without emojis or non-standard Unicode symbols.
   * **Auto Mode ("0") Night Vision Physical Detection via Frame Saturation:**

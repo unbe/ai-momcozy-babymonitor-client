@@ -12,7 +12,7 @@ import logging
 import struct
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Optional, Set
+from typing import Any, AsyncIterator, Callable, Iterator, Optional, Set
 
 import cv2
 import numpy as np
@@ -437,6 +437,19 @@ class MomcozyHevcHandler:
                     self._transcoding_active = False
 
 
+def _put_drop_oldest(queue: "asyncio.Queue[Any]", item: Any) -> None:
+    """Put item on a bounded queue, discarding the oldest entry when the queue is full."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        pass
+
+
 def _patch_tuya_stream_session() -> None:
     """Monkey-patch tuya_ipc_p2p_sdk to handle BM04 HEVC video and G.711 A-law audio."""
     from tuya_ipc_p2p_sdk.camera_stream import CameraStream
@@ -509,28 +522,13 @@ def _patch_tuya_stream_session() -> None:
 
     def momcozy_on_audio(self: Any, pcm: bytes) -> None:
         for subscriber in list(self._audio_subscribers):
-            if subscriber.full():
-                try:
-                    subscriber.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                subscriber.put_nowait(pcm)
-            except asyncio.QueueFull:
-                pass
+            _put_drop_oldest(subscriber, pcm)
 
     def momcozy_on_hevc(self: Any, chunk: bytes, is_key: bool) -> None:
+        # The SDK watchdog only counts transcoded JPEG frames; pass-through HEVC must feed it too.
         self._last_frame_at = time.monotonic()
         for subscriber in list(self._hevc_subscribers):
-            if subscriber.full():
-                try:
-                    subscriber.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                subscriber.put_nowait((chunk, is_key))
-            except asyncio.QueueFull:
-                pass
+            _put_drop_oldest(subscriber, (chunk, is_key))
 
     def momcozy_async_hevc(self: Any) -> Any:
         queue: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=30)
@@ -740,8 +738,23 @@ def create_p2p_client(
     return client
 
 
+class _Lease:
+    """Token for one user of the camera stream (see VideoStreamer.acquire)."""
+
+    __slots__ = ("linger",)
+
+    def __init__(self, linger: float) -> None:
+        self.linger = linger
+
+
 class VideoStreamer:
-    """Manages the video stream from Momcozy BM04."""
+    """Manages the video stream from Momcozy BM04.
+
+    Stream lifetime is lease based: every user of the stream (viewers, timelapse, the night
+    vision sampler) holds a lease. When the last lease is released the stream stays up for
+    that lease's `linger` seconds (never shorter than a linger already pending) and is then
+    disconnected. `idle_timeout <= 0` disables automatic disconnects entirely.
+    """
 
     def __init__(
         self,
@@ -778,16 +791,19 @@ class VideoStreamer:
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._hevc_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
+        self._hevc_resync: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._cached_vps: Optional[bytes] = None
         self._cached_sps: Optional[bytes] = None
         self._cached_pps: Optional[bytes] = None
         self._latest_hevc_keyframe: Optional[bytes] = None
+        self._keyframe_time: float = 0.0
         self._gop_chunks: list[bytes] = []
-        self._gop_time: float = 0.0
         self._snapshot_requests: Set[object] = set()
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self.keepalive_predicate: Optional[Callable[[], bool]] = None
+        self._leases: Set[_Lease] = set()
+        self._stop_deadline: float = 0.0
         self._lock = asyncio.Lock()
 
     @property
@@ -834,6 +850,16 @@ class VideoStreamer:
         else:
             self._snapshot_requests.discard(self)
 
+    @property
+    def keepalive(self) -> bool:
+        """Return True if background tasks or predicate require keeping the stream alive."""
+        if hasattr(self, "keepalive_predicate") and self.keepalive_predicate is not None:
+            try:
+                return bool(self.keepalive_predicate())
+            except Exception:
+                return False
+        return False
+
     def is_transcoding_needed(self) -> bool:
         """Return True only if an active listener or pending snapshot requires JPEG transcoding."""
         return len(self._listeners) > 0 or len(self._snapshot_requests) > 0
@@ -841,16 +867,6 @@ class VideoStreamer:
     def is_audio_needed(self) -> bool:
         """Return True only if an active listener is consuming audio."""
         return len(self._audio_listeners) > 0
-
-    @property
-    def keepalive(self) -> bool:
-        """Return True if background tasks require keeping the stream alive without connected clients."""
-        if self.keepalive_predicate is not None:
-            try:
-                return bool(self.keepalive_predicate())
-            except Exception:
-                return False
-        return False
 
     @property
     def last_error(self) -> Optional[str]:
@@ -923,18 +939,63 @@ class VideoStreamer:
             return "HEVC (Pass-through)"
         return "HEVC (Native)"
 
-    def _schedule_idle_stop(self) -> None:
-        if self.idle_timeout <= 0:
+    # ------------------------------------------------------------------
+    # Stream lifetime (leases + idle stop)
+    # ------------------------------------------------------------------
+
+    def acquire(self, linger: Optional[float] = None) -> _Lease:
+        """Register a user of the stream. `linger` defaults to the idle timeout."""
+        lease = _Lease(self.idle_timeout if linger is None else float(linger))
+        self._leases.add(lease)
+        self._cancel_idle_stop()
+        return lease
+
+    def release(self, lease: _Lease, linger: Optional[float] = None) -> None:
+        """Release a lease; the stream stops `linger` seconds after the last one is gone."""
+        if lease not in self._leases:
             return
+        self._leases.discard(lease)
+        if not self._leases and self._running:
+            self._schedule_idle_stop(lease.linger if linger is None else float(linger))
+
+    @contextlib.contextmanager
+    def lease(self, linger: Optional[float] = None) -> Iterator[_Lease]:
+        """Hold a lease for the duration of a `with` block."""
+        token = self.acquire(linger)
+        try:
+            yield token
+        finally:
+            self.release(token)
+
+    @contextlib.contextmanager
+    def _listening(self, listeners: Set[Any], queue: Any, kind: str, leased: bool = True) -> Iterator[None]:
+        """Register a subscriber queue (and, optionally, a lease) with join/leave logging."""
+        listeners.add(queue)
+        token = self.acquire() if leased else None
+        logger.info("Client subscribed to %s (active: %d, device: %s)", kind, len(listeners), self.device_id)
+        try:
+            yield
+        finally:
+            listeners.discard(queue)
+            self._hevc_resync.discard(queue)
+            logger.info("Client unsubscribed from %s (remaining: %d, device: %s)", kind, len(listeners), self.device_id)
+            if token is not None:
+                self.release(token)
+
+    def _schedule_idle_stop(self, linger: Optional[float] = None) -> None:
+        """Arm the idle-stop timer unless leases are held or idle stop is disabled.
+
+        The stop deadline only ever moves forward, so a short linger (e.g. a night vision
+        check) can never cut short a longer one already pending (e.g. a departed viewer).
+        """
+        if self.idle_timeout <= 0 or self._leases or self.keepalive:
+            return
+        delay = self.idle_timeout if linger is None else linger
+        self._stop_deadline = max(self._stop_deadline, time.monotonic() + delay)
         if self._idle_task and not self._idle_task.done():
             return
-        if self.total_listener_count > 0:
-            return
-        if self.keepalive:
-            return
         try:
-            loop = asyncio.get_running_loop()
-            self._idle_task = loop.create_task(self._idle_stop_timer())
+            self._idle_task = asyncio.get_running_loop().create_task(self._idle_stop_timer())
         except RuntimeError:
             pass
 
@@ -950,23 +1011,17 @@ class VideoStreamer:
 
     async def _idle_stop_timer(self) -> None:
         try:
-            logger.info(
-                "No stream clients connected. Starting idle timer (%ds) before disconnecting cloud stream.",
-                int(self.idle_timeout),
-            )
-            await asyncio.sleep(self.idle_timeout)
-            if (
-                not self._listeners
-                and not self._audio_listeners
-                and not self._hevc_listeners
-                and self._running
-                and not self.keepalive
-            ):
+            remaining = self._stop_deadline - time.monotonic()
+            if remaining > 0.5:
                 logger.info(
-                    "No stream clients connected for %d minutes (%ds). Disconnecting cloud video stream to conserve resources.",
-                    int(self.idle_timeout // 60),
-                    int(self.idle_timeout),
+                    "No stream clients connected. Starting idle timer (%ds) before disconnecting cloud stream.",
+                    int(remaining),
                 )
+            while remaining > 0:
+                await asyncio.sleep(remaining)
+                remaining = self._stop_deadline - time.monotonic()
+            if self._running and not self._leases and not self.keepalive:
+                logger.info("No stream clients remaining. Disconnecting cloud video stream to conserve resources.")
                 await self.stop()
         except asyncio.CancelledError:
             pass
@@ -977,10 +1032,10 @@ class VideoStreamer:
             if self._running:
                 return
             self._running = True
+            self._stop_deadline = 0.0
             self._stream_task = asyncio.create_task(self._stream_loop())
             logger.info("Video streamer started for device %s", self.device_id)
-        if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self.idle_timeout > 0:
-            self._schedule_idle_stop()
+        self._schedule_idle_stop()
 
     async def stop(self) -> None:
         """Stop background streaming task."""
@@ -988,10 +1043,7 @@ class VideoStreamer:
         async with self._lock:
             self._running = False
             self._connected = False
-            self._latest_frame = None
-            self._latest_hevc_keyframe = None
-            self._gop_chunks = []
-            self._gop_time = 0.0
+            self._reset_media_buffers()
             if self._stream_task:
                 self._stream_task.cancel()
                 try:
@@ -1000,6 +1052,38 @@ class VideoStreamer:
                     pass
                 self._stream_task = None
             logger.info("Video streamer stopped")
+
+    def _reset_media_buffers(self) -> None:
+        """Drop cached frames/keyframes so nothing stale outlives a P2P session."""
+        self._latest_frame = None
+        self._latest_hevc_keyframe = None
+        self._keyframe_time = 0.0
+        self._gop_chunks = []
+
+    def _broadcast_hevc(self, chunk: bytes, is_key: bool) -> None:
+        """Fan out an HEVC chunk to pass-through listeners.
+
+        A listener whose queue overflows is flushed and resumed at the next keyframe, so it
+        never receives delta frames whose reference frames were dropped.
+        """
+        for q in list(self._hevc_listeners):
+            if q in self._hevc_resync:
+                if not is_key:
+                    continue
+                self._hevc_resync.discard(q)
+            if q.full():
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                if not is_key:
+                    self._hevc_resync.add(q)
+                    continue
+            try:
+                q.put_nowait((chunk, is_key))
+            except asyncio.QueueFull:
+                pass
 
     async def _stream_loop(self) -> None:
         """Internal loop fetching frames from the camera P2P stream."""
@@ -1056,18 +1140,8 @@ class VideoStreamer:
                             async for pcm in stream.async_audio():
                                 if not self._running:
                                     break
-                                if not self._audio_listeners:
-                                    continue
                                 for q in list(self._audio_listeners):
-                                    if q.full():
-                                        try:
-                                            q.get_nowait()
-                                        except asyncio.QueueEmpty:
-                                            pass
-                                    try:
-                                        q.put_nowait(pcm)
-                                    except asyncio.QueueFull:
-                                        pass
+                                    _put_drop_oldest(q, pcm)
                         except asyncio.CancelledError:
                             pass
                         except Exception as exc:
@@ -1084,18 +1158,8 @@ class VideoStreamer:
                                 self._latest_frame_time = time.monotonic()
                                 if not self._latest_detection_snapshot:
                                     self.capture_detection_snapshot(trigger="Session Baseline Snapshot")
-                                if not self._listeners:
-                                    continue
                                 for q in list(self._listeners):
-                                    if q.full():
-                                        try:
-                                            q.get_nowait()
-                                        except asyncio.QueueEmpty:
-                                            pass
-                                    try:
-                                        q.put_nowait(jpeg_frame)
-                                    except asyncio.QueueFull:
-                                        pass
+                                    _put_drop_oldest(q, jpeg_frame)
                         except asyncio.CancelledError:
                             pass
                         except Exception as exc:
@@ -1152,29 +1216,16 @@ class VideoStreamer:
 
                             if is_key:
                                 self._latest_hevc_keyframe = chunk
+                                self._keyframe_time = time.monotonic()
                                 self._gop_chunks = [chunk]
-                                self._gop_time = time.monotonic()
-                            else:
-                                if self._gop_chunks:
-                                    if len(self._gop_chunks) < 150:
-                                        self._gop_chunks.append(chunk)
-                                        self._gop_time = time.monotonic()
-                                elif self._latest_hevc_keyframe:
-                                    self._gop_chunks = [self._latest_hevc_keyframe, chunk]
-                                    self._gop_time = time.monotonic()
+                            elif self._gop_chunks and len(self._gop_chunks) < 150:
+                                self._gop_chunks.append(chunk)
 
-                            for q in list(self._hevc_listeners):
-                                if q.full():
-                                    try:
-                                        q.get_nowait()
-                                    except asyncio.QueueEmpty:
-                                        pass
-                                try:
-                                    q.put_nowait((chunk, is_key))
-                                except asyncio.QueueFull:
-                                    pass
+                            self._broadcast_hevc(chunk, is_key)
                     finally:
                         self._connected = False
+                        # A reconnect starts a new GOP: never serve keyframes from the dead session.
+                        self._reset_media_buffers()
                         audio_task.cancel()
                         jpeg_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -1195,82 +1246,41 @@ class VideoStreamer:
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=10)
         if self._latest_frame and self._connected:
             queue.put_nowait(self._latest_frame)
-        self._listeners.add(queue)
-        self._cancel_idle_stop()
-        logger.info(
-            "Client subscribed to live stream (active viewers: %d, device: %s)",
-            len(self._listeners),
-            self.device_id,
-        )
-        try:
+        with self._listening(self._listeners, queue, "live stream"):
             while self._running:
                 try:
-                    frame = await asyncio.wait_for(queue.get(), timeout=25.0)
-                    yield frame
+                    yield await asyncio.wait_for(queue.get(), timeout=25.0)
                 except TimeoutError:
-                    if not self._running:
-                        break
                     continue
-        finally:
-            self._listeners.discard(queue)
-            logger.info(
-                "Client unsubscribed from live stream (remaining viewers: %d, device: %s)",
-                len(self._listeners),
-                self.device_id,
-            )
-            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
-                self._schedule_idle_stop()
 
     async def subscribe_audio(self, format: str = "mp3") -> AsyncIterator[bytes]:
         """Subscribe to live audio stream from the camera microphone."""
         queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=150)
-        self._audio_listeners.add(queue)
-        self._cancel_idle_stop()
-        logger.info(
-            "Client subscribed to live audio stream (active listeners: %d, format: %s, device: %s)",
-            len(self._audio_listeners),
-            format,
-            self.device_id,
-        )
         encoder = StreamingMp3Encoder(sample_rate=8000, bit_rate=32000) if format == "mp3" else None
-        try:
+        with self._listening(self._audio_listeners, queue, f"live audio stream ({format})"):
             if format == "wav":
                 yield make_wav_header(sample_rate=8000, channels=1, bits_per_sample=16)
 
             while self._running:
                 try:
                     pcm_chunk = await asyncio.wait_for(queue.get(), timeout=25.0)
-                    if format == "mp3" and encoder:
-                        mp3_bytes = encoder.encode(pcm_chunk)
-                        if mp3_bytes:
-                            yield mp3_bytes
-                    else:
-                        yield pcm_chunk
                 except TimeoutError:
-                    if not self._running:
-                        break
                     continue
-        finally:
-            self._audio_listeners.discard(queue)
-            logger.info(
-                "Client unsubscribed from live audio stream (remaining listeners: %d, device: %s)",
-                len(self._audio_listeners),
-                self.device_id,
-            )
-            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
-                self._schedule_idle_stop()
+                if encoder:
+                    mp3_bytes = encoder.encode(pcm_chunk)
+                    if mp3_bytes:
+                        yield mp3_bytes
+                else:
+                    yield pcm_chunk
 
-    async def subscribe_hevc(self) -> AsyncIterator[tuple[bytes, bool]]:
-        """Subscribe to raw HEVC Annex B chunks (chunk_bytes, is_key)."""
+    async def subscribe_hevc(self, leased: bool = True) -> AsyncIterator[tuple[bytes, bool]]:
+        """Subscribe to raw HEVC Annex B chunks (chunk_bytes, is_key).
+
+        With leased=False the subscription does not keep the stream alive by itself; use it
+        for consumers that already hold their own lease (e.g. the timelapse recorder).
+        """
         queue: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=30)
-        self._hevc_listeners.add(queue)
-        self._cancel_idle_stop()
-        logger.info(
-            "Client subscribed to raw HEVC pass-through stream (active viewers: %d, device: %s)",
-            len(self._hevc_listeners),
-            self.device_id,
-        )
-        try:
+        with self._listening(self._hevc_listeners, queue, "raw HEVC pass-through stream", leased):
             if self._latest_hevc_keyframe and self._connected:
                 yield self._latest_hevc_keyframe, True
 
@@ -1278,144 +1288,83 @@ class VideoStreamer:
             while self._running:
                 try:
                     chunk, is_key = await asyncio.wait_for(queue.get(), timeout=25.0)
-                    if not started:
-                        if not is_key:
-                            continue
-                        started = True
-                    yield chunk, is_key
                 except TimeoutError:
-                    if not self._running:
-                        break
                     continue
-        finally:
-            self._hevc_listeners.discard(queue)
-            logger.info(
-                "Client unsubscribed from raw HEVC stream (remaining viewers: %d, device: %s)",
-                len(self._hevc_listeners),
-                self.device_id,
-            )
-            if not self._listeners and not self._audio_listeners and not self._hevc_listeners and self._running and self.idle_timeout > 0:
-                self._schedule_idle_stop()
+                if not started:
+                    if not is_key:
+                        continue
+                    started = True
+                yield chunk, is_key
 
-    async def get_snapshot(self, timeout_seconds: float = 10.0, max_age: float = 0.5) -> bytes:
-        """Capture a single fresh frame as JPEG using the rolling GOP buffer."""
-        if not self._running:
-            await self.start()
-        elif not self._listeners and not self._hevc_listeners and self.idle_timeout > 0:
-            self._cancel_idle_stop()
-            self._schedule_idle_stop()
+    # ------------------------------------------------------------------
+    # One-shot captures
+    # ------------------------------------------------------------------
 
-        # 1. If a live frame was decoded very recently (< max_age seconds ago), it is fresh:
-        if self._latest_frame and (time.monotonic() - self._latest_frame_time) < max_age:
-            return self._latest_frame
+    async def get_keyframe(self, timeout_seconds: float = 25.0, max_age: float = 0.0) -> bytes:
+        """Return an Annex B keyframe (VPS/SPS/PPS + IDR) received at most `max_age` seconds ago.
 
-        # 2. If a rolling GOP buffer is available, burst-decode it to JPEG on demand:
-        if self._gop_chunks:
-            gop_copy = list(self._gop_chunks)
-            loop = asyncio.get_running_loop()
-            jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, gop_copy)
-            if jpeg_bytes:
-                self._latest_frame = jpeg_bytes
-                self._latest_frame_time = time.monotonic()
-                if not self._latest_detection_snapshot:
-                    self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
-                return jpeg_bytes
-
-        # 3. Otherwise wait for GOP chunks (or decoded frame) to become available:
-        req_id = object()
-        self._snapshot_requests.add(req_id)
-        start_time = time.monotonic()
-        try:
-            while time.monotonic() - start_time < timeout_seconds:
-                # Check if a fresh frame arrived:
-                if self._latest_frame and self._latest_frame_time >= start_time:
-                    return self._latest_frame
-                # Check if GOP buffer has been populated since request started:
-                if self._gop_chunks:
-                    gop_copy = list(self._gop_chunks)
-                    loop = asyncio.get_running_loop()
-                    jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, gop_copy)
-                    if jpeg_bytes:
-                        self._latest_frame = jpeg_bytes
-                        self._latest_frame_time = time.monotonic()
-                        if not self._latest_detection_snapshot:
-                            self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
-                        return jpeg_bytes
-                if self._last_error and time.monotonic() - start_time > 3.0:
-                    raise RuntimeError(f"Camera stream error: {self._last_error}")
-                await asyncio.sleep(0.03)
-
-            # Fallback to latest available frame if fresh frame timed out
-            if self._latest_frame:
-                logger.warning("Timed out waiting for fresh frame; returning latest available frame")
-                return self._latest_frame
-
-            err_suffix = f": {self._last_error}" if self._last_error else ""
-            raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
-        finally:
-            self._snapshot_requests.discard(req_id)
-
-    async def get_clean_frame(self, timeout_seconds: float = 25.0) -> bytes:
-        """Capture a clean, newly decoded JPEG frame from the camera.
-
-        If the stream is not running, starts the stream and waits for the first valid keyframe/JPEG.
-        Ensures the frame is a valid image received after the request started.
+        Starts the stream if needed. Cheap compared with get_snapshot(): nothing is decoded
+        here. Callers that want the stream to disconnect right after should hold a
+        `lease(linger=0)` around the call.
         """
         if not self._running:
             await self.start()
-        elif not self._listeners and not self._hevc_listeners and self.idle_timeout > 0:
-            self._cancel_idle_stop()
-
         start_time = time.monotonic()
-        req_id = object()
-        self._snapshot_requests.add(req_id)
+        while True:
+            now = time.monotonic()
+            if self._latest_hevc_keyframe and self._keyframe_time >= start_time - max_age:
+                return self._latest_hevc_keyframe
+            if now - start_time >= timeout_seconds:
+                break
+            if self._last_error and now - start_time > 5.0:
+                raise RuntimeError(f"Camera stream error: {self._last_error}")
+            await asyncio.sleep(0.05)
+        err_suffix = f": {self._last_error}" if self._last_error else ""
+        raise TimeoutError(f"Timed out waiting for keyframe from camera{err_suffix}")
 
-        try:
-            # If an existing decoded frame is very fresh (< 1.5s old), return it immediately
-            if (
-                self._latest_frame
-                and (time.monotonic() - self._latest_frame_time) < 1.5
-                and len(self._latest_frame) > 0
-            ):
+    async def get_snapshot(self, timeout_seconds: float = 10.0, max_age: float = 0.5) -> bytes:
+        """Capture a single JPEG: a recent live frame, else a burst-decode of the rolling GOP."""
+        with self.lease():
+            if not self._running:
+                await self.start()
+
+            if self._latest_frame and (time.monotonic() - self._latest_frame_time) < max_age:
                 return self._latest_frame
 
-            # Otherwise wait for a frame received after start_time
-            while time.monotonic() - start_time < timeout_seconds:
-                if self._latest_frame and self._latest_frame_time >= start_time:
-                    if len(self._latest_frame) > 0:
+            req_id = object()
+            self._snapshot_requests.add(req_id)
+            start_time = time.monotonic()
+            try:
+                loop = asyncio.get_running_loop()
+                while time.monotonic() - start_time < timeout_seconds:
+                    # A frame decoded by the live transcoder since the request started:
+                    if self._latest_frame and self._latest_frame_time >= start_time:
                         return self._latest_frame
+                    # Otherwise decode the GOP buffered so far:
+                    if self._gop_chunks:
+                        jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, list(self._gop_chunks))
+                        if jpeg_bytes:
+                            self._latest_frame = jpeg_bytes
+                            self._latest_frame_time = time.monotonic()
+                            if not self._latest_detection_snapshot:
+                                self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
+                            return jpeg_bytes
+                    if self._last_error and time.monotonic() - start_time > 3.0:
+                        raise RuntimeError(f"Camera stream error: {self._last_error}")
+                    await asyncio.sleep(0.03)
 
-                if self._gop_chunks and self._gop_time >= start_time:
-                    gop_copy = list(self._gop_chunks)
-                    loop = asyncio.get_running_loop()
-                    jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, gop_copy)
-                    if jpeg_bytes and len(jpeg_bytes) > 0:
-                        self._latest_frame = jpeg_bytes
-                        self._latest_frame_time = time.monotonic()
-                        if not self._latest_detection_snapshot:
-                            self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
-                        return jpeg_bytes
+                if self._latest_frame:
+                    logger.warning("Timed out waiting for fresh frame; returning latest available frame")
+                    return self._latest_frame
 
-                if self._last_error and time.monotonic() - start_time > 5.0:
-                    raise RuntimeError(f"Camera stream error: {self._last_error}")
+                err_suffix = f": {self._last_error}" if self._last_error else ""
+                raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
+            finally:
+                self._snapshot_requests.discard(req_id)
 
-                await asyncio.sleep(0.05)
-
-            if self._latest_frame and len(self._latest_frame) > 0:
-                logger.warning("Timed out waiting for new clean frame; returning latest available frame")
-                return self._latest_frame
-
-            err_suffix = f": {self._last_error}" if self._last_error else ""
-            raise TimeoutError(f"Timed out waiting for clean video frame from camera{err_suffix}")
-        finally:
-            self._snapshot_requests.discard(req_id)
-            if (
-                not self._listeners
-                and not self._audio_listeners
-                and not self._hevc_listeners
-                and self.idle_timeout > 0
-            ):
-                self._schedule_idle_stop()
+    async def get_clean_frame(self, timeout_seconds: float = 25.0) -> bytes:
+        """Capture a clean, newly decoded JPEG frame from the camera."""
+        return await self.get_snapshot(timeout_seconds=timeout_seconds, max_age=0.0)
 
     async def record_clip(
         self,

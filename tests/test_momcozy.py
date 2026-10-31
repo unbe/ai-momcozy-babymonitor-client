@@ -2593,6 +2593,107 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mock_streamer.is_running)
 
 
+class TestNightVisionAutomationStateMachine(unittest.TestCase):
+    """Unit tests for the pure NightVisionAutomation state machine."""
+
+    def test_darkness_activation_and_countdown(self):
+        from momcozy.nightvision import NightVisionAutomation, Action, SyncState
+
+        nv = NightVisionAutomation()
+        now = 1000.0
+
+        # Daylight: no action
+        act = nv.step(now, is_dark=False, recording=False, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+        state, rem = nv.sync_state(now, recording=False, session_auto=False)
+        self.assertEqual(state, SyncState.IDLE)
+        self.assertIsNone(rem)
+
+        # Dark: starts countdown
+        act = nv.step(now, is_dark=True, recording=False, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+        self.assertTrue(nv.activating)
+        state, rem = nv.sync_state(now, recording=False, session_auto=False)
+        self.assertEqual(state, SyncState.ACTIVATING)
+        self.assertAlmostEqual(rem, 60.0, places=1)
+
+        # 30s elapsed: still activating
+        act = nv.step(now + 30.0, is_dark=True, recording=False, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+        state, rem = nv.sync_state(now + 30.0, recording=False, session_auto=False)
+        self.assertEqual(state, SyncState.ACTIVATING)
+        self.assertAlmostEqual(rem, 30.0, places=1)
+
+        # 60s elapsed: triggers START_AUTO
+        act = nv.step(now + 60.1, is_dark=True, recording=False, session_auto=False)
+        self.assertEqual(act, Action.START_AUTO)
+
+    def test_daylight_deactivation_and_countdown(self):
+        from momcozy.nightvision import NightVisionAutomation, Action, SyncState
+
+        nv = NightVisionAutomation()
+        now = 1000.0
+
+        # Start auto recording
+        act = nv.step(now, is_dark=True, recording=True, session_auto=True)
+        self.assertEqual(act, Action.MARK_AUTO)
+        state, _ = nv.sync_state(now, recording=True, session_auto=True)
+        self.assertEqual(state, SyncState.RECORDING)
+
+        # Daylight arrives
+        act = nv.step(now + 10.0, is_dark=False, recording=True, session_auto=True)
+        self.assertEqual(act, Action.NONE)
+        state, rem = nv.sync_state(now + 10.0, recording=True, session_auto=True)
+        self.assertEqual(state, SyncState.STOPPING)
+        self.assertAlmostEqual(rem, 120.0, places=1)
+
+        # 60s of daylight: still stopping
+        act = nv.step(now + 70.0, is_dark=False, recording=True, session_auto=True)
+        self.assertEqual(act, Action.NONE)
+        state, rem = nv.sync_state(now + 70.0, recording=True, session_auto=True)
+        self.assertEqual(state, SyncState.STOPPING)
+        self.assertAlmostEqual(rem, 60.0, places=1)
+
+        # 120s of daylight: triggers STOP_AUTO
+        act = nv.step(now + 130.1, is_dark=False, recording=True, session_auto=True)
+        self.assertEqual(act, Action.STOP_AUTO)
+
+    def test_manual_daytime_recording_not_stopped_by_daylight(self):
+        from momcozy.nightvision import NightVisionAutomation, Action
+
+        nv = NightVisionAutomation()
+        now = 1000.0
+
+        # Manual recording started during daylight, no night observed
+        act = nv.step(now, is_dark=False, recording=True, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+        act = nv.step(now + 300.0, is_dark=False, recording=True, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+
+    def test_manual_stop_suppression(self):
+        from momcozy.nightvision import NightVisionAutomation, Action
+
+        nv = NightVisionAutomation()
+        now = 1000.0
+
+        # User manually stops recording during the night
+        nv.on_manual_stop()
+
+        # Dark stays on: should NOT trigger countdown while suppressed
+        act = nv.step(now, is_dark=True, recording=False, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+        self.assertFalse(nv.activating)
+
+        # Daylight arrives: resets suppression
+        act = nv.step(now + 50.0, is_dark=False, recording=False, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+
+        # Darkness arrives again: now countdown starts!
+        act = nv.step(now + 60.0, is_dark=True, recording=False, session_auto=False)
+        self.assertEqual(act, Action.NONE)
+        self.assertTrue(nv.activating)
+
+
 if __name__ == "__main__":
     unittest.main()
 

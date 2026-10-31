@@ -29,6 +29,14 @@ from aiohttp import web
 from .constants import DP, LULLABY_TRACKS, NightVisionMode, PtzDirection
 from .device import MomcozyMonitor
 from .hls import HlsTranscoder
+from .nightvision import (
+    Action,
+    NightVisionAutomation,
+    SyncState,
+    analyze_hevc_keyframe,
+    analyze_night_vision_frame,
+    detect_night_vision_from_jpeg,
+)
 from .stream import VideoStreamer
 from .timelapse import TimelapseRecorder
 
@@ -2407,43 +2415,6 @@ def create_ssl_context(certfile: Optional[str] = None, keyfile: Optional[str] = 
     return ctx
 
 
-def analyze_night_vision_frame(frame_bytes: bytes, threshold: float = 8.0) -> tuple[bool, float]:
-    """Analyze whether a JPEG frame is infrared monochrome (Night Vision active).
-
-    Infrared night vision frames are grayscale, where R, G, B channels are virtually identical.
-    Daytime frames have high color saturation where |R-G| + |G-B| + |B-R| is high.
-    Subsamples to a 16x16 thumbnail for ultra-fast, cheap computation (<1.5ms).
-    Returns (is_night_vision, mean_color_diff).
-    """
-    if not frame_bytes or not isinstance(frame_bytes, (bytes, bytearray)):
-        return False, 999.0
-    try:
-        from PIL import Image
-        import io
-
-        img = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
-        img = img.resize((16, 16), Image.Resampling.BOX)
-        raw = img.tobytes()
-        n = len(raw) // 3
-        if n == 0:
-            return False, 999.0
-        total_diff = sum(
-            abs(raw[i] - raw[i + 1]) + abs(raw[i + 1] - raw[i + 2]) + abs(raw[i + 2] - raw[i])
-            for i in range(0, len(raw), 3)
-        )
-        mean_diff = total_diff / n
-        return (mean_diff < threshold), mean_diff
-    except Exception as exc:
-        logger.debug("analyze_night_vision_frame error: %s", exc)
-        return False, 999.0
-
-
-def detect_night_vision_from_jpeg(frame_bytes: bytes, threshold: float = 8.0) -> bool:
-    """Detect whether a JPEG frame is infrared monochrome (Night Vision active)."""
-    is_nv, _ = analyze_night_vision_frame(frame_bytes, threshold)
-    return is_nv
-
-
 class WebServer:
     """Embedded aiohttp server hosting the BM04 web dashboard and MJPEG stream."""
 
@@ -2472,19 +2443,23 @@ class WebServer:
         if self.streamer:
             self.streamer.keepalive_predicate = lambda: bool(
                 (self.timelapse and self.timelapse.is_recording)
-                or (self._nv_active_start is not None)
+                or self.nv.activating
             )
         self._cached_status: Optional[Any] = None
         self._cached_status_time: float = 0.0
-        self._nv_active_start: Optional[float] = None
-        self._nv_inactive_start: Optional[float] = None
-        self._last_detected_nv: bool = False
-        self._last_nv_frame_check: float = 0.0
-        self._last_nv_poll_time: float = 0.0
-        self._nv_session_was_active: bool = False
-        self._nv_manual_stopped: bool = False
+        self.nv = NightVisionAutomation()
+        self._nv_lease: Optional[Any] = None  # stream lease held during the darkness countdown
+        self._last_nv_check: float = float("-inf")
         self.app = web.Application()
         self._setup_routes()
+
+    @property
+    def _nv_active_start(self) -> Optional[float]:
+        return self.nv._dark_since
+
+    @property
+    def _nv_inactive_start(self) -> Optional[float]:
+        return self.nv._light_since
 
     def _setup_routes(self) -> None:
         self.app.router.add_get("/", self.handle_index)
@@ -2808,58 +2783,27 @@ class WebServer:
             },
         )
 
-    def is_night_vision_active(self, status: Optional[Any], frame_bytes: Optional[bytes] = None) -> bool:
-        """Check whether automatic Night Vision is currently engaged on the monitor.
+    @staticmethod
+    def _is_auto_night_mode(status: Any) -> bool:
+        """True when the camera is in Auto night mode (DP 108 == "0").
 
-        Only operates when camera is in Automatic night mode (DP 108 == '0').
-        Does not react to manually forced night vision (DP 108 == '1' or '2').
-        Detects automatic night vision kicking in/out via video frame analysis.
+        Only Auto mode is automated; manually forced modes ("1"/"2") are ignored. In Auto mode
+        the DP stays "0" even when the camera switches to infrared, so darkness is detected
+        from the video (see momcozy.nightvision).
         """
         if not status:
             return False
-
-        nv = getattr(status, "night_vision", "0")
         raw = getattr(status, "raw_dps", {}) or {}
-        dp_108 = str(raw.get("108", nv)).strip()
+        return str(raw.get("108", getattr(status, "night_vision", "0"))).strip() == "0"
 
-        # Only work with Auto mode ("0"). If manually set to 1 or 2, ignore/inactive.
-        if dp_108 != "0":
+    def is_night_vision_active(self, status: Optional[Any], frame_bytes: Optional[bytes] = None) -> bool:
+        """Check whether automatic Night Vision is currently active."""
+        if not self._is_auto_night_mode(status):
             return False
-
-        # In Auto mode ("0"), detect physical infrared night vision via frame analysis:
-        target_frame = frame_bytes
-        if target_frame is None and self.streamer:
-            try:
-                frame_val = getattr(self.streamer, "latest_frame", None)
-                if callable(frame_val):
-                    frame_val = frame_val()
-                target_frame = frame_val
-            except Exception:
-                target_frame = None
-
-        if target_frame and isinstance(target_frame, (bytes, bytearray)):
-            now_mono = time.monotonic()
-            if frame_bytes is not None:
-                new_nv, diff = analyze_night_vision_frame(target_frame)
-                logger.info(
-                    "Night vision check result: %s (color saturation diff: %.1f, threshold: 8.0)",
-                    "ACTIVE (infrared monochrome)" if new_nv else "INACTIVE (daylight color)",
-                    diff,
-                )
-                if new_nv != self._last_detected_nv:
-                    if new_nv:
-                        logger.info("Automatic Night Vision kick-in detected (camera frame transitioned to infrared monochrome, diff=%.1f).", diff)
-                    else:
-                        logger.info("Automatic Night Vision kick-out detected (camera frame transitioned to daylight color, diff=%.1f).", diff)
-                self._last_detected_nv = new_nv
-                self._last_nv_frame_check = now_mono
-            elif (now_mono - self._last_nv_frame_check) >= 5.0 and self._last_nv_frame_check == 0.0:
-                new_nv, diff = analyze_night_vision_frame(target_frame)
-                self._last_detected_nv = new_nv
-                self._last_nv_frame_check = now_mono
-            return self._last_detected_nv
-
-        return self._last_detected_nv
+        if frame_bytes is not None:
+            is_nv, _ = analyze_night_vision_frame(frame_bytes)
+            return is_nv
+        return self.nv.is_dark
 
     def _get_timelapse_status(self) -> Dict[str, Any]:
         """Return enriched timelapse status including night vision sync state and countdowns."""
@@ -2892,29 +2836,16 @@ class WebServer:
 
         status_dict = self.timelapse.get_status()
         now_mono = time.monotonic()
-        is_nv = self.is_night_vision_active(self._cached_status) if self._cached_status else self._last_detected_nv
+        is_nv = self.nv.is_dark and (self._cached_status is None or self._is_auto_night_mode(self._cached_status))
 
-        sync_state = "disabled"
-        timer_remaining: Optional[float] = None
+        sync_state, timer_remaining = SyncState.DISABLED, None
         if self.timelapse.sync_night_vision:
-            if self.timelapse.is_recording:
-                if (
-                    self._nv_inactive_start is not None
-                    and (self.timelapse.current_session_type == "auto" or self._nv_session_was_active)
-                ):
-                    sync_state = "stopping"
-                    timer_remaining = max(0.0, 120.0 - (now_mono - self._nv_inactive_start))
-                else:
-                    sync_state = "recording"
-            else:
-                if self._nv_active_start is not None and not self._nv_manual_stopped:
-                    sync_state = "activating"
-                    timer_remaining = max(0.0, 60.0 - (now_mono - self._nv_active_start))
-                else:
-                    sync_state = "idle"
+            sync_state, timer_remaining = self.nv.sync_state(
+                now_mono, self.timelapse.is_recording, self.timelapse.current_session_type == "auto"
+            )
 
         status_dict["night_vision_active"] = is_nv
-        status_dict["sync_state"] = sync_state
+        status_dict["sync_state"] = sync_state.value
         status_dict["sync_timer_remaining"] = round(timer_remaining, 1) if timer_remaining is not None else None
         return status_dict
 
@@ -3150,9 +3081,7 @@ class WebServer:
                 enabled = data.get("enabled")
                 if enabled is None:
                     enabled = not self.timelapse.sync_night_vision
-                self.timelapse.set_sync_night_vision(bool(enabled))
-                self._nv_active_start = None
-                self._nv_inactive_start = None
+                self._set_night_vision_sync(bool(enabled))
                 return web.json_response({
                     "status": "ok",
                     "sync_night_vision": self.timelapse.sync_night_vision,
@@ -3163,10 +3092,8 @@ class WebServer:
                     return web.json_response({"status": "error", "error": "Timelapse recorder not available"}, status=503)
                 if self.timelapse.is_recording:
                     await self.timelapse.stop()
-                self._nv_manual_stopped = False
-                self._nv_active_start = None
-                self._nv_inactive_start = None
-                self._nv_session_was_active = False
+                self.nv.clear()
+                self._sync_countdown_lease()
                 self.timelapse.clear()
                 return web.json_response({
                     "status": "ok",
@@ -3199,7 +3126,7 @@ class WebServer:
                         fresh = bool(data["fresh"])
                 except Exception:
                     pass
-            self._nv_manual_stopped = False
+            self.nv.on_manual_start()
             await self.timelapse.start(fresh=fresh, session_type="manual")
             return web.json_response({"success": True, "timelapse": self._get_timelapse_status()})
         except Exception as exc:
@@ -3214,11 +3141,9 @@ class WebServer:
                 status=503,
             )
         try:
-            self._nv_manual_stopped = True
-            self._nv_active_start = None
-            self._nv_inactive_start = None
-            self._nv_session_was_active = False
+            self.nv.on_manual_stop()
             await self.timelapse.stop()
+            self._sync_countdown_lease()
             return web.json_response({"success": True, "timelapse": self._get_timelapse_status()})
         except Exception as exc:
             logger.error("Error stopping timelapse: %s", exc)
@@ -3234,10 +3159,8 @@ class WebServer:
         try:
             if self.timelapse.is_recording:
                 await self.timelapse.stop()
-            self._nv_manual_stopped = False
-            self._nv_active_start = None
-            self._nv_inactive_start = None
-            self._nv_session_was_active = False
+            self.nv.clear()
+            self._sync_countdown_lease()
             self.timelapse.clear()
             logger.info("Timelapse footage erased by user request.")
             return web.json_response({"success": True, "timelapse": self._get_timelapse_status()})
@@ -3275,16 +3198,7 @@ class WebServer:
         else:
             enabled = not self.timelapse.sync_night_vision
 
-        self.timelapse.set_sync_night_vision(enabled)
-        self._nv_active_start = None
-        self._nv_inactive_start = None
-        if self.streamer:
-            if enabled:
-                self._last_nv_poll_time = 0.0
-            else:
-                if not self.timelapse.is_recording and getattr(self.streamer, "total_listener_count", 0) == 0:
-                    if callable(getattr(self.streamer, "_schedule_idle_stop", None)):
-                        self.streamer._schedule_idle_stop()
+        self._set_night_vision_sync(enabled)
         return web.json_response({
             "success": True,
             "sync_night_vision": self.timelapse.sync_night_vision,
@@ -3358,24 +3272,117 @@ class WebServer:
         """Serve the standalone timelapse player page."""
         return web.Response(text=HTML_TIMELAPSE_PLAYER, content_type="text/html")
 
+    def _set_night_vision_sync(self, enabled: bool) -> None:
+        """Enable/disable night vision sync, restarting the automation from a clean slate."""
+        self.timelapse.set_sync_night_vision(enabled)
+        self.nv.reset_timers()
+        if enabled:
+            self._last_nv_check = float("-inf")  # sample on the next tick
+        self._sync_countdown_lease()
+
+    def _nv_check_interval(self) -> float:
+        """Seconds between night vision samples.
+
+        Sampling is cheap while the stream is up anyway; with the stream down every sample
+        means reconnecting to the camera, so it is rare.
+        """
+        if self.nv.activating or (self.timelapse and self.timelapse.is_recording):
+            return 15.0
+        if self.streamer and self.streamer.is_running:
+            return 30.0
+        return 300.0
+
+    def _monitor_tick_delay(self) -> float:
+        """Sleep until the next status poll, waking early when a night vision sample is due."""
+        if not (self.timelapse and self.timelapse.sync_night_vision):
+            return 4.0
+        due_in = self._last_nv_check + self._nv_check_interval() - time.monotonic()
+        return min(4.0, max(0.5, due_in))
+
+    def _sync_countdown_lease(self) -> None:
+        """Keep the camera connected while a darkness countdown is running."""
+        if self.streamer is None or self.timelapse is None:
+            return
+        want = self.timelapse.sync_night_vision and self.nv.activating and not self.timelapse.is_recording
+        if want and self._nv_lease is None:
+            self._nv_lease = self.streamer.acquire(linger=0)
+        elif not want and self._nv_lease is not None:
+            self.streamer.release(self._nv_lease)
+            self._nv_lease = None
+
+    async def _sample_night_vision(self) -> None:
+        """Fetch one keyframe and feed the verdict to the automation.
+
+        The caller holds a stream lease; on failure the previous verdict is kept.
+        """
+        timeout = 5.0
+        if not self.streamer.is_running:
+            timeout = 25.0
+            logger.info("Checking night vision state (restarting camera stream for a keyframe)...")
+        try:
+            keyframe = await self.streamer.get_keyframe(timeout_seconds=timeout, max_age=10.0)
+        except Exception as err:
+            logger.warning("Could not fetch keyframe for night vision check: %s", err)
+            return
+        verdict = await asyncio.to_thread(analyze_hevc_keyframe, keyframe)
+        if verdict is None:
+            logger.warning("Could not decode keyframe for night vision check.")
+            return
+        self.nv.observe(*verdict)
+
+    async def _advance_night_vision(self, now: float, status: Any) -> None:
+        """Feed the latest verdict to the debounce state machine and carry out its decision."""
+        is_dark = self._is_auto_night_mode(status) and self.nv.is_dark
+        action = self.nv.step(
+            now,
+            is_dark,
+            recording=self.timelapse.is_recording,
+            session_auto=self.timelapse.current_session_type == "auto",
+        )
+        if action is Action.MARK_AUTO:
+            self.timelapse.current_session_type = "auto"
+        elif action is Action.START_AUTO:
+            # An auto session continues an earlier auto one; otherwise it replaces manual footage.
+            fresh = self.timelapse.last_session_type != "auto"
+            await self.timelapse.start(fresh=fresh, session_type="auto")
+        elif action is Action.STOP_AUTO:
+            # linger=0: the camera disconnects at once unless a viewer is still watching.
+            await self.timelapse.stop(linger=0)
+        self._sync_countdown_lease()
+
+    async def _run_night_vision_cycle(self, status: Any, now: float) -> None:
+        """One automation tick: sample the camera if a sample is due, then advance the state machine."""
+        if (
+            self.streamer is not None
+            and self._is_auto_night_mode(status)
+            and now - self._last_nv_check >= self._nv_check_interval()
+        ):
+            self._last_nv_check = now
+            # linger=0: if sampling is the only reason the stream is up, it disconnects right after.
+            with self.streamer.lease(linger=0):
+                await self._sample_night_vision()
+                await self._advance_night_vision(time.monotonic(), status)
+        else:
+            await self._advance_night_vision(now, status)
+
     async def _background_monitor_loop(self) -> None:
         """Server-side background loop managing:
-        1. Night Vision timelapse automation (start on >=60s active, stop on >=120s inactive).
+        1. Night Vision timelapse automation (see momcozy.nightvision).
         2. Hardware motion event logging while recording.
         Runs entirely server-side without requiring any connected clients.
         """
         last_ev_time = 0.0
         while True:
             try:
-                await asyncio.sleep(4.0)
+                await asyncio.sleep(self._monitor_tick_delay())
                 if not self.monitor or not self.timelapse:
                     continue
 
                 # If timelapse is neither recording nor configured to sync with Night Vision,
                 # reset debounce timers and idle to minimize camera queries.
                 if not self.timelapse.is_recording and not self.timelapse.sync_night_vision:
-                    self._nv_active_start = None
-                    self._nv_inactive_start = None
+                    self.nv.reset_timers()
+                    self._sync_countdown_lease()
                     continue
 
                 now_mono = time.monotonic()
@@ -3388,118 +3395,10 @@ class WebServer:
                     logger.debug("Background monitor failed to poll camera status: %s", poll_err)
                     continue
 
-                # 1. Night Vision Automation
                 if self.timelapse.sync_night_vision:
-                    nv_mode = getattr(status, "night_vision", "0")
-                    raw = getattr(status, "raw_dps", {}) or {}
-                    dp_108 = str(raw.get("108", nv_mode)).strip()
+                    await self._run_night_vision_cycle(status, now_mono)
 
-                    clean_frame: Optional[bytes] = None
-                    connected_for_nv_check: bool = False
-
-                    if dp_108 == "0" and self.streamer:
-                        streamer_running = getattr(self.streamer, "is_running", False)
-                        # When stream is running, check at a steady cadence (30s, or 15s during countdown/recording).
-                        # When stream is stopped, check every 5 minutes (300s).
-                        check_interval = (
-                            15.0 if (self._nv_active_start is not None or self.timelapse.is_recording)
-                            else (30.0 if streamer_running else 300.0)
-                        )
-                        if (now_mono - self._last_nv_poll_time >= check_interval) or (self._last_nv_poll_time == 0.0):
-                            self._last_nv_poll_time = now_mono
-                            if not streamer_running:
-                                connected_for_nv_check = True
-                                logger.info("Checking night vision state (restarting camera stream for clean frame)...")
-                            try:
-                                timeout = 5.0 if streamer_running else 25.0
-                                if hasattr(self.streamer, "get_clean_frame"):
-                                    res = self.streamer.get_clean_frame(timeout_seconds=timeout)
-                                    clean_frame = await res if asyncio.iscoroutine(res) else res
-                                elif hasattr(self.streamer, "get_snapshot"):
-                                    res = self.streamer.get_snapshot(timeout_seconds=timeout)
-                                    clean_frame = await res if asyncio.iscoroutine(res) else res
-                            except Exception as err:
-                                logger.warning("Could not fetch clean frame for night vision check: %s", err)
-                                clean_frame = None
-
-                    is_nv = self.is_night_vision_active(status, frame_bytes=clean_frame)
-                    if is_nv:
-                        # Night vision is active
-                        self._nv_inactive_start = None
-                        if self.timelapse.is_recording:
-                            if not self._nv_session_was_active:
-                                logger.info("Night Vision active detected during ongoing recording session (session marked as auto).")
-                            self._nv_session_was_active = True
-                            self.timelapse.current_session_type = "auto"
-                        else:
-                            if not self._nv_manual_stopped:
-                                if self._nv_active_start is None:
-                                    self._nv_active_start = now_mono
-                                    logger.info("Night Vision active detected on camera. Starting 60s activation timer...")
-                                else:
-                                    active_sec = now_mono - self._nv_active_start
-                                    if active_sec >= 60.0:
-                                        # 1 minute continuous night vision reached
-                                        # "If the previous timelapse for automatic, the next automatic one appends to that, not restart."
-                                        fresh = (self.timelapse.last_session_type != "auto")
-                                        logger.info(
-                                            "Night Vision active for >= 60s (%.1fs). Auto-starting timelapse (fresh=%s, prev_session=%s)...",
-                                            active_sec,
-                                            fresh,
-                                            self.timelapse.last_session_type,
-                                        )
-                                        await self.timelapse.start(fresh=fresh, session_type="auto")
-                                        self._nv_session_was_active = True
-                    else:
-                        # Night vision is inactive
-                        self._nv_active_start = None
-                        self._nv_manual_stopped = False
-                        if self.timelapse.is_recording:
-                            # Only auto-stop if session was started as auto or night vision had been active
-                            if self.timelapse.current_session_type == "auto" or self._nv_session_was_active:
-                                if self._nv_inactive_start is None:
-                                    self._nv_inactive_start = now_mono
-                                    logger.info("Night Vision inactive detected on camera. Starting 120s deactivation timer...")
-                                else:
-                                    inactive_sec = now_mono - self._nv_inactive_start
-                                    if inactive_sec >= 120.0:
-                                        # 2 minutes continuous daylight/inactive reached
-                                        logger.info(
-                                            "Night Vision inactive for >= 120s (%.1fs). Auto-stopping timelapse...",
-                                            inactive_sec,
-                                        )
-                                        await self.timelapse.stop()
-                                        self._nv_session_was_active = False
-                                        self._nv_inactive_start = None
-                                        # When auto-stop completes, if no client viewers connected, stop camera stream
-                                        if (
-                                            self.streamer
-                                            and getattr(self.streamer, "total_listener_count", 0) == 0
-                                        ):
-                                            logger.info("Timelapse auto-stopped and no viewers connected. Stopping camera stream.")
-                                            res = self.streamer.stop()
-                                            if asyncio.iscoroutine(res):
-                                                await res
-                                            self._last_nv_poll_time = now_mono
-                            else:
-                                self._nv_inactive_start = None
-                        else:
-                            # Not recording and night vision is inactive:
-                            # ONLY if we connected solely for the periodic night vision check, disconnect immediately!
-                            # If the stream was started by a viewer or manual start, respect the 300s idle timeout.
-                            if (
-                                connected_for_nv_check
-                                and self.streamer
-                                and getattr(self.streamer, "is_running", False)
-                                and getattr(self.streamer, "total_listener_count", 0) == 0
-                                and self._nv_active_start is None
-                            ):
-                                logger.info("Night vision inactive (daylight). Disconnecting camera stream immediately.")
-                                res = self.streamer.stop()
-                                if asyncio.iscoroutine(res):
-                                    await res
-
-                # 2. Motion Events Tracking (while recording)
+                # Motion events while recording
                 if self.timelapse.is_recording:
                     ev_cmd = getattr(status, "latest_event_cmd", "")
                     ev_time = getattr(status, "latest_event_time", None)

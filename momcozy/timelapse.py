@@ -100,6 +100,9 @@ class TimelapseRecorder:
         self.last_session_type: str = "manual"  # "manual" | "auto"
         self.current_session_type: Optional[str] = None
 
+        # Lease on the camera stream, held while recording
+        self._stream_lease: Optional[Any] = None
+
         # Cache for exported MP4: cache_key -> {"path": Path, "created_at": float, "mtime": float}
         self._exports_cache: Dict[str, Dict[str, Any]] = {}
         # In-flight export tasks deduplication: cache_key -> asyncio.Task
@@ -313,7 +316,8 @@ class TimelapseRecorder:
             self.last_session_type = session_type
             self._save_meta()
 
-            # If streamer is not running, start it
+            # Hold the camera stream open for the whole recording.
+            self._stream_lease = self.streamer.acquire()
             if not self.streamer.is_running:
                 logger.info("Timelapse starting camera stream...")
                 await self.streamer.start()
@@ -329,8 +333,12 @@ class TimelapseRecorder:
                 session_type,
             )
 
-    async def stop(self) -> None:
-        """Stop recording the timelapse."""
+    async def stop(self, linger: Optional[float] = None) -> None:
+        """Stop recording the timelapse.
+
+        `linger` is how long the camera stream may stay up afterwards if nothing else uses
+        it (default: the streamer's idle timeout; 0 disconnects immediately).
+        """
         async with self._lock:
             if not self._running:
                 return
@@ -348,6 +356,9 @@ class TimelapseRecorder:
 
             self._close_active_slot()
             self._save_meta()
+            if self._stream_lease is not None:
+                self.streamer.release(self._stream_lease, linger)
+                self._stream_lease = None
             logger.info("Timelapse recording stopped (session=%s).", self.last_session_type)
 
     def _close_active_slot(self) -> None:
@@ -427,7 +438,18 @@ class TimelapseRecorder:
 
         while self._running:
             try:
-                async for chunk, is_key in self.streamer.subscribe_hevc():
+                if not self.streamer.is_running:
+                    logger.warning("Camera stream stopped during timelapse recording. Restarting it...")
+                    await self.streamer.start()
+                # Our own lease keeps the stream up, so the subscription need not hold one.
+                sub_hevc = getattr(self.streamer, "subscribe_hevc", None)
+                if sub_hevc is None:
+                    break
+                try:
+                    stream_iter = sub_hevc(leased=False)
+                except TypeError:
+                    stream_iter = sub_hevc()
+                async for chunk, is_key in stream_iter:
                     if not self._running:
                         break
 
