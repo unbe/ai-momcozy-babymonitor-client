@@ -2407,15 +2407,16 @@ def create_ssl_context(certfile: Optional[str] = None, keyfile: Optional[str] = 
     return ctx
 
 
-def detect_night_vision_from_jpeg(frame_bytes: bytes, threshold: float = 8.0) -> bool:
-    """Detect whether a JPEG frame is infrared monochrome (Night Vision active).
+def analyze_night_vision_frame(frame_bytes: bytes, threshold: float = 8.0) -> tuple[bool, float]:
+    """Analyze whether a JPEG frame is infrared monochrome (Night Vision active).
 
     Infrared night vision frames are grayscale, where R, G, B channels are virtually identical.
     Daytime frames have high color saturation where |R-G| + |G-B| + |B-R| is high.
     Subsamples to a 16x16 thumbnail for ultra-fast, cheap computation (<1.5ms).
+    Returns (is_night_vision, mean_color_diff).
     """
     if not frame_bytes or not isinstance(frame_bytes, (bytes, bytearray)):
-        return False
+        return False, 999.0
     try:
         from PIL import Image
         import io
@@ -2425,16 +2426,22 @@ def detect_night_vision_from_jpeg(frame_bytes: bytes, threshold: float = 8.0) ->
         raw = img.tobytes()
         n = len(raw) // 3
         if n == 0:
-            return False
+            return False, 999.0
         total_diff = sum(
             abs(raw[i] - raw[i + 1]) + abs(raw[i + 1] - raw[i + 2]) + abs(raw[i + 2] - raw[i])
             for i in range(0, len(raw), 3)
         )
         mean_diff = total_diff / n
-        return mean_diff < threshold
+        return (mean_diff < threshold), mean_diff
     except Exception as exc:
-        logger.debug("detect_night_vision_from_jpeg error: %s", exc)
-        return False
+        logger.debug("analyze_night_vision_frame error: %s", exc)
+        return False, 999.0
+
+
+def detect_night_vision_from_jpeg(frame_bytes: bytes, threshold: float = 8.0) -> bool:
+    """Detect whether a JPEG frame is infrared monochrome (Night Vision active)."""
+    is_nv, _ = analyze_night_vision_frame(frame_bytes, threshold)
+    return is_nv
 
 
 class WebServer:
@@ -2833,12 +2840,18 @@ class WebServer:
         if target_frame and isinstance(target_frame, (bytes, bytearray)):
             now_mono = time.monotonic()
             if (now_mono - self._last_nv_frame_check) >= 5.0 or frame_bytes is not None:
-                new_nv = detect_night_vision_from_jpeg(target_frame)
+                new_nv, diff = analyze_night_vision_frame(target_frame)
+                if frame_bytes is not None:
+                    logger.info(
+                        "Night vision check result: %s (color saturation diff: %.1f, threshold: 8.0)",
+                        "ACTIVE (infrared monochrome)" if new_nv else "INACTIVE (daylight color)",
+                        diff,
+                    )
                 if new_nv != self._last_detected_nv:
                     if new_nv:
-                        logger.info("Automatic Night Vision kick-in detected (camera frame transitioned to infrared monochrome).")
+                        logger.info("Automatic Night Vision kick-in detected (camera frame transitioned to infrared monochrome, diff=%.1f).", diff)
                     else:
-                        logger.info("Automatic Night Vision kick-out detected (camera frame transitioned to daylight color).")
+                        logger.info("Automatic Night Vision kick-out detected (camera frame transitioned to daylight color, diff=%.1f).", diff)
                 self._last_detected_nv = new_nv
                 self._last_nv_frame_check = now_mono
             return self._last_detected_nv
