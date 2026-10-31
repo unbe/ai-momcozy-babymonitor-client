@@ -2474,7 +2474,6 @@ class WebServer:
         self.app.router.add_get("/api/detection_snapshot", self.handle_detection_snapshot)
         self.app.router.add_get("/api/status", self.handle_api_status)
         self.app.router.add_get("/health", self.handle_health)
-        self.app.router.add_get("/api/health", self.handle_health)
         self.app.router.add_post("/api/control", self.handle_api_control)
         self.app.router.add_post("/api/timelapse/start", self.handle_timelapse_start)
         self.app.router.add_post("/api/timelapse/stop", self.handle_timelapse_stop)
