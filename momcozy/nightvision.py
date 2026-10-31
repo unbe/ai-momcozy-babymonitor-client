@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 COLOR_DIFF_THRESHOLD = 8.0
-ACTIVATE_AFTER_SEC = 60.0
+ACTIVATE_AFTER_SEC = 0.0
 DEACTIVATE_AFTER_SEC = 120.0
 THUMBNAIL_SIZE = 16
 
@@ -110,13 +110,19 @@ class SyncState(str, enum.Enum):
 class NightVisionAutomation:
     """Debounces night vision observations into start/stop decisions for the timelapse.
 
-    - Dark for ACTIVATE_AFTER_SEC (and not recording, not suppressed): start an auto session.
-    - Light for DEACTIVATE_AFTER_SEC while recording an auto/night session: stop it.
+    - Dark (and not recording, not suppressed): start an auto session immediately (when activate_delay <= 0).
+    - Light for deactivate_delay while recording an auto/night session: stop it.
       Manual daytime recordings are never stopped by daylight.
     - A manual stop suppresses auto-start until the next daylight observation.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        activate_delay: float = ACTIVATE_AFTER_SEC,
+        deactivate_delay: float = DEACTIVATE_AFTER_SEC,
+    ) -> None:
+        self.activate_delay = activate_delay
+        self.deactivate_delay = deactivate_delay
         self.is_dark = False
         self.last_diff: Optional[float] = None
         self._dark_since: Optional[float] = None
@@ -127,7 +133,7 @@ class NightVisionAutomation:
     @property
     def activating(self) -> bool:
         """True while a darkness countdown is running (the stream must stay up for it)."""
-        return self._dark_since is not None
+        return self._dark_since is not None and self.activate_delay > 0
 
     def observe(self, is_dark: bool, diff: float) -> None:
         """Record a fresh camera observation (and log it, including kick-in/out transitions)."""
@@ -162,15 +168,20 @@ class NightVisionAutomation:
                 return Action.MARK_AUTO
             if self._suppressed:
                 return Action.NONE
+            if self.activate_delay <= 0:
+                self._dark_since = now
+                logger.info("Night Vision active detected on camera. Auto-starting timelapse...")
+                self._night_session = True
+                return Action.START_AUTO
             if self._dark_since is None:
                 self._dark_since = now
                 logger.info(
-                    "Night Vision active detected on camera. Starting %.0fs activation timer...", ACTIVATE_AFTER_SEC
+                    "Night Vision active detected on camera. Starting %.0fs activation timer...", self.activate_delay
                 )
                 return Action.NONE
             elapsed = now - self._dark_since
-            if elapsed >= ACTIVATE_AFTER_SEC:
-                logger.info("Night Vision active for >= %.0fs (%.1fs). Auto-starting timelapse...", ACTIVATE_AFTER_SEC, elapsed)
+            if elapsed >= self.activate_delay:
+                logger.info("Night Vision active for >= %.0fs (%.1fs). Auto-starting timelapse...", self.activate_delay, elapsed)
                 self._night_session = True
                 return Action.START_AUTO
             return Action.NONE
@@ -183,12 +194,12 @@ class NightVisionAutomation:
         if self._light_since is None:
             self._light_since = now
             logger.info(
-                "Night Vision inactive detected on camera. Starting %.0fs deactivation timer...", DEACTIVATE_AFTER_SEC
+                "Night Vision inactive detected on camera. Starting %.0fs deactivation timer...", self.deactivate_delay
             )
             return Action.NONE
         elapsed = now - self._light_since
-        if elapsed >= DEACTIVATE_AFTER_SEC:
-            logger.info("Night Vision inactive for >= %.0fs (%.1fs). Auto-stopping timelapse...", DEACTIVATE_AFTER_SEC, elapsed)
+        if elapsed >= self.deactivate_delay:
+            logger.info("Night Vision inactive for >= %.0fs (%.1fs). Auto-stopping timelapse...", self.deactivate_delay, elapsed)
             self._night_session = False
             self._light_since = None
             return Action.STOP_AUTO
@@ -198,10 +209,10 @@ class NightVisionAutomation:
         """Current state and seconds left on the running countdown, if any."""
         if recording:
             if self._light_since is not None and (session_auto or self._night_session):
-                return SyncState.STOPPING, max(0.0, DEACTIVATE_AFTER_SEC - (now - self._light_since))
+                return SyncState.STOPPING, max(0.0, self.deactivate_delay - (now - self._light_since))
             return SyncState.RECORDING, None
-        if self._dark_since is not None and not self._suppressed:
-            return SyncState.ACTIVATING, max(0.0, ACTIVATE_AFTER_SEC - (now - self._dark_since))
+        if self.activate_delay > 0 and self._dark_since is not None and not self._suppressed:
+            return SyncState.ACTIVATING, max(0.0, self.activate_delay - (now - self._dark_since))
         return SyncState.IDLE, None
 
     def reset_timers(self) -> None:

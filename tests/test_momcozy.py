@@ -2240,7 +2240,7 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(streamer._idle_task)
 
     async def test_sync_night_vision_debounce_simulation(self):
-        """Verify the 60s activation threshold and 120s deactivation threshold."""
+        """Verify immediate activation on night mode and 120s deactivation threshold."""
         with tempfile.TemporaryDirectory() as td:
             mock_streamer = MagicMock()
             mock_streamer.is_running = True
@@ -2269,43 +2269,30 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
             rec.start = fake_start
             rec.stop = fake_stop
 
-            # Step 1: Night Vision becomes active at t=100.0
+            # Step 1: Night Vision becomes active at t=100.0 -> starts immediately!
             t = 100.0
             is_nv = True
-            if is_nv:
-                nv_inactive_start = None
-                if nv_active_start is None:
-                    nv_active_start = t
-
-            # Step 2: At t=130.0 (30s later) -> Under 60s, should NOT start
-            t = 130.0
-            if (t - nv_active_start) < 60.0:
-                pass  # not triggered
-            self.assertEqual(len(started_calls), 0)
-
-            # Step 3: At t=161.0 (61s later) -> Exceeds 60s, triggers auto-start!
-            t = 161.0
-            if is_nv and not rec.is_recording and (t - nv_active_start) >= 60.0:
+            if is_nv and not rec.is_recording:
                 fresh = (rec.last_session_type != "auto")
                 await rec.start(fresh=fresh, session_type="auto")
             self.assertEqual(len(started_calls), 1)
             # Since last_session_type was "auto", fresh should be False (appended)!
             self.assertEqual(started_calls[0], (False, "auto"))
 
-            # Step 4: Daylight/inactive occurs at t=200.0
+            # Step 2: Daylight/inactive occurs at t=200.0
             t = 200.0
             is_nv = False
             nv_active_start = None
             if nv_inactive_start is None:
                 nv_inactive_start = t
 
-            # Step 5: At t=280.0 (80s of daylight) -> Under 120s, should NOT stop
+            # Step 3: At t=280.0 (80s of daylight) -> Under 120s, should NOT stop
             t = 280.0
             if rec.is_recording and (t - nv_inactive_start) < 120.0:
                 pass  # not triggered
             self.assertEqual(len(stopped_calls), 0)
 
-            # Step 6: At t=325.0 (125s of daylight) -> Exceeds 120s, triggers auto-stop!
+            # Step 4: At t=325.0 (125s of daylight) -> Exceeds 120s, triggers auto-stop!
             t = 325.0
             if not is_nv and rec.is_recording and (t - nv_inactive_start) >= 120.0:
                 await rec.stop()
@@ -2599,6 +2586,7 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
     def test_darkness_activation_and_countdown(self):
         from momcozy.nightvision import NightVisionAutomation, Action, SyncState
 
+        # 1. Default: immediate start (no timeout)
         nv = NightVisionAutomation()
         now = 1000.0
 
@@ -2609,23 +2597,29 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
         self.assertEqual(state, SyncState.IDLE)
         self.assertIsNone(rem)
 
-        # Dark: starts countdown
+        # Dark: starts immediately
         act = nv.step(now, is_dark=True, recording=False, session_auto=False)
+        self.assertEqual(act, Action.START_AUTO)
+        self.assertFalse(nv.activating)
+
+        # 2. Configured activation delay (e.g. 60s)
+        nv_delayed = NightVisionAutomation(activate_delay=60.0)
+        act = nv_delayed.step(now, is_dark=True, recording=False, session_auto=False)
         self.assertEqual(act, Action.NONE)
-        self.assertTrue(nv.activating)
-        state, rem = nv.sync_state(now, recording=False, session_auto=False)
+        self.assertTrue(nv_delayed.activating)
+        state, rem = nv_delayed.sync_state(now, recording=False, session_auto=False)
         self.assertEqual(state, SyncState.ACTIVATING)
         self.assertAlmostEqual(rem, 60.0, places=1)
 
         # 30s elapsed: still activating
-        act = nv.step(now + 30.0, is_dark=True, recording=False, session_auto=False)
+        act = nv_delayed.step(now + 30.0, is_dark=True, recording=False, session_auto=False)
         self.assertEqual(act, Action.NONE)
-        state, rem = nv.sync_state(now + 30.0, recording=False, session_auto=False)
+        state, rem = nv_delayed.sync_state(now + 30.0, recording=False, session_auto=False)
         self.assertEqual(state, SyncState.ACTIVATING)
         self.assertAlmostEqual(rem, 30.0, places=1)
 
         # 60s elapsed: triggers START_AUTO
-        act = nv.step(now + 60.1, is_dark=True, recording=False, session_auto=False)
+        act = nv_delayed.step(now + 60.1, is_dark=True, recording=False, session_auto=False)
         self.assertEqual(act, Action.START_AUTO)
 
     def test_daylight_deactivation_and_countdown(self):
@@ -2688,10 +2682,9 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
         act = nv.step(now + 50.0, is_dark=False, recording=False, session_auto=False)
         self.assertEqual(act, Action.NONE)
 
-        # Darkness arrives again: now countdown starts!
+        # Darkness arrives again: now triggers immediately!
         act = nv.step(now + 60.0, is_dark=True, recording=False, session_auto=False)
-        self.assertEqual(act, Action.NONE)
-        self.assertTrue(nv.activating)
+        self.assertEqual(act, Action.START_AUTO)
 
 
 if __name__ == "__main__":

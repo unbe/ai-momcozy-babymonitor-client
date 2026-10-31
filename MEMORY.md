@@ -118,9 +118,9 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), acquires a zero-linger lease (`async with streamer.lease(linger=0)`), fetches a keyframe via `get_keyframe()`, and evaluates night vision status.
     * If daylight is detected, the lease exits and the stream disconnects immediately without lingering, remaining stopped until the next 5-minute check.
     * If the stream was started by a viewer (or manual start), user disconnection triggers the standard 300s idle timer without being cut short by background night vision checks.
-    * While the stream is actively running, night vision is checked at a steady cadence (every 30s when idle/viewing, 15s during the 60s countdown or active recording) by decoding a keyframe. Passive status queries (`/api/status`) do not alter or reset check timers.
-    * If night vision is detected, the lease holds or re-acquires to keep the stream running, the 60s activation debounce starts, and timelapse recording auto-starts after 60s of continuous darkness.
-    * While recording is active (or during the 60s activation window), the timelapse recorder holds an active stream lease (`streamer.acquire("timelapse")`), keeping the stream running.
+    * While the stream is actively running, night vision is checked at a steady cadence (every 30s when idle/viewing, 15s during active recording) by decoding a keyframe. Passive status queries (`/api/status`) do not alter or reset check timers.
+    * As soon as night vision is detected, timelapse recording auto-starts immediately (no activation delay).
+    * While recording is active, the timelapse recorder holds an active stream lease (`streamer.acquire("timelapse")`), keeping the stream running.
     * When daylight persists for 120s, timelapse stops, releases its lease, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.
   * **Logging Conventions:**
     * Log messages must use clean, readable plain text without emojis or non-standard Unicode symbols.
@@ -129,7 +129,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * `detect_night_vision_from_jpeg()` inspects a 16x16 subsampled thumbnail of the camera frame (< 1.5ms computation). Daytime frames show strong color saturation ($|R-G| + |G-B| + |B-R| \gg 10.0$), whereas infrared night vision frames are monochrome grayscale where $R \approx G \approx B$ (mean diff $< 8.0$).
     * Timelapse automation operates **exclusively in Auto mode (`"0"`)**, ignoring manually set states (`"1"` or `"2"`). In Auto mode, `is_night_vision_active()` checks frame saturation to accurately detect active IR night vision kicking in or out.
   * **Debounce Timing & Session Protection Logic:**
-    * **Activation Threshold (1 Minute = 60s):** When camera reports Night Vision active, a monotonic timer starts. If Night Vision remains continuously active for $\ge 60.0$ seconds and timelapse is not currently recording, it automatically starts/resumes. Transient darkness under 60 seconds is ignored.
+    * **Immediate Activation (0s Delay):** When camera reports Night Vision active, timelapse recording auto-starts/resumes immediately without any countdown delay.
     * **Deactivation Threshold (2 Minutes = 120s):** When camera reports daylight / Night Vision inactive, an inactive monotonic timer starts. If daylight persists continuously for $\ge 120.0$ seconds and timelapse is recording, it stops *only if* the recording was auto-started or had night vision active. Manual daytime recordings are never killed by daylight.
     * **Manual Stop Honor:** If the user manually stops recording during the night, auto-restart is suppressed for the remainder of that dark period until daylight resets it or the user clicks resume.
   * **Manual Recording Resume vs. Erase:**
