@@ -2166,6 +2166,81 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             st2 = recorder2.get_status()
             self.assertEqual(st2["motion_events_count"], 2)
 
+    async def test_timelapse_playback_motion_detection_binary_search(self):
+        """Verify on-demand playback motion detection using adaptive binary search and state invariance."""
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        from momcozy.timelapse import (
+            TimelapseRecorder,
+            extract_hevc_keyframe_luma,
+            luma_fingerprint_diff,
+        )
+
+        # 1. Test fingerprint comparison helper
+        fp_a = b"\x10" * 256
+        fp_b = b"\x10" * 256
+        fp_c = b"\x30" * 256
+        self.assertEqual(luma_fingerprint_diff(fp_a, fp_b), 0.0)
+        self.assertEqual(luma_fingerprint_diff(fp_a, fp_c), 32.0)
+        self.assertEqual(luma_fingerprint_diff(None, fp_a), 999.0)
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = False
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=2,
+                slot_duration_sec=60.0,
+                speed_ratio=60,
+            )
+
+            # Create slot 0 with 60 synthetic keyframes separated by VPS marker
+            s0 = recorder.slot_path(0)
+            vps_marker = b"\x00\x00\x00\x01\x40\x01"
+            payload = b""
+            for i in range(60):
+                payload += vps_marker + bytes([i % 256]) * 40
+            s0.write_bytes(payload)
+            recorder._slots_meta["0"] = {"mtime": 2000.0, "duration": 60.0, "frames": 60, "bytes": len(payload)}
+
+            # Mock extract_hevc_keyframe_luma so:
+            # Frames 0..19: state A (b"\x10" * 256)
+            # Frames 20..59: state B (b"\x50" * 256) -> motion occurred at frame 20!
+            decoded_frames = []
+
+            def mock_luma(chunk):
+                frame_idx = chunk[6]  # read test byte
+                decoded_frames.append(frame_idx)
+                if frame_idx < 20:
+                    return b"\x10" * 256
+                return b"\x50" * 256
+
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                # Run adaptive binary search
+                events = await recorder.scan_motion_events(force=True)
+
+                self.assertGreaterEqual(len(events), 1)
+                self.assertEqual(events[0]["type"], "motion")
+                self.assertEqual(events[0]["label"], "Motion Detected")
+
+                # The motion started at frame 20 (approx 20/59 * 60 = 20.3s into recording, wall time ~1960.3)
+                ev_time = events[0]["time"]
+                self.assertAlmostEqual(ev_time, 1940.0 + (20 / 59) * 60.0, delta=4.0)
+
+                # Verify that not all 60 frames were decoded (skipping still intervals!)
+                self.assertLess(len(decoded_frames), 30)
+
+                # Verify caching: subsequent scan returns cached events without re-decoding
+                prev_decoded_count = len(decoded_frames)
+                cached_events = recorder.detect_motion_events()
+                self.assertEqual(cached_events, events)
+                self.assertEqual(len(decoded_frames), prev_decoded_count)
+
 
 class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
     """Test server-side timelapse synchronization with Night Vision."""

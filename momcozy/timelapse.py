@@ -50,6 +50,50 @@ def format_bytes(bytes_count: int) -> str:
     return f"{bytes_count / (1024 * 1024 * 1024):.2f} GB"
 
 
+def extract_hevc_keyframe_luma(chunk: bytes, grid_size: int = 16) -> Optional[bytes]:
+    """Extract a fast grid_size x grid_size grayscale luminance fingerprint from an HEVC keyframe.
+
+    Decodes a single keyframe using PyAV with thread_count=1 (sub-10ms).
+    Directly subsamples the Y plane without color conversions or software rescaling.
+    """
+    try:
+        import av
+
+        codec = av.CodecContext.create("hevc", "r")
+        codec.thread_count = 1
+        last_frame = None
+        for packet in list(codec.parse(chunk)) + list(codec.parse(b"")):
+            for frame in codec.decode(packet):
+                last_frame = frame
+        for frame in codec.decode():
+            last_frame = frame
+        if not last_frame or not last_frame.planes:
+            return None
+
+        y = memoryview(last_frame.planes[0])
+        w, h = last_frame.width, last_frame.height
+        step_x = max(1, w // grid_size)
+        step_y = max(1, h // grid_size)
+        samples = bytearray(grid_size * grid_size)
+        idx = 0
+        for r in range(grid_size):
+            row_offset = (r * step_y + step_y // 2) * w
+            for c in range(grid_size):
+                samples[idx] = y[row_offset + c * step_x + step_x // 2]
+                idx += 1
+        return bytes(samples)
+    except Exception as exc:
+        logger.debug("extract_hevc_keyframe_luma error: %s", exc)
+        return None
+
+
+def luma_fingerprint_diff(fp1: Optional[bytes], fp2: Optional[bytes]) -> float:
+    """Compute mean absolute difference between two luma fingerprints (0.0 to 255.0)."""
+    if not fp1 or not fp2 or len(fp1) != len(fp2):
+        return 999.0
+    return sum(abs(a - b) for a, b in zip(fp1, fp2)) / len(fp1)
+
+
 class TimelapseRecorder:
     """Fixed-slot circular ring buffer timelapse recorder.
 
@@ -107,6 +151,9 @@ class TimelapseRecorder:
         self._exports_cache: Dict[str, Dict[str, Any]] = {}
         # In-flight export tasks deduplication: cache_key -> asyncio.Task
         self._in_flight_exports: Dict[str, asyncio.Task] = {}
+
+        # Motion detection on-demand scan cache
+        self._last_motion_scan_mtime: float = 0.0
 
         self._load_meta()
 
@@ -249,6 +296,7 @@ class TimelapseRecorder:
         self._slot_start_wall = time.time()
         self._slots_meta = {}
         self._events = []
+        self._last_motion_scan_mtime = 0.0
         self._exports_cache.clear()
         for task in list(self._in_flight_exports.values()):
             if not task.done():
@@ -298,6 +346,151 @@ class TimelapseRecorder:
         self._save_meta()
         logger.info("Recorded timelapse %s event: '%s' at timestamp %.1f", event_type, label, ts)
         return True
+
+    @property
+    def has_content(self) -> bool:
+        """Check if any recorded timelapse slots exist with content."""
+        ordered = self.get_ordered_slots()
+        return bool(ordered and any(p.exists() and p.stat().st_size > 0 for _, p, _ in ordered))
+
+    def detect_motion_events(
+        self,
+        threshold: float = 4.5,
+        coarse_step: int = 30,
+        min_window: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Run adaptive binary search motion detection across recorded timelapse slots on playback.
+
+        Operates on-demand during playback (zero CPU overhead during recording).
+        Leverages state-difference invariance: if Frame(A) ≈ Frame(B), no motion occurred
+        in interval [A, B] and the entire block is skipped in O(1).
+        Only intervals with diff >= threshold are recursively subdivided to pinpoint motion onsets.
+        """
+        ordered = self.get_ordered_slots()
+        if not ordered:
+            return self._events
+
+        latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
+        if self._last_motion_scan_mtime >= latest_mtime and self._events:
+            return self._events
+
+        vps_marker = b"\x00\x00\x00\x01\x40\x01"
+        indexed_frames: List[Tuple[Path, int, int, float]] = []
+
+        for slot_idx, path, meta in ordered:
+            if not path.exists() or path.stat().st_size < 100:
+                continue
+            file_size = path.stat().st_size
+            duration = float(meta.get("duration", self.slot_duration_sec))
+            slot_end = float(meta.get("mtime", path.stat().st_mtime))
+            slot_start = slot_end - duration
+
+            try:
+                with open(path, "rb") as f:
+                    import mmap
+
+                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    offsets = []
+                    pos = 0
+                    while True:
+                        pos = mm.find(vps_marker, pos)
+                        if pos == -1:
+                            break
+                        offsets.append(pos)
+                        pos += 6
+                    mm.close()
+
+                num_kf = len(offsets)
+                if num_kf == 0:
+                    continue
+
+                for i, off in enumerate(offsets):
+                    length = (offsets[i + 1] - off) if (i + 1 < num_kf) else (file_size - off)
+                    frame_ts = slot_start + (i / max(1, num_kf - 1)) * duration
+                    indexed_frames.append((path, off, length, frame_ts))
+            except Exception as exc:
+                logger.debug("Failed indexing keyframes in %s: %s", path, exc)
+
+        total_frames = len(indexed_frames)
+        if total_frames < 2:
+            return self._events
+
+        fp_cache: Dict[int, Optional[bytes]] = {}
+
+        def get_fp(idx: int) -> Optional[bytes]:
+            if idx not in fp_cache:
+                f_path, f_off, f_len, _ = indexed_frames[idx]
+                try:
+                    with open(f_path, "rb") as f:
+                        f.seek(f_off)
+                        chunk = f.read(f_len)
+                    fp_cache[idx] = extract_hevc_keyframe_luma(chunk)
+                except Exception:
+                    fp_cache[idx] = None
+            return fp_cache[idx]
+
+        motion_frame_indices: List[int] = []
+
+        def subdivide(left: int, right: int) -> None:
+            if right - left <= min_window:
+                motion_frame_indices.append(right)
+                return
+            mid = (left + right) // 2
+            fp_l = get_fp(left)
+            fp_m = get_fp(mid)
+            fp_r = get_fp(right)
+            if fp_l is not None and fp_m is not None:
+                if luma_fingerprint_diff(fp_l, fp_m) >= threshold:
+                    subdivide(left, mid)
+            if fp_m is not None and fp_r is not None:
+                if luma_fingerprint_diff(fp_m, fp_r) >= threshold:
+                    subdivide(mid, right)
+
+        for start in range(0, total_frames - 1, coarse_step):
+            end = min(total_frames - 1, start + coarse_step)
+            fp_start = get_fp(start)
+            fp_end = get_fp(end)
+            if fp_start is None or fp_end is None:
+                continue
+            diff = luma_fingerprint_diff(fp_start, fp_end)
+            if diff >= threshold:
+                subdivide(start, end)
+
+        raw_timestamps = sorted([indexed_frames[idx][3] for idx in motion_frame_indices])
+        clustered: List[Dict[str, Any]] = []
+        for ts in raw_timestamps:
+            if not clustered or (ts - float(clustered[-1]["time"])) >= 15.0:
+                clustered.append({
+                    "time": round(ts, 1),
+                    "type": "motion",
+                    "label": "Motion Detected",
+                })
+
+        # Merge with existing hardware/manual events if present
+        all_events = {round(float(e["time"]), 1): e for e in self._events}
+        for c in clustered:
+            ts_key = round(float(c["time"]), 1)
+            if ts_key not in all_events:
+                all_events[ts_key] = c
+        merged = sorted(all_events.values(), key=lambda x: float(x.get("time", 0.0)))
+
+        self._events = merged
+        self._last_motion_scan_mtime = latest_mtime
+        self._save_meta()
+        logger.info(
+            "Motion scan complete: indexed %d frames (decoded %d), detected %d motion events",
+            total_frames,
+            len(fp_cache),
+            len(clustered),
+        )
+        return self._events
+
+    async def scan_motion_events(self, force: bool = False) -> List[Dict[str, Any]]:
+        """Asynchronously run detect_motion_events in executor thread."""
+        loop = asyncio.get_running_loop()
+        if force:
+            self._last_motion_scan_mtime = 0.0
+        return await loop.run_in_executor(None, self.detect_motion_events)
 
     async def start(self, fresh: bool = False, session_type: str = "manual") -> None:
         """Start recording the circular timelapse.

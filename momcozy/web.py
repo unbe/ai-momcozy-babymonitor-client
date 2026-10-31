@@ -2151,6 +2151,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     let activeCodec = canPlayHevc() ? 'hevc' : 'h264';
     let fallbackAttempted = false;
     let initialPlaySucceeded = false;
+    let recoveryAttempts = 0;
     let currentRatio = 60;
 
     function updateDownloadLinks() {
@@ -2165,6 +2166,8 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     function loadPlayback(codec) {
       activeCodec = codec;
+      recoveryAttempts = 0;
+      initialPlaySucceeded = false;
       loading.style.display = 'flex';
       errorBox.style.display = 'none';
       const url = `/api/timelapse/video.mp4?codec=${codec}&ratio=${currentRatio}&t=${Date.now()}`;
@@ -2180,7 +2183,9 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     };
 
     video.onplaying = function() {
+      loading.style.display = 'none';
       initialPlaySucceeded = true;
+      recoveryAttempts = 0;
     };
 
     video.onerror = function(e) {
@@ -2192,14 +2197,18 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         return;
       }
 
-      // If HEVC already successfully loaded metadata / played, this was a transient seek glitch, NOT an unsupported codec!
-      if (initialPlaySucceeded) {
-        console.info('[Timelapse Player] Transient seek/playback glitch on HEVC, recovering playback...');
+      // If HEVC already successfully loaded metadata / played and recovery is within retry limits
+      if (initialPlaySucceeded && recoveryAttempts < 2) {
+        recoveryAttempts++;
+        console.info('[Timelapse Player] Recovering playback (attempt ' + recoveryAttempts + '/2)...');
         const dur = video.duration || 1.0;
         const cur = Math.max(0.05, Math.min(dur - 0.05, video.currentTime || 0.05));
+        const onLoadedMeta = function() {
+          video.currentTime = cur;
+          video.play().catch(function() {});
+        };
+        video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
         video.load();
-        video.currentTime = cur;
-        video.play().catch(function() {});
         return;
       }
 
@@ -2212,13 +2221,6 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       loading.style.display = 'none';
       errorBox.style.display = 'flex';
     };
-
-    video.addEventListener('seeking', function() {
-      // Prevent 0.000 boundary underflow in native hardware decoders
-      if (video.currentTime < 0.05 && video.duration > 0.1) {
-        video.currentTime = 0.05;
-      }
-    });
 
     let motionEvents = [];
 
@@ -2361,9 +2363,18 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       if (btn) btn.classList.add('active');
     }
 
-    function reloadVideo() {
+    async function reloadVideo() {
       fallbackAttempted = false;
       initialPlaySucceeded = false;
+      recoveryAttempts = 0;
+      try {
+        const res = await fetch('/api/timelapse/status?scan=1');
+        const st = await res.json();
+        if (st.events) {
+          motionEvents = st.events;
+          renderTimelineMarkers();
+        }
+      } catch (e) {}
       loadPlayback(activeCodec);
     }
 
@@ -3274,7 +3285,16 @@ class WebServer:
         })
 
     async def handle_timelapse_status(self, request: web.Request) -> web.Response:
-        """Get timelapse recorder status."""
+        """Get timelapse recorder status with on-demand playback motion scan."""
+        if not self.timelapse:
+            return web.json_response({})
+        scan_param = request.query.get("scan")
+        should_scan = scan_param == "1" or (not self.timelapse._events and self.timelapse.has_content and not self.timelapse.is_recording)
+        if should_scan:
+            try:
+                await self.timelapse.scan_motion_events()
+            except Exception as exc:
+                logger.debug("Motion scan error: %s", exc)
         return web.json_response(self._get_timelapse_status())
 
     async def handle_timelapse_record_event(self, request: web.Request) -> web.Response:
