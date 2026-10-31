@@ -3299,11 +3299,18 @@ class WebServer:
         return 300.0
 
     def _monitor_tick_delay(self) -> float:
-        """Sleep until the next status poll, waking early when a night vision sample is due."""
+        """Sleep until the next status poll, waking early when a night vision sample is due.
+
+        While recording, poll every 4s to capture hardware motion events in real-time.
+        When idle (not recording), sleep in 30s intervals (or until the next sample is due)
+        to eliminate unnecessary wakeups and telemetry polling.
+        """
         if not (self.timelapse and self.timelapse.sync_night_vision):
             return 4.0
         due_in = self._last_nv_check + self._nv_check_interval() - time.monotonic()
-        return min(4.0, max(0.5, due_in))
+        if self.timelapse.is_recording:
+            return min(4.0, max(0.5, due_in))
+        return min(30.0, max(0.5, due_in))
 
     def _sync_countdown_lease(self) -> None:
         """Keep the camera connected while a darkness countdown is running."""

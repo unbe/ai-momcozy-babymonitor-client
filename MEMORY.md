@@ -130,6 +130,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * As soon as night vision is detected, timelapse recording auto-starts immediately (no activation delay).
     * While recording is active, the timelapse recorder holds an active stream lease (`streamer.acquire("timelapse")`), keeping the stream running.
     * When daylight persists for 120s, timelapse stops, releases its lease, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.
+  * **Idle Monitor Loop Backoff:**
+    * In `WebServer._monitor_tick_delay()`, the background loop distinguishes between active recording and idle states.
+    * While recording, it polls every 4.0s to log hardware motion events (DPs 115, 127, 185) on the video timeline in real-time.
+    * When idle (stream stopped, timelapse not recording), it sleeps in 30.0s blocks (or until the 300s sample is due), reducing idle loop wakeups and telemetry dispatches from 75 down to 10 per 5 minutes. On-demand API requests (`/api/status`) continue to query the device directly, preserving instant UI responsiveness.
   * **Logging Conventions:**
     * Log messages must use clean, readable plain text without emojis or non-standard Unicode symbols.
   * **Auto Mode ("0") Night Vision Physical Detection via Frame Saturation:**

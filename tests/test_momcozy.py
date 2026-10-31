@@ -2731,6 +2731,17 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
         self.assertTrue(server.nv.is_stopping)
         self.assertEqual(server._nv_check_interval(), 15.0)
 
+        # 5. Monitor tick delay: 4s when recording, up to 30s when idle
+        server.timelapse.sync_night_vision = True
+        server._last_nv_check = time.monotonic()  # sample just occurred
+        # While recording: sleeps min(4.0, ...)
+        server.timelapse.is_recording = True
+        self.assertAlmostEqual(server._monitor_tick_delay(), 4.0, places=1)
+        # While idle (not recording): sleeps min(30.0, ...)
+        server.timelapse.is_recording = False
+        mock_streamer.is_running = False
+        self.assertAlmostEqual(server._monitor_tick_delay(), 30.0, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()
