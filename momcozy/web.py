@@ -1608,15 +1608,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (tl.is_recording) {
         if (badge) {
           badge.className = 'badge active';
-          if (tl.last_session_type === 'auto') {
-            badge.style.background = '#EDE9FE';
-            badge.style.color = '#7C3AED';
-            badge.innerText = '🌙 Auto-Recording';
-          } else {
-            badge.style.background = '#FED7D7';
-            badge.style.color = '#C53030';
-            badge.innerText = 'Recording';
-          }
+          badge.style.background = '#FED7D7';
+          badge.style.color = '#C53030';
+          badge.innerText = tl.last_session_type === 'auto' ? 'Recording 🌙' : 'Recording';
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏹ Stop Recording';
@@ -1661,7 +1655,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const sec = Math.round(tl.sync_timer_remaining || 0);
             label = `☀️ Day Mode Detected (Stops in ${sec}s)`;
           } else if (tl.is_recording && tl.last_session_type === 'auto') {
-            label = '🌙 Sync: Auto-Recording (Active)';
+            label = '🌙 Sync: Recording 🌙 (Active)';
           } else if (tl.night_vision_active) {
             label = '🌙 Sync with Night Vision: ON (Active)';
           }
