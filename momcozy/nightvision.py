@@ -66,14 +66,15 @@ def analyze_hevc_keyframe(
 ) -> Optional[Tuple[bool, float]]:
     """Decide from one Annex B keyframe (VPS/SPS/PPS + IDR) whether night vision is active.
 
-    Only the keyframe is decoded and it is scaled straight to a 16x16 thumbnail, so this
-    costs a fraction of decoding a whole GOP and re-encoding it as JPEG.
+    Decodes single keyframe using a single thread (zero thread pool allocation).
+    Inspects U/V chroma planes directly, bypassing libswscale image rescaling and RGB conversion.
     Returns (is_night_vision, mean_color_diff), or None if the keyframe cannot be decoded.
     """
     try:
         import av
 
         codec = av.CodecContext.create("hevc", "r")
+        codec.thread_count = 1
         last_frame = None
         for packet in list(codec.parse(chunk)) + list(codec.parse(b"")):
             for frame in codec.decode(packet):
@@ -82,8 +83,18 @@ def analyze_hevc_keyframe(
             last_frame = frame
         if last_frame is None:
             return None
-        thumb = last_frame.reformat(width=THUMBNAIL_SIZE, height=THUMBNAIL_SIZE, format="rgb24")
-        diff = thumbnail_color_diff(thumb.to_ndarray().tobytes())
+
+        # YUV420p planes: plane 0 = Y (luma), plane 1 = U (chroma Cb), plane 2 = V (chroma Cr)
+        # In infrared monochrome, U and V are neutral 128 (no color saturation).
+        # Inspecting U and V directly eliminates libswscale software scaling and RGB24 conversion.
+        if len(last_frame.planes) >= 3:
+            u = memoryview(last_frame.planes[1])
+            v = memoryview(last_frame.planes[2])
+            step = max(1, len(u) // 256)
+            diff = sum(abs(u[i] - 128) + abs(v[i] - 128) for i in range(0, 256 * step, step)) / 256
+        else:
+            thumb = last_frame.reformat(width=THUMBNAIL_SIZE, height=THUMBNAIL_SIZE, format="rgb24")
+            diff = thumbnail_color_diff(thumb.to_ndarray().tobytes())
     except Exception as exc:
         logger.debug("analyze_hevc_keyframe error: %s", exc)
         return None
@@ -134,6 +145,11 @@ class NightVisionAutomation:
     def activating(self) -> bool:
         """True while a darkness countdown is running (the stream must stay up for it)."""
         return self._dark_since is not None and self.activate_delay > 0
+
+    @property
+    def is_stopping(self) -> bool:
+        """True while daylight has been detected and the deactivation countdown is running."""
+        return self._light_since is not None
 
     def observe(self, is_dark: bool, diff: float) -> None:
         """Record a fresh camera observation (and log it, including kick-in/out transitions)."""

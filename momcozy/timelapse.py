@@ -446,9 +446,12 @@ class TimelapseRecorder:
                 if sub_hevc is None:
                     break
                 try:
-                    stream_iter = sub_hevc(leased=False)
+                    stream_iter = sub_hevc(leased=False, keyframes_only=True)
                 except TypeError:
-                    stream_iter = sub_hevc()
+                    try:
+                        stream_iter = sub_hevc(leased=False)
+                    except TypeError:
+                        stream_iter = sub_hevc()
                 async for chunk, is_key in stream_iter:
                     if not self._running:
                         break

@@ -109,16 +109,24 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Decoupled State Machine Architecture (`momcozy/nightvision.py`):**
     * The debounce timing, suppression, and activation/deactivation logic is implemented as a pure, testable state machine `NightVisionAutomation`.
     * It takes inputs `(now, is_dark, recording, session_auto)` and returns actions (`Action.NONE`, `Action.START_AUTO`, `Action.STOP_AUTO`, `Action.MARK_AUTO`). It has zero I/O or network dependencies, making testing instantaneous and deterministic without mocks.
-  * **Direct HEVC Keyframe Thumbnail Analysis (`analyze_hevc_keyframe`):**
-    * Decodes only the single incoming IDR HEVC keyframe directly into a 16x16 thumbnail using PyAV, completely bypassing GOP decoding and intermediate JPEG compression.
+  * **Direct HEVC Keyframe Analysis & Chroma Inspection (`analyze_hevc_keyframe`):**
+    * Decodes only the single incoming IDR HEVC keyframe using single-threaded decode (`thread_count=1`), avoiding worker thread pool allocation and teardown per check.
+    * Inspects the decoded YUV420p chroma planes $U$ (plane 1) and $V$ (plane 2) directly ($|U-128| + |V-128|$). In infrared monochrome, chroma values are neutral 128 (0.0 saturation). Direct chroma plane inspection eliminates `libswscale` software rescaling, RGB24 format conversions, and buffer allocations.
     * Fallback functions (`analyze_night_vision_frame`, `detect_night_vision_from_jpeg`) remain available for JPEG inputs and backward compatibility.
+  * **Keyframe-Only Subscription Filtering (`subscribe_hevc(keyframes_only=True)`):**
+    * In `VideoStreamer._broadcast_hevc`, delta frames are filtered at broadcast time and never queued to keyframe listeners. The timelapse recorder receives only keyframes (~1 frame/sec) rather than all 15 fps, eliminating ~93% of async queue wakeups and task reschedules.
+  * **Adaptive Check Cadence:**
+    * Night vision sampling operates adaptively:
+      * **60s:** During active timelapse recording in stable darkness, checks occur once every 60 seconds (cutting nighttime CPU decode overhead by 75%).
+      * **15s:** When daylight is detected while recording, checks accelerate to every 15 seconds during the 120s deactivation countdown for prompt auto-stop.
+      * **30s:** While a client viewer is watching the live stream.
+      * **300s:** While the stream is idle (stopped).
   * **Idle Stream Disconnect & 5-Minute Periodic Detection Sampling:**
     * To conserve camera battery/heat, bandwidth, and CPU, the camera P2P stream is **NOT kept running 24/7** when idle.
     * When timelapse is not recording and no client viewers are connected, the stream disconnects.
     * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), acquires a zero-linger lease (`async with streamer.lease(linger=0)`), fetches a keyframe via `get_keyframe()`, and evaluates night vision status.
     * If daylight is detected, the lease exits and the stream disconnects immediately without lingering, remaining stopped until the next 5-minute check.
     * If the stream was started by a viewer (or manual start), user disconnection triggers the standard 300s idle timer without being cut short by background night vision checks.
-    * While the stream is actively running, night vision is checked at a steady cadence (every 30s when idle/viewing, 15s during active recording) by decoding a keyframe. Passive status queries (`/api/status`) do not alter or reset check timers.
     * As soon as night vision is detected, timelapse recording auto-starts immediately (no activation delay).
     * While recording is active, the timelapse recorder holds an active stream lease (`streamer.acquire("timelapse")`), keeping the stream running.
     * When daylight persists for 120s, timelapse stops, releases its lease, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.

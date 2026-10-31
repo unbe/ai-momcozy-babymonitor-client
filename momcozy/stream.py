@@ -791,6 +791,7 @@ class VideoStreamer:
         self._listeners: Set[asyncio.Queue[bytes]] = set()
         self._audio_listeners: Set[asyncio.Queue[bytes]] = set()
         self._hevc_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
+        self._hevc_keyframe_listeners: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._hevc_resync: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._cached_vps: Optional[bytes] = None
         self._cached_sps: Optional[bytes] = None
@@ -827,12 +828,12 @@ class VideoStreamer:
     @property
     def hevc_listener_count(self) -> int:
         """Number of active client queues subscribing to the raw HEVC pass-through stream."""
-        return len(self._hevc_listeners)
+        return len(self._hevc_listeners) + len(self._hevc_keyframe_listeners)
 
     @property
     def total_listener_count(self) -> int:
         """Total active listeners across video, audio, and HEVC pass-through."""
-        return len(self._listeners) + len(self._audio_listeners) + len(self._hevc_listeners)
+        return len(self._listeners) + len(self._audio_listeners) + len(self._hevc_listeners) + len(self._hevc_keyframe_listeners)
 
     @property
     def gop_buffer_size(self) -> int:
@@ -1065,6 +1066,7 @@ class VideoStreamer:
 
         A listener whose queue overflows is flushed and resumed at the next keyframe, so it
         never receives delta frames whose reference frames were dropped.
+        Keyframe-only listeners only receive frames where is_key is True, avoiding queue churn.
         """
         for q in list(self._hevc_listeners):
             if q in self._hevc_resync:
@@ -1084,6 +1086,10 @@ class VideoStreamer:
                 q.put_nowait((chunk, is_key))
             except asyncio.QueueFull:
                 pass
+
+        if is_key and self._hevc_keyframe_listeners:
+            for q in list(self._hevc_keyframe_listeners):
+                _put_drop_oldest(q, (chunk, True))
 
     async def _stream_loop(self) -> None:
         """Internal loop fetching frames from the camera P2P stream."""
@@ -1273,14 +1279,20 @@ class VideoStreamer:
                 else:
                     yield pcm_chunk
 
-    async def subscribe_hevc(self, leased: bool = True) -> AsyncIterator[tuple[bytes, bool]]:
+    async def subscribe_hevc(
+        self, leased: bool = True, keyframes_only: bool = False
+    ) -> AsyncIterator[tuple[bytes, bool]]:
         """Subscribe to raw HEVC Annex B chunks (chunk_bytes, is_key).
 
         With leased=False the subscription does not keep the stream alive by itself; use it
         for consumers that already hold their own lease (e.g. the timelapse recorder).
+        With keyframes_only=True, delta frames are filtered out at broadcast, eliminating
+        unnecessary queue wakeups and task reschedules.
         """
         queue: asyncio.Queue[tuple[bytes, bool]] = asyncio.Queue(maxsize=30)
-        with self._listening(self._hevc_listeners, queue, "raw HEVC pass-through stream", leased):
+        target = self._hevc_keyframe_listeners if keyframes_only else self._hevc_listeners
+        name = "raw HEVC keyframe stream" if keyframes_only else "raw HEVC pass-through stream"
+        with self._listening(target, queue, name, leased):
             if self._latest_hevc_keyframe and self._connected:
                 yield self._latest_hevc_keyframe, True
 

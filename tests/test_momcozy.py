@@ -1358,6 +1358,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_hevc_keyframe(p_slice))
 
     async def test_video_streamer_subscribe_hevc(self):
+        import asyncio
         from momcozy.stream import VideoStreamer
         streamer = VideoStreamer("dev123", "localkey")
         self.assertEqual(streamer.hevc_listener_count, 0)
@@ -1374,6 +1375,21 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(streamer.hevc_listener_count, 1)
         await gen.aclose()
         self.assertEqual(streamer.hevc_listener_count, 0)
+
+        # Test keyframes_only=True
+        streamer._latest_hevc_keyframe = None
+        gen_kf = streamer.subscribe_hevc(keyframes_only=True)
+        t = asyncio.create_task(gen_kf.__anext__())
+        # Broadcast delta frame -> should be ignored by keyframe listener
+        streamer._broadcast_hevc(b"\x00\x00\x00\x01\x01DELTA", is_key=False)
+        await asyncio.sleep(0.01)
+        self.assertFalse(t.done())
+        # Broadcast keyframe -> should be received
+        streamer._broadcast_hevc(b"\x00\x00\x00\x01\x26KEY2", is_key=True)
+        res_chunk, res_is_key = await t
+        self.assertEqual(res_chunk, b"\x00\x00\x00\x01\x26KEY2")
+        self.assertTrue(res_is_key)
+        await gen_kf.aclose()
 
     async def test_web_server_dashboard_webcodecs_and_fallback(self):
         from momcozy.web import HTML_DASHBOARD
@@ -2631,12 +2647,14 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
         # Start auto recording
         act = nv.step(now, is_dark=True, recording=True, session_auto=True)
         self.assertEqual(act, Action.MARK_AUTO)
+        self.assertFalse(nv.is_stopping)
         state, _ = nv.sync_state(now, recording=True, session_auto=True)
         self.assertEqual(state, SyncState.RECORDING)
 
         # Daylight arrives
         act = nv.step(now + 10.0, is_dark=False, recording=True, session_auto=True)
         self.assertEqual(act, Action.NONE)
+        self.assertTrue(nv.is_stopping)
         state, rem = nv.sync_state(now + 10.0, recording=True, session_auto=True)
         self.assertEqual(state, SyncState.STOPPING)
         self.assertAlmostEqual(rem, 120.0, places=1)
@@ -2685,6 +2703,33 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
         # Darkness arrives again: now triggers immediately!
         act = nv.step(now + 60.0, is_dark=True, recording=False, session_auto=False)
         self.assertEqual(act, Action.START_AUTO)
+
+    def test_webserver_adaptive_nv_check_interval(self):
+        from momcozy.web import WebServer
+        from momcozy.timelapse import TimelapseRecorder
+        from unittest.mock import MagicMock
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = False
+        server = WebServer(monitor=MagicMock(), streamer=mock_streamer)
+
+        # 1. Idle with stream stopped: 300s
+        self.assertEqual(server._nv_check_interval(), 300.0)
+
+        # 2. Stream running for viewer (not recording): 30s
+        mock_streamer.is_running = True
+        self.assertEqual(server._nv_check_interval(), 30.0)
+
+        # 3. Timelapse recording in stable darkness: 60s
+        server.timelapse = MagicMock()
+        server.timelapse.is_recording = True
+        server.nv._light_since = None
+        self.assertEqual(server._nv_check_interval(), 60.0)
+
+        # 4. Timelapse recording with daylight detected (stopping countdown): 15s
+        server.nv._light_since = 1000.0
+        self.assertTrue(server.nv.is_stopping)
+        self.assertEqual(server._nv_check_interval(), 15.0)
 
 
 if __name__ == "__main__":

@@ -3285,9 +3285,15 @@ class WebServer:
 
         Sampling is cheap while the stream is up anyway; with the stream down every sample
         means reconnecting to the camera, so it is rare.
+        While recording in stable darkness, 60s checks save CPU; once daylight is detected
+        and the deactivation countdown begins, checks speed up to 15s.
         """
-        if self.nv.activating or (self.timelapse and self.timelapse.is_recording):
+        if self.nv.activating:
             return 15.0
+        if self.timelapse and self.timelapse.is_recording:
+            if getattr(self.nv, "is_stopping", False):
+                return 15.0
+            return 60.0
         if self.streamer and self.streamer.is_running:
             return 30.0
         return 300.0
