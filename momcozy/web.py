@@ -196,6 +196,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       border-radius: 6px;
       background: #EBF8FF;
       color: var(--accent-blue);
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .badge.active { background: #F0FFF4; color: var(--accent-green); }
     .badge.alert { background: #FFF5F5; color: #E53E3E; }
@@ -659,7 +661,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               <option value="90">1:90</option>
             </select>
           </h2>
-          <span class="badge" id="timelapse-badge">Stopped</span>
+          <span class="badge" id="timelapse-badge" style="white-space:nowrap; flex-shrink:0;">Stopped</span>
         </div>
         <div class="control-row">
           <span>Time Recorded</span>
@@ -1605,7 +1607,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           badge.className = 'badge active';
           badge.style.background = '#FED7D7';
           badge.style.color = '#C53030';
-          badge.innerText = tl.last_session_type === 'auto' ? 'Recording 🌙' : 'Recording';
+          badge.style.whiteSpace = 'nowrap';
+          badge.style.flexShrink = '0';
+          badge.innerText = tl.last_session_type === 'auto' ? 'Recording\u00A0🌙' : 'Recording';
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏹ Stop Recording';
