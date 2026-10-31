@@ -2524,12 +2524,13 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
 
             # Perform single check simulating _background_monitor_loop logic:
             now_mono = time.monotonic()
+            connected_for_nv_check = True
             clean_frame = await mock_streamer.get_clean_frame()
             is_nv = server.is_night_vision_active(st, frame_bytes=clean_frame)
             self.assertFalse(is_nv, "Red image should be detected as daylight, not night vision")
 
             if (
-                clean_frame is not None
+                connected_for_nv_check
                 and mock_streamer.is_running
                 and mock_streamer.total_listener_count == 0
                 and not server.timelapse.is_recording
@@ -2539,6 +2540,57 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(stopped_calls), 1, "Stream should be stopped immediately after detecting daylight")
             self.assertFalse(mock_streamer.is_running)
+
+    async def test_timelapse_night_vision_viewer_idle_timeout_preserved(self):
+        """When the stream was started for viewers, night vision daylight check must NOT cancel idle timer."""
+        from PIL import Image
+        import io
+        st = BM04Status(night_vision="0", raw_dps={"108": "0"})
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = st
+
+        im = Image.new("RGB", (32, 32), color=(255, 0, 0))
+        bio = io.BytesIO()
+        im.save(bio, format="JPEG")
+        daylight_jpeg = bio.getvalue()
+
+        stopped_calls = []
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = True
+        mock_streamer.total_listener_count = 0  # Viewer just disconnected
+
+        async def fake_clean_frame(timeout_seconds=5.0):
+            return daylight_jpeg
+        mock_streamer.get_clean_frame = fake_clean_frame
+
+        async def fake_stop():
+            mock_streamer.is_running = False
+            stopped_calls.append(True)
+        mock_streamer.stop = fake_stop
+
+        with tempfile.TemporaryDirectory() as td:
+            server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td)
+            server.timelapse.sync_night_vision = True
+
+            # Stream was already running (connected_for_nv_check = False)
+            connected_for_nv_check = False
+            clean_frame = await mock_streamer.get_clean_frame()
+            is_nv = server.is_night_vision_active(st, frame_bytes=clean_frame)
+            self.assertFalse(is_nv)
+
+            if (
+                connected_for_nv_check
+                and mock_streamer.is_running
+                and mock_streamer.total_listener_count == 0
+                and not server.timelapse.is_recording
+                and server._nv_active_start is None
+            ):
+                await mock_streamer.stop()
+
+            # Must NOT stop the streamer; let 300s viewer idle timeout run its course!
+            self.assertEqual(len(stopped_calls), 0)
+            self.assertTrue(mock_streamer.is_running)
 
 
 if __name__ == "__main__":

@@ -97,7 +97,9 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * To conserve camera battery/heat, bandwidth, and CPU, the camera P2P stream is **NOT kept running 24/7** when idle.
     * When timelapse is not recording and no client viewers are connected, the stream disconnects.
     * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), restarts the P2P stream via `VideoStreamer.get_clean_frame()`, captures a clean keyframe, and evaluates night vision status.
-    * If daylight is detected (or check completes with 0 active viewers), the stream disconnects immediately (`await self.streamer.stop()`) without waiting for the 300s idle timeout to expire, remaining stopped until the next 5-minute check.
+    * If daylight is detected AND the stream was connected solely for this periodic check (`connected_for_nv_check == True`), the stream disconnects immediately (`await self.streamer.stop()`) without waiting for the 300s idle timeout to expire, remaining stopped until the next 5-minute check.
+    * If the stream was started by a viewer (or manual start), user disconnection triggers the standard 300s idle timer without being cut short by background night vision checks.
+    * While the stream is actively running, night vision is checked at a steady cadence (every 30s when idle/viewing, 15s during the 60s countdown or active recording) by decoding a keyframe from the rolling GOP buffer. Passive status queries (`/api/status`) do not alter or reset check timers.
     * If night vision is detected, the stream stays running, the 60s activation debounce starts, and timelapse recording auto-starts after 60s of continuous darkness.
     * While recording is active (or during the 60s activation window), `VideoStreamer.keepalive` keeps the stream running.
     * When daylight persists for 120s, timelapse stops, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.
