@@ -1354,6 +1354,68 @@ class VideoStreamer:
         finally:
             self._snapshot_requests.discard(req_id)
 
+    async def get_clean_frame(self, timeout_seconds: float = 25.0) -> bytes:
+        """Capture a clean, newly decoded JPEG frame from the camera.
+
+        If the stream is not running, starts the stream and waits for the first valid keyframe/JPEG.
+        Ensures the frame is a valid image received after the request started.
+        """
+        if not self._running:
+            await self.start()
+        elif not self._listeners and not self._hevc_listeners and self.idle_timeout > 0:
+            self._cancel_idle_stop()
+
+        start_time = time.monotonic()
+        req_id = object()
+        self._snapshot_requests.add(req_id)
+
+        try:
+            # If an existing decoded frame is very fresh (< 1.5s old), return it immediately
+            if (
+                self._latest_frame
+                and (time.monotonic() - self._latest_frame_time) < 1.5
+                and len(self._latest_frame) > 0
+            ):
+                return self._latest_frame
+
+            # Otherwise wait for a frame received after start_time
+            while time.monotonic() - start_time < timeout_seconds:
+                if self._latest_frame and self._latest_frame_time >= start_time:
+                    if len(self._latest_frame) > 0:
+                        return self._latest_frame
+
+                if self._gop_chunks and self._gop_time >= start_time:
+                    gop_copy = list(self._gop_chunks)
+                    loop = asyncio.get_running_loop()
+                    jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, gop_copy)
+                    if jpeg_bytes and len(jpeg_bytes) > 0:
+                        self._latest_frame = jpeg_bytes
+                        self._latest_frame_time = time.monotonic()
+                        if not self._latest_detection_snapshot:
+                            self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
+                        return jpeg_bytes
+
+                if self._last_error and time.monotonic() - start_time > 5.0:
+                    raise RuntimeError(f"Camera stream error: {self._last_error}")
+
+                await asyncio.sleep(0.05)
+
+            if self._latest_frame and len(self._latest_frame) > 0:
+                logger.warning("Timed out waiting for new clean frame; returning latest available frame")
+                return self._latest_frame
+
+            err_suffix = f": {self._last_error}" if self._last_error else ""
+            raise TimeoutError(f"Timed out waiting for clean video frame from camera{err_suffix}")
+        finally:
+            self._snapshot_requests.discard(req_id)
+            if (
+                not self._listeners
+                and not self._audio_listeners
+                and not self._hevc_listeners
+                and self.idle_timeout > 0
+            ):
+                self._schedule_idle_stop()
+
     async def record_clip(
         self,
         output_file: str | Path,

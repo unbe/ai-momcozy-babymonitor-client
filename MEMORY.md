@@ -92,9 +92,14 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Interactive Scrubber Markers & Navigation:** In `/timelapse`, motion events appear as glowing amber notches on the timeline scrubber. Hovering over a marker shows the event label, wall-clock time, and video timestamp. Clicking any marker seeks directly to that moment. Next (`N`) and Previous (`P`) motion navigation buttons allow jumping between highlights. The main dashboard Timelapse card displays an active count badge (`🏃 N events`).
 * **Server-Side Night Vision Timelapse Automation (0% Client Overhead):**
   * **Completely Headless & Server-Side:** The automation runs entirely inside `WebServer._background_monitor_loop()` on the host/container. It operates autonomously without requiring any browser window, tab, or client socket to remain open.
-  * **Persistent Configuration & Stream Keep-Alive:**
-    * Toggling the sync feature via `[Sync with Night Vision: ON]` persists `"sync_night_vision": true` and `"last_session_type"` in `timelapse/meta.json`. Server restarts immediately restore the monitoring loop.
-    * When `sync_night_vision` is active, `VideoStreamer.keepalive` (evaluated via `keepalive_predicate`) suppresses the 300s idle disconnect timer so the camera stream stays connected in the background. This ensures continuous, real-time night vision detection entirely server-side without requiring connected browser tabs.
+  * **Idle Stream Disconnect & 5-Minute Periodic Detection Sampling:**
+    * To conserve camera battery/heat, bandwidth, and CPU, the camera P2P stream is **NOT kept running 24/7** when idle.
+    * When timelapse is not recording and no client viewers are connected, the stream disconnects.
+    * When `sync_night_vision` is enabled and the stream is stopped, `WebServer._background_monitor_loop` wakes up every 5 minutes (300s), restarts the P2P stream via `VideoStreamer.get_clean_frame()`, captures a clean keyframe, and evaluates night vision status.
+    * If daylight is detected, the stream is immediately stopped until the next 5-minute check.
+    * If night vision is detected, the stream stays running, the 60s activation debounce starts, and timelapse recording auto-starts after 60s of continuous darkness.
+    * While recording is active (or during the 60s activation window), `VideoStreamer.keepalive` keeps the stream running.
+    * When daylight persists for 120s, timelapse stops, and if no client viewers are connected, the stream disconnects and returns to 5-minute periodic checks.
   * **Logging Conventions:**
     * Log messages must use clean, readable plain text without emojis or non-standard Unicode symbols.
   * **Auto Mode ("0") Night Vision Physical Detection via Frame Saturation:**

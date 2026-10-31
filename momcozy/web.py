@@ -2464,16 +2464,16 @@ class WebServer:
         )
         if self.streamer:
             self.streamer.keepalive_predicate = lambda: bool(
-                self.timelapse and (self.timelapse.is_recording or self.timelapse.sync_night_vision)
+                (self.timelapse and self.timelapse.is_recording)
+                or (self._nv_active_start is not None)
             )
-            if self.timelapse and self.timelapse.sync_night_vision:
-                self.streamer._cancel_idle_stop()
         self._cached_status: Optional[Any] = None
         self._cached_status_time: float = 0.0
         self._nv_active_start: Optional[float] = None
         self._nv_inactive_start: Optional[float] = None
         self._last_detected_nv: bool = False
         self._last_nv_frame_check: float = 0.0
+        self._last_nv_poll_time: float = 0.0
         self._nv_session_was_active: bool = False
         self._nv_manual_stopped: bool = False
         self.app = web.Application()
@@ -2821,9 +2821,12 @@ class WebServer:
 
         # In Auto mode ("0"), detect physical infrared night vision via frame analysis:
         target_frame = frame_bytes
-        if target_frame is None and self.streamer and callable(getattr(self.streamer, "latest_frame", None)):
+        if target_frame is None and self.streamer:
             try:
-                target_frame = self.streamer.latest_frame()
+                frame_val = getattr(self.streamer, "latest_frame", None)
+                if callable(frame_val):
+                    frame_val = frame_val()
+                target_frame = frame_val
             except Exception:
                 target_frame = None
 
@@ -3261,13 +3264,7 @@ class WebServer:
         self._nv_inactive_start = None
         if self.streamer:
             if enabled:
-                if callable(getattr(self.streamer, "_cancel_idle_stop", None)):
-                    self.streamer._cancel_idle_stop()
-                if not getattr(self.streamer, "is_running", False):
-                    if callable(getattr(self.streamer, "start", None)):
-                        res = self.streamer.start()
-                        if asyncio.iscoroutine(res):
-                            asyncio.create_task(res)
+                self._last_nv_poll_time = 0.0
             else:
                 if not self.timelapse.is_recording and getattr(self.streamer, "total_listener_count", 0) == 0:
                     if callable(getattr(self.streamer, "_schedule_idle_stop", None)):
@@ -3377,17 +3374,45 @@ class WebServer:
 
                 # 1. Night Vision Automation
                 if self.timelapse.sync_night_vision:
-                    # In Auto mode ("0"), DP 108 is static. Fetch a frame for monochrome IR detection if needed.
                     nv_mode = getattr(status, "night_vision", "0")
-                    if str(nv_mode) == "0" and self.streamer and callable(getattr(self.streamer, "get_snapshot", None)):
-                        latest_time = self.streamer.latest_frame_time() if callable(getattr(self.streamer, "latest_frame_time", None)) else 0.0
-                        if (now_mono - latest_time > 10.0) and (now_mono - self._last_nv_frame_check > 8.0):
-                            try:
-                                await self.streamer.get_snapshot(timeout_seconds=3.0)
-                            except Exception as snap_err:
-                                logger.debug("Snapshot query for night vision check failed: %s", snap_err)
+                    raw = getattr(status, "raw_dps", {}) or {}
+                    dp_108 = str(raw.get("108", nv_mode)).strip()
 
-                    is_nv = self.is_night_vision_active(status)
+                    clean_frame: Optional[bytes] = None
+
+                    if dp_108 == "0" and self.streamer:
+                        streamer_running = getattr(self.streamer, "is_running", False)
+                        if not streamer_running:
+                            # Stream is stopped. Periodic check every 5 minutes (300s):
+                            if (now_mono - self._last_nv_poll_time >= 300.0) or (self._last_nv_poll_time == 0.0):
+                                self._last_nv_poll_time = now_mono
+                                logger.info("Checking night vision state (restarting camera stream for clean frame)...")
+                                try:
+                                    if hasattr(self.streamer, "get_clean_frame"):
+                                        res = self.streamer.get_clean_frame(timeout_seconds=25.0)
+                                        clean_frame = await res if asyncio.iscoroutine(res) else res
+                                    elif hasattr(self.streamer, "get_snapshot"):
+                                        res = self.streamer.get_snapshot(timeout_seconds=25.0)
+                                        clean_frame = await res if asyncio.iscoroutine(res) else res
+                                except Exception as err:
+                                    logger.warning("Could not fetch clean frame for night vision check: %s", err)
+                                    clean_frame = None
+                        else:
+                            # Stream is already running (viewers, active recording, or countdown).
+                            time_val = getattr(self.streamer, "latest_frame_time", 0.0)
+                            latest_time = time_val() if callable(time_val) else float(time_val or 0.0)
+                            if (now_mono - latest_time > 10.0) and (now_mono - self._last_nv_frame_check > 8.0):
+                                try:
+                                    if hasattr(self.streamer, "get_clean_frame"):
+                                        res = self.streamer.get_clean_frame(timeout_seconds=5.0)
+                                        clean_frame = await res if asyncio.iscoroutine(res) else res
+                                    elif hasattr(self.streamer, "get_snapshot"):
+                                        res = self.streamer.get_snapshot(timeout_seconds=5.0)
+                                        clean_frame = await res if asyncio.iscoroutine(res) else res
+                                except Exception as snap_err:
+                                    logger.debug("Snapshot query for night vision check failed: %s", snap_err)
+
+                    is_nv = self.is_night_vision_active(status, frame_bytes=clean_frame)
                     if is_nv:
                         # Night vision is active
                         self._nv_inactive_start = None
@@ -3436,8 +3461,32 @@ class WebServer:
                                         await self.timelapse.stop()
                                         self._nv_session_was_active = False
                                         self._nv_inactive_start = None
+                                        # When auto-stop completes, if no client viewers connected, stop camera stream
+                                        if (
+                                            self.streamer
+                                            and getattr(self.streamer, "total_listener_count", 0) == 0
+                                        ):
+                                            logger.info("Timelapse auto-stopped and no viewers connected. Stopping camera stream.")
+                                            res = self.streamer.stop()
+                                            if asyncio.iscoroutine(res):
+                                                await res
+                                            self._last_nv_poll_time = now_mono
                             else:
                                 self._nv_inactive_start = None
+                        else:
+                            # Not recording and night vision is inactive:
+                            # If stream was restarted for periodic check and has 0 viewers, stop stream immediately
+                            if (
+                                clean_frame is not None
+                                and self.streamer
+                                and getattr(self.streamer, "is_running", False)
+                                and getattr(self.streamer, "total_listener_count", 0) == 0
+                                and self._nv_active_start is None
+                            ):
+                                logger.info("Night vision inactive (daylight) and no viewers connected. Stopping camera stream.")
+                                res = self.streamer.stop()
+                                if asyncio.iscoroutine(res):
+                                    await res
 
                 # 2. Motion Events Tracking (while recording)
                 if self.timelapse.is_recording:

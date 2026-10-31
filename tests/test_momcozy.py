@@ -2466,6 +2466,80 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(stopped, "Manual daytime recording should not be stopped by daylight automation!")
 
+    async def test_get_clean_frame_returns_fresh_keyframe(self):
+        from momcozy.stream import VideoStreamer
+        streamer = VideoStreamer(device_id="dev1", local_key="key1")
+        streamer._running = False
+        
+        # When get_clean_frame is called on stopped streamer, start is invoked
+        async def fake_start():
+            streamer._running = True
+            # Simulate first frame arriving from live stream:
+            streamer._latest_frame = b"\xff\xd8\xff\xe0" + b"X" * 200
+            streamer._latest_frame_time = time.monotonic()
+        streamer.start = fake_start
+
+        frame = await streamer.get_clean_frame(timeout_seconds=2.0)
+        self.assertIsNotNone(frame)
+        self.assertTrue(frame.startswith(b"\xff\xd8"))
+
+    async def test_night_vision_periodic_check_stops_stream_when_daylight(self):
+        """When night vision sync is enabled and stream is stopped, periodic check fetches clean frame and stops if daylight."""
+        mock_monitor = MagicMock()
+        st = MagicMock()
+        st.night_vision = "0"
+        st.raw_dps = {"108": "0"}
+        mock_monitor.get_status.return_value = st
+
+        mock_streamer = MagicMock()
+        mock_streamer.is_running = False
+        mock_streamer.total_listener_count = 0
+        
+        # Daylight frame (RGB color difference is high)
+        from PIL import Image
+        import io
+        img = Image.new("RGB", (32, 32), color=(255, 0, 0)) # Red = daylight
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        daylight_jpeg = buf.getvalue()
+
+        stopped_calls = []
+        async def fake_clean_frame(timeout_seconds=25.0):
+            mock_streamer.is_running = True
+            return daylight_jpeg
+        mock_streamer.get_clean_frame = fake_clean_frame
+
+        async def fake_stop():
+            mock_streamer.is_running = False
+            stopped_calls.append(True)
+        mock_streamer.stop = fake_stop
+
+        with tempfile.TemporaryDirectory() as td:
+            server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
+            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td)
+            server.timelapse.sync_night_vision = True
+
+            # Verify keepalive does not keep stream alive when not recording and no countdown
+            self.assertFalse(mock_streamer.keepalive_predicate())
+
+            # Perform single check simulating _background_monitor_loop logic:
+            now_mono = time.monotonic()
+            clean_frame = await mock_streamer.get_clean_frame()
+            is_nv = server.is_night_vision_active(st, frame_bytes=clean_frame)
+            self.assertFalse(is_nv, "Red image should be detected as daylight, not night vision")
+
+            if (
+                clean_frame is not None
+                and mock_streamer.is_running
+                and mock_streamer.total_listener_count == 0
+                and not server.timelapse.is_recording
+                and server._nv_active_start is None
+            ):
+                await mock_streamer.stop()
+
+            self.assertEqual(len(stopped_calls), 1, "Stream should be stopped immediately after detecting daylight")
+            self.assertFalse(mock_streamer.is_running)
+
 
 if __name__ == "__main__":
     unittest.main()
