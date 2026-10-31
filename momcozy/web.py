@@ -2463,7 +2463,7 @@ class WebServer:
             TimelapseRecorder(streamer=self.streamer) if self.streamer else None
         )
         if self.streamer:
-            self.streamer.is_keepalive_required = lambda: bool(
+            self.streamer.keepalive_predicate = lambda: bool(
                 self.timelapse and (self.timelapse.is_recording or self.timelapse.sync_night_vision)
             )
             if self.timelapse and self.timelapse.sync_night_vision:
@@ -2833,9 +2833,9 @@ class WebServer:
                 new_nv = detect_night_vision_from_jpeg(target_frame)
                 if new_nv != self._last_detected_nv:
                     if new_nv:
-                        logger.info("🌙 Automatic Night Vision kick-in detected (camera frame transitioned to infrared monochrome).")
+                        logger.info("Automatic Night Vision kick-in detected (camera frame transitioned to infrared monochrome).")
                     else:
-                        logger.info("☀️ Automatic Night Vision kick-out detected (camera frame transitioned to daylight color).")
+                        logger.info("Automatic Night Vision kick-out detected (camera frame transitioned to daylight color).")
                 self._last_detected_nv = new_nv
                 self._last_nv_frame_check = now_mono
             return self._last_detected_nv
@@ -3393,14 +3393,14 @@ class WebServer:
                         self._nv_inactive_start = None
                         if self.timelapse.is_recording:
                             if not self._nv_session_was_active:
-                                logger.info("🌙 Night Vision active detected during ongoing recording session (session marked as auto).")
+                                logger.info("Night Vision active detected during ongoing recording session (session marked as auto).")
                             self._nv_session_was_active = True
                             self.timelapse.current_session_type = "auto"
                         else:
                             if not self._nv_manual_stopped:
                                 if self._nv_active_start is None:
                                     self._nv_active_start = now_mono
-                                    logger.info("🌙 Night Vision active detected on camera. Starting 60s activation timer...")
+                                    logger.info("Night Vision active detected on camera. Starting 60s activation timer...")
                                 else:
                                     active_sec = now_mono - self._nv_active_start
                                     if active_sec >= 60.0:
@@ -3408,7 +3408,7 @@ class WebServer:
                                         # "If the previous timelapse for automatic, the next automatic one appends to that, not restart."
                                         fresh = (self.timelapse.last_session_type != "auto")
                                         logger.info(
-                                            "🌙 Night Vision active for >= 60s (%.1fs). Auto-starting timelapse (fresh=%s, prev_session=%s)...",
+                                            "Night Vision active for >= 60s (%.1fs). Auto-starting timelapse (fresh=%s, prev_session=%s)...",
                                             active_sec,
                                             fresh,
                                             self.timelapse.last_session_type,
@@ -3424,13 +3424,13 @@ class WebServer:
                             if self.timelapse.current_session_type == "auto" or self._nv_session_was_active:
                                 if self._nv_inactive_start is None:
                                     self._nv_inactive_start = now_mono
-                                    logger.info("☀️ Night Vision inactive detected on camera. Starting 120s deactivation timer...")
+                                    logger.info("Night Vision inactive detected on camera. Starting 120s deactivation timer...")
                                 else:
                                     inactive_sec = now_mono - self._nv_inactive_start
                                     if inactive_sec >= 120.0:
                                         # 2 minutes continuous daylight/inactive reached
                                         logger.info(
-                                            "☀️ Night Vision inactive for >= 120s (%.1fs). Auto-stopping timelapse...",
+                                            "Night Vision inactive for >= 120s (%.1fs). Auto-stopping timelapse...",
                                             inactive_sec,
                                         )
                                         await self.timelapse.stop()

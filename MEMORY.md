@@ -93,8 +93,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
 * **Server-Side Night Vision Timelapse Automation (0% Client Overhead):**
   * **Completely Headless & Server-Side:** The automation runs entirely inside `WebServer._background_monitor_loop()` on the host/container. It operates autonomously without requiring any browser window, tab, or client socket to remain open.
   * **Persistent Configuration & Stream Keep-Alive:**
-    * Toggling the sync feature via `[🌙 Sync with Night Vision: ON]` persists `"sync_night_vision": true` and `"last_session_type"` in `timelapse/meta.json`. Server restarts immediately restore the monitoring loop.
-    * When `sync_night_vision` is active, `VideoStreamer.is_keepalive_required` suppresses the 300s idle disconnect timer so the camera stream stays connected in the background. This ensures continuous, real-time night vision detection entirely server-side without requiring connected browser tabs.
+    * Toggling the sync feature via `[Sync with Night Vision: ON]` persists `"sync_night_vision": true` and `"last_session_type"` in `timelapse/meta.json`. Server restarts immediately restore the monitoring loop.
+    * When `sync_night_vision` is active, `VideoStreamer.keepalive` (evaluated via `keepalive_predicate`) suppresses the 300s idle disconnect timer so the camera stream stays connected in the background. This ensures continuous, real-time night vision detection entirely server-side without requiring connected browser tabs.
+  * **Logging Conventions:**
+    * Log messages must use clean, readable plain text without emojis or non-standard Unicode symbols.
   * **Auto Mode ("0") Night Vision Physical Detection via Frame Saturation:**
     * On Tuya IPC cameras, `basic_nightvision` (DP 108) represents the configured mode (`"0"` = Auto, `"1"` = Off, `"2"` = On). In Auto mode (`"0"`), the camera hardware physically flips the IR-cut filter and activates the IR LEDs locally in darkness, but **DP 108 remains `"0"`** in telemetry.
     * `detect_night_vision_from_jpeg()` inspects a 16x16 subsampled thumbnail of the camera frame (< 1.5ms computation). Daytime frames show strong color saturation ($|R-G| + |G-B| + |B-R| \gg 10.0$), whereas infrared night vision frames are monochrome grayscale where $R \approx G \approx B$ (mean diff $< 8.0$).

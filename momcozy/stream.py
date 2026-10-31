@@ -786,7 +786,7 @@ class VideoStreamer:
         self._snapshot_requests: Set[object] = set()
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
-        self.is_keepalive_required: Optional[Callable[[], bool]] = None
+        self.keepalive_predicate: Optional[Callable[[], bool]] = None
         self._lock = asyncio.Lock()
 
     @property
@@ -840,6 +840,16 @@ class VideoStreamer:
     def is_audio_needed(self) -> bool:
         """Return True only if an active listener is consuming audio."""
         return len(self._audio_listeners) > 0
+
+    @property
+    def keepalive(self) -> bool:
+        """Return True if background tasks require keeping the stream alive without connected clients."""
+        if self.keepalive_predicate is not None:
+            try:
+                return bool(self.keepalive_predicate())
+            except Exception:
+                return False
+        return False
 
     @property
     def last_error(self) -> Optional[str]:
@@ -919,7 +929,7 @@ class VideoStreamer:
             return
         if self.total_listener_count > 0:
             return
-        if self.is_keepalive_required and self.is_keepalive_required():
+        if self.keepalive:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -949,7 +959,7 @@ class VideoStreamer:
                 and not self._audio_listeners
                 and not self._hevc_listeners
                 and self._running
-                and not (self.is_keepalive_required and self.is_keepalive_required())
+                and not self.keepalive
             ):
                 logger.info(
                     "No stream clients connected for %d minutes (%ds). Disconnecting cloud video stream to conserve resources.",
@@ -1105,7 +1115,7 @@ class VideoStreamer:
                             except TimeoutError:
                                 if chunks_received == 0:
                                     logger.warning(
-                                        "✗ Timed out waiting for initial video stream from camera %s (%.0fs). Re-establishing P2P session...",
+                                        "Timed out waiting for initial video stream from camera %s (%.0fs). Re-establishing P2P session...",
                                         self.device_id,
                                         timeout,
                                     )
@@ -1113,7 +1123,7 @@ class VideoStreamer:
                                     # so status endpoint keeps reporting stream_running: true, stream_connected: false
                                 else:
                                     err_msg = f"Live video stream stalled: no data received from camera {self.device_id} for {timeout:.0f}s"
-                                    logger.warning("✗ %s. Reconnecting...", err_msg)
+                                    logger.warning("%s. Reconnecting...", err_msg)
                                     self._last_error = err_msg
                                 self._connected = False
                                 break
@@ -1124,7 +1134,7 @@ class VideoStreamer:
                             chunks_received += 1
                             if chunks_received == 1:
                                 logger.info(
-                                    "✓ First live video stream chunk received for %s (%d bytes). Stream active.",
+                                    "First live video stream chunk received for %s (%d bytes). Stream active.",
                                     self.device_id,
                                     len(chunk),
                                 )

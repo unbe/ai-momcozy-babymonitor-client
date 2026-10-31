@@ -93,7 +93,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             for dev_ip, dev_info in devices.items():
                 if dev_info.get("gwId") == dev_id or dev_info.get("id") == dev_id:
                     ip = dev_ip
-                    logger.info("✓ Discovered camera %s on local network at %s", dev_id, ip)
+                    logger.info("Discovered camera %s on local network at %s", dev_id, ip)
                     saved["ip"] = ip
                     if config_path.exists():
                         try:
@@ -107,7 +107,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
 
         if not ip:
             logger.warning(
-                "✗ Camera %s was NOT discovered on local network via UDP broadcast.\n"
+                "Camera %s was NOT discovered on local network via UDP broadcast.\n"
                 "  • Reason: UDP broadcasts (ports 6666/6667) do not cross different subnets/VLANs or Docker bridge networks.\n"
                 "  • How to enable local control: Provide your camera's LAN IP address directly using:\n"
                 "      - Environment variable: MOMCOZY_IP=<CAMERA_IP>\n"
@@ -131,12 +131,12 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     pass
                 if dev_id and dev_id in synced and synced[dev_id].get("local_key"):
                     local_key = synced[dev_id]["local_key"]
-                    logger.info("✓ Retrieved and saved Tuya local encryption key for %s", dev_id)
+                    logger.info("Retrieved and saved Tuya local encryption key for %s", dev_id)
                 else:
                     found_key = next((item["local_key"] for item in synced.values() if item.get("local_key")), None)
                     if found_key:
                         local_key = found_key
-                        logger.info("✓ Retrieved and saved Tuya local encryption key")
+                        logger.info("Retrieved and saved Tuya local encryption key")
                     else:
                         logger.warning(
                             "Tuya Cloud did not return an encryption key for device %s. "

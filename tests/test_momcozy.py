@@ -2234,7 +2234,8 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(streamer._idle_task)
 
         # With keepalive required:
-        streamer.is_keepalive_required = lambda: True
+        streamer.keepalive_predicate = lambda: True
+        self.assertTrue(streamer.keepalive)
         streamer._schedule_idle_stop()
         self.assertIsNone(streamer._idle_task)
 

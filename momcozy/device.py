@@ -190,19 +190,19 @@ class MomcozyMonitor:
             with socket.create_connection((self.ip, 6668), timeout=1.5):
                 self._lan_tcp_unavailable = False
                 self.control_diagnostic = f"Local LAN TCP port 6668 reachable at {self.ip}"
-                logger.info("✓ Local LAN control active: connected to camera at %s:6668", self.ip)
+                logger.info("Local LAN control active: connected to camera at %s:6668", self.ip)
                 return True
         except Exception as exc:
             if allow_rediscovery and self.device_id:
                 old_ip = self.ip
                 logger.info(
-                    "✗ Camera not reachable at %s:6668 (%s). Scanning local network via UDP broadcast...",
+                    "Camera not reachable at %s:6668 (%s). Scanning local network via UDP broadcast...",
                     old_ip,
                     exc,
                 )
                 discovered_ip = self.discover_local_ip()
                 if discovered_ip and discovered_ip != old_ip:
-                    logger.info("✓ Camera rediscovered at new IP %s. Retesting connection...", discovered_ip)
+                    logger.info("Camera rediscovered at new IP %s. Retesting connection...", discovered_ip)
                     self.set_ip(discovered_ip, test_connection=False)
                     return self.test_local_lan_connection(allow_rediscovery=False)
 
@@ -212,7 +212,7 @@ class MomcozyMonitor:
                 "Device control will fall back to Tuya Cloud Gateway."
             )
             logger.warning(
-                "✗ Local LAN connection to %s:6668 failed (%s). "
+                "Local LAN connection to %s:6668 failed (%s). "
                 "Device control will fall back to Tuya Cloud Gateway.",
                 self.ip,
                 exc,
@@ -275,7 +275,7 @@ class MomcozyMonitor:
             devices = tinytuya.deviceScan(False, timeout)
             for dev_ip, dev_info in devices.items():
                 if dev_info.get("gwId") == self.device_id or dev_info.get("id") == self.device_id:
-                    logger.info("✓ Discovered camera %s on local network at %s", self.device_id, dev_ip)
+                    logger.info("Discovered camera %s on local network at %s", self.device_id, dev_ip)
                     self.set_ip(dev_ip, test_connection=False)
                     if self.on_ip_discovered:
                         try:
@@ -284,7 +284,7 @@ class MomcozyMonitor:
                             logger.debug("on_ip_discovered callback error: %s", save_err)
                     return dev_ip
             logger.warning(
-                "✗ Camera %s was not found in local UDP scan. "
+                "Camera %s was not found in local UDP scan. "
                 "(Note: UDP broadcast discovery cannot cross subnets/VLANs or Docker bridge networks unless host networking is enabled).",
                 self.device_id,
             )
