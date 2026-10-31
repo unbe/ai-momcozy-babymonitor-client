@@ -1655,7 +1655,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const sec = Math.round(tl.sync_timer_remaining || 0);
             label = `☀️ Day Mode Detected (Stops in ${sec}s)`;
           } else if (tl.is_recording && tl.last_session_type === 'auto') {
-            label = '🌙 Sync: Recording 🌙 (Active)';
+            label = '🌙 Sync: Recording (Active)';
           } else if (tl.night_vision_active) {
             label = '🌙 Sync with Night Vision: ON (Active)';
           }
