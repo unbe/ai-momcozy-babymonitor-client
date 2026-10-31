@@ -2824,7 +2824,13 @@ class WebServer:
         if target_frame and isinstance(target_frame, (bytes, bytearray)):
             now_mono = time.monotonic()
             if (now_mono - self._last_nv_frame_check) >= 5.0 or frame_bytes is not None:
-                self._last_detected_nv = detect_night_vision_from_jpeg(target_frame)
+                new_nv = detect_night_vision_from_jpeg(target_frame)
+                if new_nv != self._last_detected_nv:
+                    if new_nv:
+                        logger.info("🌙 Automatic Night Vision kick-in detected (camera frame transitioned to infrared monochrome).")
+                    else:
+                        logger.info("☀️ Automatic Night Vision kick-out detected (camera frame transitioned to daylight color).")
+                self._last_detected_nv = new_nv
                 self._last_nv_frame_check = now_mono
             return self._last_detected_nv
 
@@ -3247,8 +3253,6 @@ class WebServer:
         self.timelapse.set_sync_night_vision(enabled)
         self._nv_active_start = None
         self._nv_inactive_start = None
-
-        logger.info("Timelapse Night Vision synchronization set to %s", self.timelapse.sync_night_vision)
         return web.json_response({
             "success": True,
             "sync_night_vision": self.timelapse.sync_night_vision,
@@ -3369,6 +3373,8 @@ class WebServer:
                         # Night vision is active
                         self._nv_inactive_start = None
                         if self.timelapse.is_recording:
+                            if not self._nv_session_was_active:
+                                logger.info("🌙 Night Vision active detected during ongoing recording session (session marked as auto).")
                             self._nv_session_was_active = True
                             self.timelapse.current_session_type = "auto"
                         else:
