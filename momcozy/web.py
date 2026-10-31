@@ -2796,35 +2796,24 @@ class WebServer:
         )
 
     def is_night_vision_active(self, status: Optional[Any], frame_bytes: Optional[bytes] = None) -> bool:
-        """Check whether Night Vision is currently engaged on the monitor.
+        """Check whether automatic Night Vision is currently engaged on the monitor.
 
-        Supports:
-        1. Explicit forced On ("2", "ON") or forced Off ("1", "OFF") via DP 108.
-        2. Hardware flags (ir_cut, ir_status).
-        3. Automatic mode ("0"): Camera does not change DP 108 in Auto mode. In Auto mode,
-           video frame analysis detects whether the frame is infrared monochrome (IR cut filter open)
-           vs full-color daytime.
+        Only operates when camera is in Automatic night mode (DP 108 == '0').
+        Does not react to manually forced night vision (DP 108 == '1' or '2').
+        Detects automatic night vision kicking in/out via video frame analysis.
         """
         if not status:
             return False
-        nv = getattr(status, "night_vision", None)
+
+        nv = getattr(status, "night_vision", "0")
         raw = getattr(status, "raw_dps", {}) or {}
+        dp_108 = str(raw.get("108", nv)).strip()
 
-        # 1. Explicit forced states
-        if str(nv).lower() in ("2", "on", "true"):
-            return True
-        if str(nv).lower() in ("1", "off", "false"):
-            return False
-        if str(raw.get("108", "")).lower() in ("2", "on", "true"):
-            return True
-        if str(raw.get("108", "")).lower() in ("1", "off", "false"):
-            return False
-        if raw.get("ir_cut") is True or raw.get("ir_status") in ("1", "2", True):
-            return True
-        if raw.get("ir_cut") is False or raw.get("ir_status") in ("0", False):
+        # Only work with Auto mode ("0"). If manually set to 1 or 2, ignore/inactive.
+        if dp_108 != "0":
             return False
 
-        # 2. In Auto mode ("0"), DP 108 remains "0" even when IR filter and LEDs activate in the dark.
+        # In Auto mode ("0"), detect physical infrared night vision via frame analysis:
         target_frame = frame_bytes
         if target_frame is None and self.streamer and callable(getattr(self.streamer, "latest_frame", None)):
             try:

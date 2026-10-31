@@ -2170,12 +2170,10 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(server.is_night_vision_active(None))
         self.assertFalse(server.is_night_vision_active(BM04Status(night_vision="0")))
+        # Manual states (1 or 2) must not trigger automation (only work with 0)
         self.assertFalse(server.is_night_vision_active(BM04Status(night_vision="1")))
-        self.assertTrue(server.is_night_vision_active(BM04Status(night_vision="2")))
-        self.assertTrue(server.is_night_vision_active(BM04Status(night_vision="ON")))
-        self.assertTrue(server.is_night_vision_active(BM04Status(raw_dps={"108": "2"})))
-        self.assertTrue(server.is_night_vision_active(BM04Status(raw_dps={"ir_cut": True})))
-        self.assertTrue(server.is_night_vision_active(BM04Status(raw_dps={"ir_status": "1"})))
+        self.assertFalse(server.is_night_vision_active(BM04Status(night_vision="2")))
+        self.assertFalse(server.is_night_vision_active(BM04Status(raw_dps={"108": "2"})))
 
     async def test_api_timelapse_sync_night_vision(self):
         from aiohttp.test_utils import make_mocked_request
@@ -2346,11 +2344,10 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(server.is_night_vision_active(status_auto, frame_bytes=color_frame))
         self.assertTrue(server.is_night_vision_active(status_auto, frame_bytes=mono_frame))
 
-        # Explicit "2" is always True regardless of frame
+        # Explicit manual modes "2" or "1" do not trigger automation (only work with 0)
         status_forced_on = BM04Status(night_vision="2")
-        self.assertTrue(server.is_night_vision_active(status_forced_on, frame_bytes=color_frame))
+        self.assertFalse(server.is_night_vision_active(status_forced_on, frame_bytes=mono_frame))
 
-        # Explicit "1" is always False regardless of frame
         status_forced_off = BM04Status(night_vision="1")
         self.assertFalse(server.is_night_vision_active(status_forced_off, frame_bytes=mono_frame))
 

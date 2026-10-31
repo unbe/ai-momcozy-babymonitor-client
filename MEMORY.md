@@ -96,7 +96,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Auto Mode ("0") Night Vision Physical Detection via Frame Saturation:**
     * On Tuya IPC cameras, `basic_nightvision` (DP 108) represents the configured mode (`"0"` = Auto, `"1"` = Off, `"2"` = On). In Auto mode (`"0"`), the camera hardware physically flips the IR-cut filter and activates the IR LEDs locally in darkness, but **DP 108 remains `"0"`** in telemetry.
     * `detect_night_vision_from_jpeg()` inspects a 16x16 subsampled thumbnail of the camera frame (< 1.5ms computation). Daytime frames show strong color saturation ($|R-G| + |G-B| + |B-R| \gg 10.0$), whereas infrared night vision frames are monochrome grayscale where $R \approx G \approx B$ (mean diff $< 8.0$).
-    * In Auto mode, `is_night_vision_active()` checks frame saturation to accurately detect active IR night vision even when DP 108 is `"0"`.
+    * Timelapse automation operates **exclusively in Auto mode (`"0"`)**, ignoring manually set states (`"1"` or `"2"`). In Auto mode, `is_night_vision_active()` checks frame saturation to accurately detect active IR night vision kicking in or out.
   * **Local DP Override Persistence:**
     * In `MomcozyMonitor`, commands sent via `set_dp` / `set_dps` are cached in `_local_overrides` with timestamps (5-minute TTL). Stale cloud polling snapshots cannot clobber recently set local states.
   * **Debounce Timing & Session Protection Logic:**
