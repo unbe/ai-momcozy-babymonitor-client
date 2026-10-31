@@ -199,7 +199,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       white-space: nowrap;
     }
     .badge.active { background: #F0FFF4; color: var(--accent-green); }
+    .badge.recording { background: #C53030; color: #FFFFFF; }
     .badge.alert { background: #FFF5F5; color: #E53E3E; }
+    .nv-moon {
+      display: inline-block;
+      filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.7));
+      vertical-align: -1px;
+    }
 
     /* Video Player */
     .video-card {
@@ -681,7 +687,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <button class="btn" id="timelapse-erase-btn" style="flex:0.8; background:rgba(239,68,68,0.12); color:#ef4444; border:1px solid rgba(239,68,68,0.3); font-size:0.85rem;" onclick="eraseTimelapse()" disabled title="Erase all recorded timelapse footage">🗑️ Erase</button>
         </div>
         <div style="margin-top:8px;">
-          <button id="timelapse-sync-nv-btn" class="btn" style="width:100%; font-size:0.82rem; transition:all 0.2s;" onclick="toggleNightVisionSync()" title="Automatically start/resume timelapse on night vision (>=60s) and stop on daylight (>=120s)">🌙 Sync with Night Vision: OFF</button>
+          <button id="timelapse-sync-nv-btn" class="btn" style="width:100%; font-size:0.82rem; transition:all 0.2s;" onclick="toggleNightVisionSync()" title="Automatically start/resume timelapse on night vision (>=60s) and stop on daylight (>=120s)"><span class="nv-moon">🌙</span> Sync with Night Vision: OFF</button>
         </div>
       </div>
 
@@ -1601,10 +1607,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       if (tl.is_recording) {
         if (badge) {
-          badge.className = 'badge active';
-          badge.style.background = '#FED7D7';
-          badge.style.color = '#C53030';
-          badge.innerText = tl.last_session_type === 'auto' ? 'Recording 🌙' : 'Recording';
+          badge.className = 'badge recording';
+          badge.style.background = '#C53030';
+          badge.style.color = '#FFFFFF';
+          badge.innerHTML = tl.last_session_type === 'auto' ? 'Recording <span class="nv-moon">🌙</span>' : 'Recording';
         }
         if (toggleBtn) {
           toggleBtn.innerText = '⏹ Stop Recording';
@@ -1617,7 +1623,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           if (tl.sync_state === 'activating') {
             badge.style.background = '#EDE9FE';
             badge.style.color = '#7C3AED';
-            badge.innerText = `🌙 Activating (${Math.round(tl.sync_timer_remaining || 0)}s)`;
+            badge.innerHTML = `<span class="nv-moon">🌙</span> Activating (${Math.round(tl.sync_timer_remaining || 0)}s)`;
           } else {
             badge.style.background = '#EDF2F7';
             badge.style.color = 'var(--text-muted)';
@@ -1639,32 +1645,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (syncBtn) {
         const syncOn = !!tl.sync_night_vision;
         if (syncOn) {
-          let label = '🌙 Sync with Night Vision: ON';
+          let label = '<span class="nv-moon">🌙</span> Sync with Night Vision: ON';
           if (tl.sync_state === 'activating') {
             const sec = Math.round(tl.sync_timer_remaining || 0);
-            label = `🌙 Night Vision Active (Starts in ${sec}s)`;
+            label = `<span class="nv-moon">🌙</span> Night Vision Active (Starts in ${sec}s)`;
           } else if (tl.sync_state === 'stopping') {
             const sec = Math.round(tl.sync_timer_remaining || 0);
             label = `☀️ Day Mode Detected (Stops in ${sec}s)`;
           } else if (tl.is_recording && tl.last_session_type === 'auto') {
-            label = 'Sync: Recording 🌙';
+            label = 'Sync: Recording <span class="nv-moon">🌙</span>';
           } else if (tl.night_vision_active) {
-            label = '🌙 Sync with Night Vision: Active';
+            label = '<span class="nv-moon">🌙</span> Sync with Night Vision: Active';
           }
-          syncBtn.innerText = label;
+          syncBtn.innerHTML = label;
           if (tl.is_recording && tl.last_session_type === 'auto') {
-            syncBtn.style.background = '#FED7D7';
-            syncBtn.style.borderColor = '#FEB2B2';
-            syncBtn.style.color = '#C53030';
+            syncBtn.style.background = '#C53030';
+            syncBtn.style.borderColor = '#9B2C2C';
+            syncBtn.style.color = '#FFFFFF';
             syncBtn.style.fontWeight = '600';
           } else {
-            syncBtn.style.background = 'rgba(147, 51, 234, 0.2)';
-            syncBtn.style.borderColor = 'rgba(147, 51, 234, 0.5)';
-            syncBtn.style.color = '#c084fc';
+            syncBtn.style.background = '#EDE9FE';
+            syncBtn.style.borderColor = '#C4B5FD';
+            syncBtn.style.color = '#6D28D9';
             syncBtn.style.fontWeight = '600';
           }
         } else {
-          syncBtn.innerText = '🌙 Sync with Night Vision: OFF';
+          syncBtn.innerHTML = '<span class="nv-moon">🌙</span> Sync with Night Vision: OFF';
           syncBtn.style.background = '';
           syncBtn.style.borderColor = '';
           syncBtn.style.color = '';
