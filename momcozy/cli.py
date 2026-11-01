@@ -631,6 +631,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         http_port=http_port,
         ssl_context=ssl_context,
     )
+    if getattr(args, "sync_night_vision", None) is not None and server.timelapse:
+        server._set_night_vision_sync(bool(args.sync_night_vision))
     proto = "https" if ssl_context else "http"
     display_host = "localhost" if args.host == "0.0.0.0" else args.host
     print(f"\n=======================================================")
@@ -949,6 +951,12 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         type=int,
         default=8420,
         help="Plain HTTP port for Chromecast and LAN streaming when SSL is enabled (default: 8420)",
+    )
+    p_serve.add_argument(
+        "--sync-night-vision",
+        action="store_true",
+        default=None,
+        help="Enable automatic timelapse synchronization with camera Night Vision",
     )
     p_serve.set_defaults(func=cmd_serve)
 

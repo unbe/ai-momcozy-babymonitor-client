@@ -2318,6 +2318,26 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(rec2.sync_night_vision)
             self.assertEqual(rec2.last_session_type, "manual")
 
+            # Verify persistence via .momcozy.json config file
+            mock_config = storage_dir / "mock_momcozy.json"
+            mock_config.write_text(json.dumps({"timelapse_sync_night_vision": True}))
+            # Even if storage_dir has no meta.json, it should restore sync from config
+            empty_dir = storage_dir / "empty"
+            empty_dir.mkdir()
+            rec3 = TimelapseRecorder(streamer=mock_streamer, storage_dir=empty_dir, config_path=mock_config)
+            self.assertTrue(rec3.sync_night_vision)
+
+            # Disabling updates config
+            rec3.set_sync_night_vision(False)
+            updated_cfg = json.loads(mock_config.read_text())
+            self.assertFalse(updated_cfg.get("timelapse_sync_night_vision"))
+
+            # Test environment variable override
+            import os
+            with unittest.mock.patch.dict(os.environ, {"MOMCOZY_TIMELAPSE_SYNC_NV": "1"}):
+                rec4 = TimelapseRecorder(streamer=mock_streamer, storage_dir=empty_dir, config_path=mock_config)
+                self.assertTrue(rec4.sync_night_vision)
+
     async def test_session_type_append_vs_restart(self):
         with tempfile.TemporaryDirectory() as td:
             storage_dir = Path(td)

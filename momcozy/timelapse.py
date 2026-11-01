@@ -146,9 +146,11 @@ class TimelapseRecorder:
         sample_interval_sec: float = 2.0,
         fps: int = 15,
         speed_ratio: int = 60,
+        config_path: Optional[Path | str] = None,
     ) -> None:
         self.streamer = streamer
         self.storage_dir = Path(storage_dir or os.getenv("MOMCOZY_TIMELAPSE_DIR", "timelapse"))
+        self.config_path = Path(config_path) if config_path else None
         self.total_slots = int(total_slots)
         self.slot_duration_sec = float(slot_duration_sec)
         self.sample_interval_sec = float(sample_interval_sec)
@@ -175,7 +177,9 @@ class TimelapseRecorder:
         self._events: List[Dict[str, Any]] = []
 
         # Night vision sync automation state
-        self.sync_night_vision: bool = False
+        persisted_sync = self._load_persisted_sync_setting()
+        self._persisted_sync_setting: Optional[bool] = persisted_sync
+        self.sync_night_vision: bool = bool(persisted_sync) if persisted_sync is not None else False
         self.last_session_type: str = "manual"  # "manual" | "auto"
         self.current_session_type: Optional[str] = None
 
@@ -239,6 +243,48 @@ class TimelapseRecorder:
     def slot_path(self, slot_idx: int) -> Path:
         return self.storage_dir / f"slot_{slot_idx:02d}.hevc"
 
+    def _get_config_path(self) -> Path:
+        """Resolve persistent configuration file path (.momcozy.json)."""
+        if self.config_path is not None:
+            return self.config_path
+        default_dir = Path(os.getenv("MOMCOZY_TIMELAPSE_DIR", "timelapse"))
+        try:
+            if self.storage_dir == default_dir or self.storage_dir.resolve() == default_dir.resolve():
+                from .cloud import DEFAULT_CONFIG_PATH
+                return DEFAULT_CONFIG_PATH
+        except Exception:
+            pass
+        return self.storage_dir / ".momcozy.json"
+
+    def _load_persisted_sync_setting(self) -> Optional[bool]:
+        """Load persisted night vision sync preference from env or config file."""
+        env_val = os.environ.get("MOMCOZY_TIMELAPSE_SYNC_NV") or os.environ.get("MOMCOZY_SYNC_NIGHT_VISION")
+        if env_val is not None:
+            return env_val.strip().lower() in ("1", "true", "yes", "on", "enable", "enabled")
+        cfg_path = self._get_config_path()
+        try:
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if "timelapse_sync_night_vision" in cfg:
+                    return bool(cfg["timelapse_sync_night_vision"])
+        except Exception:
+            pass
+        return None
+
+    def _persist_sync_setting(self, enabled: bool) -> None:
+        """Persist night vision sync preference to config file."""
+        cfg_path = self._get_config_path()
+        try:
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if cfg.get("timelapse_sync_night_vision") != bool(enabled):
+                    cfg["timelapse_sync_night_vision"] = bool(enabled)
+                    tmp_cfg = cfg_path.with_suffix(".tmp.json")
+                    tmp_cfg.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                    tmp_cfg.replace(cfg_path)
+        except Exception as exc:
+            logger.debug("Could not persist timelapse_sync_night_vision to config: %s", exc)
+
     def _load_meta(self) -> None:
         """Load metadata from meta.json or reconstruct from existing slot files."""
         if not self.storage_dir.exists():
@@ -252,7 +298,10 @@ class TimelapseRecorder:
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
                 self._events = data.get("events", [])
-                self.sync_night_vision = bool(data.get("sync_night_vision", False))
+                if self._persisted_sync_setting is not None:
+                    self.sync_night_vision = self._persisted_sync_setting
+                else:
+                    self.sync_night_vision = bool(data.get("sync_night_vision", False))
                 self.last_session_type = str(data.get("last_session_type", "manual"))
                 if "speed_ratio" in data:
                     try:
@@ -316,6 +365,8 @@ class TimelapseRecorder:
     def set_sync_night_vision(self, enabled: bool) -> bool:
         """Enable or disable automatic timelapse synchronization with Night Vision."""
         self.sync_night_vision = bool(enabled)
+        self._persisted_sync_setting = bool(enabled)
+        self._persist_sync_setting(enabled)
         self._save_meta()
         logger.info("Timelapse Night Vision sync set to: %s", self.sync_night_vision)
         return self.sync_night_vision

@@ -148,6 +148,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * `handle_timelapse_start` and `TimelapseRecorder.start()` default to `fresh=False`. When recording is stopped manually, previous slots are preserved. Starting again resumes and appends to the circular buffer.
     * In the web UI, stopped recordings with existing footage display `[▶ Resume Recording]`.
     * An explicit `[🗑️ Erase]` button (calling `POST /api/timelapse/clear`) allows users to wipe the recording buffer and reset counters to 0m 00s on demand.
+  * **Night Vision Sync Setting Persistence Across Server Restarts:**
+    * Night Vision sync preference (`sync_night_vision`) is persisted both in `timelapse/meta.json` and in the user configuration file `.momcozy.json` (`timelapse_sync_night_vision`).
+    * On server startup, `TimelapseRecorder` checks for persisted preferences from (1) environment variable `MOMCOZY_TIMELAPSE_SYNC_NV`, (2) `.momcozy.json`, and (3) `meta.json`. CLI command `momcozy.py serve --sync-night-vision` is also supported.
+    * Decoupling configuration from slot storage ensures that clearing footage (`[🗑️ Erase]`), slot rotations, or restoring slot files from an external backup never reverts the user's Night Vision automation setting.
   * **Session Continuity (Append vs. Restart):**
     * When auto-start triggers:
       * If `last_session_type == "auto"` (the previous timelapse was automatic), it calls `timelapse.start(fresh=False, session_type="auto")`. This appends the new night session directly into the circular buffer without clearing previous slots.
