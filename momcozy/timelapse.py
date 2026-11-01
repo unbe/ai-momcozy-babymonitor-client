@@ -1019,6 +1019,7 @@ class TimelapseRecorder:
                     ]
                 else:
                     # Stream copy HEVC: 0% CPU, ultrafast remux with monotonic sequential timestamps
+                    setts_filter = f"setts=pts=N/(TB*{fps}):dts=N/(TB*{fps})"
                     cmd = [
                         "ffmpeg",
                         "-y",
@@ -1027,7 +1028,7 @@ class TimelapseRecorder:
                         "-safe", "0",
                         "-i", list_path,
                         "-c:v", "copy",
-                        "-bsf:v", "setts=pts=N:dts=N",
+                        "-bsf:v", setts_filter,
                         "-tag:v", "hvc1",
                         "-movflags", "+faststart",
                         str(tmp_out),

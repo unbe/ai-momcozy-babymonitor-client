@@ -1940,6 +1940,16 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mp4_path.exists())
             self.assertGreater(mp4_path.stat().st_size, 1000)
 
+            # Verify exported MP4 duration is realistic (not collapsed to <1s by raw timebase tick scaling)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(mp4_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            dur = float(probe.stdout.strip())
+            self.assertGreater(dur, 0.5)
+
             # Verify that calling export_mp4 again returns the cached file
             mp4_path_2 = await recorder.export_mp4(codec="hevc")
             self.assertEqual(mp4_path, mp4_path_2)
