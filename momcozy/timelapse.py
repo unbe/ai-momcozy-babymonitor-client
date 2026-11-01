@@ -189,6 +189,7 @@ class TimelapseRecorder:
 
         # Motion detection on-demand scan cache
         self._last_motion_scan_mtime: float = 0.0
+        self._last_meta_file_mtime: float = 0.0
 
         self._load_meta()
 
@@ -246,6 +247,7 @@ class TimelapseRecorder:
         meta_loaded = False
         if self.meta_file.exists():
             try:
+                self._last_meta_file_mtime = self.meta_file.stat().st_mtime
                 data = json.loads(self.meta_file.read_text(encoding="utf-8"))
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
@@ -263,28 +265,30 @@ class TimelapseRecorder:
             except Exception as exc:
                 logger.warning("Error reading timelapse meta.json: %s", exc)
 
-        if not meta_loaded:
-            # Reconstruct from slot files mtimes
-            self._slots_meta = {}
-            newest_slot = 0
-            newest_mtime = 0.0
-            for i in range(self.total_slots):
-                p = self.slot_path(i)
-                if p.exists() and p.stat().st_size > 0:
-                    st = p.stat()
-                    # Approximate frame count (30KB per frame average)
+        # Reconcile with any slot files present on disk (fills in missing slots or estimates 0-frame entries)
+        newest_slot = self._current_slot
+        newest_mtime = 0.0
+        for i in range(self.total_slots):
+            p = self.slot_path(i)
+            if p.exists() and p.stat().st_size > 0:
+                s_key = str(i)
+                st = p.stat()
+                slot_info = self._slots_meta.get(s_key)
+                if not slot_info or not slot_info.get("frames"):
                     approx_frames = max(1, st.st_size // 35000)
-                    self._slots_meta[str(i)] = {
-                        "mtime": st.st_mtime,
+                    self._slots_meta[s_key] = {
+                        "mtime": slot_info.get("mtime", st.st_mtime) if slot_info else st.st_mtime,
                         "frames": approx_frames,
                         "bytes": st.st_size,
+                        "duration": slot_info.get("duration", min(self.slot_duration_sec, approx_frames * 4.0)) if slot_info else min(self.slot_duration_sec, approx_frames * 4.0),
                     }
-                    if st.st_mtime > newest_mtime:
-                        newest_mtime = st.st_mtime
-                        newest_slot = i
+                slot_mtime = float(self._slots_meta[s_key].get("mtime", st.st_mtime))
+                if slot_mtime > newest_mtime:
+                    newest_mtime = slot_mtime
+                    newest_slot = i
 
-            if newest_mtime > 0:
-                self._current_slot = newest_slot
+        if not meta_loaded and newest_mtime > 0:
+            self._current_slot = newest_slot
 
     def _save_meta(self) -> None:
         """Persist metadata to meta.json."""
@@ -305,6 +309,7 @@ class TimelapseRecorder:
             tmp_meta = self.storage_dir / "meta.json.tmp"
             tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             tmp_meta.replace(self.meta_file)
+            self._last_meta_file_mtime = self.meta_file.stat().st_mtime
         except Exception as exc:
             logger.debug("Failed saving timelapse meta.json: %s", exc)
 
@@ -728,8 +733,30 @@ class TimelapseRecorder:
 
         self._close_active_slot()
 
+    def _sync_meta_if_changed(self) -> None:
+        """Reload meta.json or disk slots if modified externally while server is running."""
+        if self.is_recording:
+            return
+        if not self.storage_dir.exists():
+            return
+        try:
+            current_meta_mtime = self.meta_file.stat().st_mtime if self.meta_file.exists() else 0.0
+            if current_meta_mtime != self._last_meta_file_mtime:
+                self._load_meta()
+                return
+            disk_slots = set()
+            for i in range(self.total_slots):
+                p = self.slot_path(i)
+                if p.exists() and p.stat().st_size > 0:
+                    disk_slots.add(str(i))
+            if disk_slots != set(self._slots_meta.keys()):
+                self._load_meta()
+        except OSError:
+            pass
+
     def get_ordered_slots(self) -> List[Tuple[int, Path, Dict[str, Any]]]:
         """Return all non-empty slot files in chronological order (oldest to newest)."""
+        self._sync_meta_if_changed()
         valid_slots = []
         for i in range(self.total_slots):
             p = self.slot_path(i)
@@ -762,11 +789,13 @@ class TimelapseRecorder:
                 total_bytes += self._bytes_in_slot
             else:
                 dur = meta.get("duration")
-                if dur is None:
-                    frames = meta.get("frames", 0)
+                frames = meta.get("frames", 0)
+                if not frames and path.exists() and path.stat().st_size > 0:
+                    frames = max(1, path.stat().st_size // 35000)
+                if dur is None or dur <= 0:
                     dur = min(self.slot_duration_sec, frames * 4.0 if frames > 0 else 0.0)
                 total_real_time_sec += float(dur)
-                total_frames += meta.get("frames", 0)
+                total_frames += frames
                 total_bytes += meta.get("bytes", path.stat().st_size if path.exists() else 0)
 
         max_duration = self.total_slots * self.slot_duration_sec
@@ -827,7 +856,7 @@ class TimelapseRecorder:
             "speed_ratio_options": ["1:15", "1:30", "1:60", "1:90"],
             "disk_bytes": total_bytes,
             "disk_formatted": format_bytes(total_bytes),
-            "has_content": total_frames > 0,
+            "has_content": self.has_content,
             "events": events_list,
             "motion_events_count": len(events_list),
             "sync_night_vision": self.sync_night_vision,

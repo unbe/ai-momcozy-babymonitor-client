@@ -179,7 +179,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Slot-Aware Timeline Mapping Across Gapped Slots:**
     * If recording was paused and resumed, gaps between slot files exist in wall-clock time, but FFmpeg concatenates slots consecutively with linear presentation timestamps (`setts=pts=N:dts=N`).
     * Timeline position mapping in `get_status()` projects each event's wall-clock timestamp onto its containing slot and adds the cumulative duration of preceding slots, matching the concatenated video player timeline exactly.
-  * **On-Demand Playback Integration:** Triggered during playback (`/timelapse` loading or `GET /api/timelapse/status`), runs asynchronously in thread pool executor, and caches results to `meta.json`. Events are plotted as interactive markers on the timelapse scrubber timeline.
+  * **External Directory Restoration & Filesystem Reconciliation:**
+    * When `timelapse/` files (`slot_*.hevc` or `meta.json`) are restored, copied, or modified from the host filesystem while the server is running, `_sync_meta_if_changed()` automatically detects the changes on disk (tracking `meta.json` modification time and slot file presence) and re-evaluates slots without requiring a server restart.
+    * If `meta.json` was omitted or contains 0-frame entries during restore, `_load_meta` and `get_status` automatically reconcile against actual `slot_*.hevc` files on disk, approximating frame counts from file sizes (`max(1, size // 35000)`) and computing valid slot durations.
+    * `has_content` in `get_status()` aligns with `self.has_content` (verifying whether valid slot files exist on disk), ensuring UI buttons (like `[▶ Watch]` and `[🗑️ Erase]`) enable as expected.
 
 
 
