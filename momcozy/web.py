@@ -2258,7 +2258,10 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         });
         el.addEventListener('click', (e) => {
           e.stopPropagation();
-          seekToSec(ev.video_sec);
+          const targetSec = (video.duration && ev.percent !== undefined)
+            ? (ev.percent / 100) * video.duration
+            : ev.video_sec;
+          seekToSec(targetSec);
         });
         container.appendChild(el);
       });
@@ -2310,22 +2313,30 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     function jumpToNextEvent() {
       if (!motionEvents.length || !video.duration) return;
       const cur = video.currentTime;
-      const next = motionEvents.find(ev => ev.video_sec > cur + 0.8);
+      const next = motionEvents.find(ev => {
+        const sec = (ev.percent !== undefined) ? (ev.percent / 100) * video.duration : ev.video_sec;
+        return sec > cur + 0.8;
+      });
       if (next) {
-        seekToSec(next.video_sec);
+        seekToSec((next.percent !== undefined) ? (next.percent / 100) * video.duration : next.video_sec);
       } else if (motionEvents.length) {
-        seekToSec(motionEvents[0].video_sec);
+        const first = motionEvents[0];
+        seekToSec((first.percent !== undefined) ? (first.percent / 100) * video.duration : first.video_sec);
       }
     }
 
     function jumpToPrevEvent() {
       if (!motionEvents.length || !video.duration) return;
       const cur = video.currentTime;
-      const prev = [...motionEvents].reverse().find(ev => ev.video_sec < cur - 0.8);
+      const prev = [...motionEvents].reverse().find(ev => {
+        const sec = (ev.percent !== undefined) ? (ev.percent / 100) * video.duration : ev.video_sec;
+        return sec < cur - 0.8;
+      });
       if (prev) {
-        seekToSec(prev.video_sec);
+        seekToSec((prev.percent !== undefined) ? (prev.percent / 100) * video.duration : prev.video_sec);
       } else if (motionEvents.length) {
-        seekToSec(motionEvents[motionEvents.length - 1].video_sec);
+        const last = motionEvents[motionEvents.length - 1];
+        seekToSec((last.percent !== undefined) ? (last.percent / 100) * video.duration : last.video_sec);
       }
     }
 
@@ -2379,7 +2390,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
 
     async function initPlayer() {
       try {
-        const res = await fetch('/api/timelapse/status');
+        const res = await fetch('/api/timelapse/status?scan=1');
         const st = await res.json();
         if (st.speed_ratio_val) {
           currentRatio = st.speed_ratio_val;
@@ -3285,7 +3296,7 @@ class WebServer:
         if not self.timelapse:
             return web.json_response({})
         scan_param = request.query.get("scan")
-        should_scan = scan_param == "1" or (not self.timelapse._events and self.timelapse.has_content and not self.timelapse.is_recording)
+        should_scan = scan_param == "1" or (not self.timelapse._events and self.timelapse.has_content)
         if should_scan:
             try:
                 await self.timelapse.scan_motion_events()
