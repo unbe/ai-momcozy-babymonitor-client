@@ -2072,7 +2072,6 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
           <h1 style="display:flex; align-items:center; gap:8px;">
             <span>Timelapse</span>
             <span id="player-ratio-badge" style="background:rgba(66,153,225,0.15); color:#60a5fa; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(66,153,225,0.3);" title="Timelapse Recording Speed Ratio">1:60</span>
-            <span id="player-nv-sync-badge" style="display:none; background:rgba(147,51,234,0.18); color:#c084fc; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(147,51,234,0.4);" title="Timelapse is synchronized with Night Vision">🌙 NV Sync</span>
           </h1>
           <div style="font-size: 0.75rem; color: var(--text-muted);">Momcozy BM04</div>
         </div>
@@ -2390,10 +2389,6 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
         if (st.events) {
           motionEvents = st.events;
           renderTimelineMarkers();
-        }
-        if (st.sync_night_vision) {
-          const nvBadge = document.getElementById('player-nv-sync-badge');
-          if (nvBadge) nvBadge.style.display = 'inline-block';
         }
       } catch (e) {}
       loadPlayback(activeCodec);
