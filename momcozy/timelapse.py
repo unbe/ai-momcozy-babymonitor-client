@@ -858,7 +858,7 @@ class TimelapseRecorder:
             "disk_formatted": format_bytes(total_bytes),
             "has_content": self.has_content,
             "events": events_list,
-            "motion_events_count": len(events_list),
+            "motion_events_count": len(events_list) if events_list else len(self._events),
             "sync_night_vision": self.sync_night_vision,
             "last_session_type": self.last_session_type,
             "current_session_type": self.current_session_type,
