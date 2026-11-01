@@ -278,11 +278,22 @@ class TimelapseRecorder:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
             if cfg.get("timelapse_sync_night_vision") != bool(enabled):
                 cfg["timelapse_sync_night_vision"] = bool(enabled)
+                content = json.dumps(cfg, indent=2)
                 tmp_cfg = cfg_path.with_suffix(".tmp.json")
-                tmp_cfg.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-                tmp_cfg.replace(cfg_path)
+                try:
+                    tmp_cfg.write_text(content, encoding="utf-8")
+                    tmp_cfg.replace(cfg_path)
+                except OSError:
+                    # Docker bind-mount of a single file fails os.replace with [Errno 16] EBUSY
+                    cfg_path.write_text(content, encoding="utf-8")
+                finally:
+                    if tmp_cfg.exists():
+                        try:
+                            tmp_cfg.unlink()
+                        except OSError:
+                            pass
         except Exception as exc:
-            logger.debug("Could not persist timelapse_sync_night_vision to config: %s", exc)
+            logger.warning("Could not persist timelapse_sync_night_vision to config %s: %s", cfg_path, exc)
 
     def _load_meta(self) -> None:
         """Load metadata from meta.json or reconstruct from existing slot files."""
