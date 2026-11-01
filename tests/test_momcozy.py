@@ -2390,11 +2390,10 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
             updated_cfg = json.loads(mock_config.read_text())
             self.assertFalse(updated_cfg.get("timelapse_sync_night_vision"))
 
-            # Test persistence when config is a Docker single-file bind mount (os.replace raises EBUSY)
-            with unittest.mock.patch("pathlib.Path.replace", side_effect=OSError(16, "Device or resource busy")):
-                rec3.set_sync_night_vision(True)
-                docker_cfg = json.loads(mock_config.read_text())
-                self.assertTrue(docker_cfg.get("timelapse_sync_night_vision"))
+            # Re-enabling updates config directly in-place
+            rec3.set_sync_night_vision(True)
+            re_enabled_cfg = json.loads(mock_config.read_text())
+            self.assertTrue(re_enabled_cfg.get("timelapse_sync_night_vision"))
 
             # Test environment variable override
             import os

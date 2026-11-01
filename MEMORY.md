@@ -151,7 +151,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Night Vision Sync Setting Persistence Across Server Restarts:**
     * Night Vision sync preference (`sync_night_vision`) is persisted strictly in the user configuration file `.momcozy.json` (`timelapse_sync_night_vision`), not in `timelapse/meta.json`.
     * On server startup, `TimelapseRecorder` checks for persisted preferences from (1) environment variable `MOMCOZY_TIMELAPSE_SYNC_NV`, (2) `.momcozy.json` (or CLI `--sync-night-vision`).
-    * **Docker Single-File Bind Mount Handling:** In Docker deployments (`./.momcozy.json:/config/.momcozy.json`), attempting an atomic `os.replace()` on a bind-mounted file raises `[Errno 16] EBUSY (Device or resource busy)` because Linux does not permit replacing mount points. `_persist_sync_setting` catches `OSError` and writes in-place directly to `cfg_path.write_text()`, ensuring settings persist properly inside containers.
+    * **In-Place Config Persistence:** Settings in `.momcozy.json` are written directly in-place via `cfg_path.write_text()`. In Docker deployments (`./.momcozy.json:/config/.momcozy.json`), atomic replace (`os.replace`) fails with `[Errno 16] EBUSY` because Linux prohibits replacing active file mount points. Direct in-place writing avoids temporary files and works seamlessly across both host and container bind mounts.
     * Decoupling user configuration from slot buffer metadata (`meta.json`) ensures single source of truth: clearing footage (`[🗑️ Erase]`), slot rotations, or restoring slot files from an external backup never modifies or reverts the user's Night Vision automation preference.
   * **Session Continuity (Append vs. Restart):**
     * When auto-start triggers:
