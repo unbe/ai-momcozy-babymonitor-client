@@ -158,6 +158,12 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
       * If `last_session_type == "manual"` (previous recording was manually started), it starts fresh (`fresh=True`), wiping manual records to begin the auto session.
     * When auto-stop triggers, it marks `last_session_type = "auto"`.
   * **Zero Recording Overhead Preserved:** Video recording continues to write pure Annex B HEVC keyframes via stream-copy directly from `VideoStreamer.subscribe_hevc()` with 0% CPU consumption.
+* **Docker Volume Persistence & Configuration Architecture:**
+  * Persistent configuration is mapped via `/config/.momcozy.json` (`MOMCOZY_CONFIG=/config/.momcozy.json`).
+  * Timelapse recordings and ring buffer data are stored in `/timelapse`, exposed as a Docker `VOLUME ["/timelapse"]` with `MOMCOZY_TIMELAPSE_DIR=/timelapse`.
+  * For seamless backward compatibility, `/app/timelapse` is symlinked to `/timelapse` in the container.
+  * In `docker-compose.yml`, `./timelapse:/timelapse` is mounted alongside `./.momcozy.json:/config/.momcozy.json`.
+  * `.dockerignore` excludes `timelapse/` and `*.hevc` so local video recordings are never included in Docker build contexts.
 * **Dev Server Port & SSL:**
   * Port 8421 runs HTTPS (`momcozy.py serve --ssl`). Healthchecks and WebCodecs APIs require HTTPS on this port. Plain HTTP for LAN/Chromecast is hosted on port 8420.
 * **Docker Health Check & Local Telemetry Endpoints:**

@@ -29,6 +29,8 @@ wheels/
 tests/
 scratch/
 *.mp4
+*.hevc
+timelapse/
 *.jpg
 *.jpeg
 .DS_Store

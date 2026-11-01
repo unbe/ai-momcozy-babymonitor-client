@@ -31,13 +31,17 @@ COPY README.md /app/README.md
 # Install package so `momcozy` command line is ready
 RUN pip install --no-cache-dir -e .
 
-# Create directory for persistent configuration
-RUN mkdir -p /config
+# Create directory for persistent configuration and timelapse recordings
+RUN mkdir -p /config /timelapse && ln -s /timelapse /app/timelapse
 
 # Environment defaults
 ENV PYTHONUNBUFFERED=1 \
     AIOHTTP_NOSENDFILE=1 \
-    MOMCOZY_CONFIG=/config/.momcozy.json
+    MOMCOZY_CONFIG=/config/.momcozy.json \
+    MOMCOZY_TIMELAPSE_DIR=/timelapse
+
+# Declare timelapse storage volume for persistence across container rebuilds/restarts
+VOLUME ["/timelapse"]
 
 # Expose web dashboard (8421) and Chromecast LAN streaming port (8420)
 EXPOSE 8420 8421

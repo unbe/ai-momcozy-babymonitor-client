@@ -623,6 +623,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         except ValueError:
             pass
 
+    timelapse_dir = getattr(args, "timelapse_dir", None) or os.environ.get("MOMCOZY_TIMELAPSE_DIR")
     server = WebServer(
         monitor=monitor,
         streamer=streamer,
@@ -630,6 +631,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         port=args.port,
         http_port=http_port,
         ssl_context=ssl_context,
+        timelapse_dir=timelapse_dir,
     )
     if getattr(args, "sync_night_vision", None) is not None and server.timelapse:
         server._set_night_vision_sync(bool(args.sync_night_vision))
@@ -957,6 +959,11 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         action="store_true",
         default=None,
         help="Enable automatic timelapse synchronization with camera Night Vision",
+    )
+    p_serve.add_argument(
+        "--timelapse-dir",
+        default=None,
+        help="Directory to store circular timelapse ring buffer recordings (default: $MOMCOZY_TIMELAPSE_DIR or 'timelapse')",
     )
     p_serve.set_defaults(func=cmd_serve)
 

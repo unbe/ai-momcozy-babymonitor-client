@@ -8,11 +8,14 @@ services:
     volumes:
       # Mount single config file (ensure `touch .momcozy.json` exists before running)
       - ./.momcozy.json:/config/.momcozy.json
+      # Mount timelapse directory to persist recordings and ring buffer outside container
+      - ./timelapse:/timelapse
     devices:
       # Pass through Intel integrated GPU for hardware-accelerated video encoding (VA-API)
       - /dev/dri:/dev/dri
     environment:
       - MOMCOZY_CONFIG=/config/.momcozy.json
+      - MOMCOZY_TIMELAPSE_DIR=/timelapse
       # Intel driver for Haswell (Pentium G3220 Gen 7.5). Use iHD for Broadwell (Gen 8) or newer.
       - LIBVA_DRIVER_NAME=i965
       # Optional environment overrides:

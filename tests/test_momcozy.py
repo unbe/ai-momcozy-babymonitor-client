@@ -744,6 +744,16 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         default_args = parser.parse_args(["serve"])
         self.assertEqual(default_args.idle_timeout, 300.0)
 
+    def test_serve_timelapse_dir_cli_arg(self):
+        from momcozy.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--timelapse-dir", "/data/timelapse"])
+        self.assertEqual(args.timelapse_dir, "/data/timelapse")
+
+        default_args = parser.parse_args(["serve"])
+        self.assertIsNone(default_args.timelapse_dir)
+
     def test_tuya_gateway_publish_dps(self):
         from unittest.mock import MagicMock
         from momcozy.tuya_cloud import TuyaGatewayClient, TuyaSession
@@ -1775,8 +1785,9 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             mock_streamer = MagicMock()
             mock_streamer.is_running = True
 
-            server = WebServer(monitor=MagicMock(), streamer=mock_streamer)
-            server.timelapse = TimelapseRecorder(streamer=mock_streamer, storage_dir=td, total_slots=3)
+            server = WebServer(monitor=MagicMock(), streamer=mock_streamer, timelapse_dir=td)
+            self.assertEqual(server.timelapse.storage_dir, Path(td))
+            server.timelapse.total_slots = 3
 
             # Test GET /api/timelapse/status
             req = make_mocked_request("GET", "/api/timelapse/status")

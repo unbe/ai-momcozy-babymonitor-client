@@ -2491,6 +2491,7 @@ class WebServer:
         port: int = 8421,
         http_port: Optional[int] = None,
         ssl_context: Optional[ssl.SSLContext] = None,
+        timelapse_dir: Optional[Path | str] = None,
     ) -> None:
         self.monitor = monitor
         self.streamer = streamer
@@ -2503,7 +2504,7 @@ class WebServer:
             self.http_port = 8420 if self.ssl_context else self.port
         self.hls: Optional[HlsTranscoder] = HlsTranscoder(streamer=self.streamer) if self.streamer else None
         self.timelapse: Optional[TimelapseRecorder] = (
-            TimelapseRecorder(streamer=self.streamer) if self.streamer else None
+            TimelapseRecorder(streamer=self.streamer, storage_dir=timelapse_dir) if self.streamer else None
         )
         if self.streamer:
             self.streamer.keepalive_predicate = lambda: bool(
