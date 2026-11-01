@@ -592,6 +592,7 @@ class TimelapseRecorder:
 
             self._close_active_slot()
             self._save_meta()
+            self._exports_cache.clear()
             if self._stream_lease is not None:
                 self.streamer.release(self._stream_lease, linger)
                 self._stream_lease = None
@@ -900,7 +901,8 @@ class TimelapseRecorder:
             out_path = cache_entry["path"]
             created_at = float(cache_entry.get("created_at", 0.0))
             if allow_cache_only:
-                return out_path
+                if (not self.is_recording and created_at >= latest_mtime) or (self.is_recording and (time.time() - created_at) < 300.0):
+                    return out_path
             if not self.is_recording:
                 # Slot recordings are static; cache is valid if built after or at latest slot mtime
                 if created_at >= latest_mtime:

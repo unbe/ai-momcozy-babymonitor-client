@@ -3336,13 +3336,24 @@ class WebServer:
         ratio_param = request.query.get("ratio")
         ratio = int(ratio_param) if (ratio_param and ratio_param.isdigit()) else None
 
-        # For Range requests (seeking/scrubbing), do not regenerate MP4 mid-stream to avoid swapping out the file
-        has_range = bool(request.headers.get("Range"))
+        # For mid-stream scrub/seek requests (start byte > 0), do not regenerate MP4 mid-stream
+        # to avoid replacing the file under the player's active demuxer.
+        # Initial requests (Range: bytes=0- or no Range) must always allow fresh cache generation.
+        range_header = request.headers.get("Range", "")
+        is_midstream_seek = False
+        if not is_download and range_header.startswith("bytes="):
+            try:
+                start_spec = range_header[6:].split("-")[0].strip()
+                if start_spec and int(start_spec) > 0:
+                    is_midstream_seek = True
+            except (ValueError, IndexError):
+                pass
+
         try:
             mp4_path = await self.timelapse.export_mp4(
                 codec=codec,
                 ratio=ratio,
-                allow_cache_only=has_range,
+                allow_cache_only=is_midstream_seek,
             )
         except Exception as exc:
             logger.error("Error generating timelapse MP4: %s", exc)

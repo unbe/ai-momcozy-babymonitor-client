@@ -1827,6 +1827,18 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp_dl.status, 200)
                 self.assertIn("attachment", resp_dl.headers.get("Content-Disposition", ""))
 
+                # Initial browser request Range: bytes=0- must NOT be allow_cache_only
+                server.timelapse.export_mp4.reset_mock()
+                req_browser_init = make_mocked_request("GET", "/api/timelapse/video.mp4", headers={"Range": "bytes=0-"})
+                await server.handle_timelapse_video(req_browser_init)
+                server.timelapse.export_mp4.assert_called_with(codec="hevc", ratio=None, allow_cache_only=False)
+
+                # Mid-stream seek request Range: bytes=5000- MUST be allow_cache_only
+                server.timelapse.export_mp4.reset_mock()
+                req_browser_seek = make_mocked_request("GET", "/api/timelapse/video.mp4", headers={"Range": "bytes=5000-"})
+                await server.handle_timelapse_video(req_browser_seek)
+                server.timelapse.export_mp4.assert_called_with(codec="hevc", ratio=None, allow_cache_only=True)
+
             # Test POST /api/timelapse/ratio
             req_ratio = make_mocked_request("POST", "/api/timelapse/ratio")
             req_ratio._read_bytes = b'{"ratio": 30}'
