@@ -275,13 +275,12 @@ class TimelapseRecorder:
         """Persist night vision sync preference to config file."""
         cfg_path = self._get_config_path()
         try:
-            if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                if cfg.get("timelapse_sync_night_vision") != bool(enabled):
-                    cfg["timelapse_sync_night_vision"] = bool(enabled)
-                    tmp_cfg = cfg_path.with_suffix(".tmp.json")
-                    tmp_cfg.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-                    tmp_cfg.replace(cfg_path)
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+            if cfg.get("timelapse_sync_night_vision") != bool(enabled):
+                cfg["timelapse_sync_night_vision"] = bool(enabled)
+                tmp_cfg = cfg_path.with_suffix(".tmp.json")
+                tmp_cfg.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                tmp_cfg.replace(cfg_path)
         except Exception as exc:
             logger.debug("Could not persist timelapse_sync_night_vision to config: %s", exc)
 
@@ -298,10 +297,6 @@ class TimelapseRecorder:
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
                 self._events = data.get("events", [])
-                if self._persisted_sync_setting is not None:
-                    self.sync_night_vision = self._persisted_sync_setting
-                else:
-                    self.sync_night_vision = bool(data.get("sync_night_vision", False))
                 self.last_session_type = str(data.get("last_session_type", "manual"))
                 if "speed_ratio" in data:
                     try:
@@ -352,7 +347,6 @@ class TimelapseRecorder:
                 "current_slot": self._current_slot,
                 "slots": self._slots_meta,
                 "events": self._events,
-                "sync_night_vision": self.sync_night_vision,
                 "last_session_type": self.last_session_type,
             }
             tmp_meta = self.storage_dir / "meta.json.tmp"
@@ -367,7 +361,6 @@ class TimelapseRecorder:
         self.sync_night_vision = bool(enabled)
         self._persisted_sync_setting = bool(enabled)
         self._persist_sync_setting(enabled)
-        self._save_meta()
         logger.info("Timelapse Night Vision sync set to: %s", self.sync_night_vision)
         return self.sync_night_vision
 

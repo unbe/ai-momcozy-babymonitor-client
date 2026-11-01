@@ -2307,13 +2307,15 @@ class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
             rec.set_sync_night_vision(True)
             self.assertTrue(rec.sync_night_vision)
 
-            # Check meta.json
-            self.assertTrue(rec.meta_file.exists())
-            meta_data = json.loads(rec.meta_file.read_text())
-            self.assertTrue(meta_data.get("sync_night_vision"))
-            self.assertEqual(meta_data.get("last_session_type"), "manual")
+            # Check meta.json does NOT contain sync_night_vision (belongs only in config)
+            if rec.meta_file.exists():
+                meta_data = json.loads(rec.meta_file.read_text())
+                self.assertNotIn("sync_night_vision", meta_data)
+            cfg_file = rec._get_config_path()
+            self.assertTrue(cfg_file.exists())
+            self.assertTrue(json.loads(cfg_file.read_text()).get("timelapse_sync_night_vision"))
 
-            # Reload into new instance
+            # Reload into new instance from the same directory/config
             rec2 = TimelapseRecorder(streamer=mock_streamer, storage_dir=storage_dir)
             self.assertTrue(rec2.sync_night_vision)
             self.assertEqual(rec2.last_session_type, "manual")
