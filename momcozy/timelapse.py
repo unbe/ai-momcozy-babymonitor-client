@@ -35,7 +35,7 @@ def format_duration(seconds: float) -> str:
 
 def format_video_duration(seconds: float) -> str:
     """Format video playback seconds to 'M:SS'."""
-    total_sec = max(0, int(seconds))
+    total_sec = max(0, round(seconds))
     mins = total_sec // 60
     secs = total_sec % 60
     return f"{mins}:{secs:02d}"
@@ -390,10 +390,10 @@ class TimelapseRecorder:
 
     def detect_motion_events(
         self,
-        threshold: float = 4.5,
+        threshold: float = 3.5,
         coarse_step: int = 30,
         min_window: int = 2,
-        debounce_sec: float = 25.0,
+        debounce_sec: float = 20.0,
     ) -> List[Dict[str, Any]]:
         """Run adaptive binary search motion detection across recorded timelapse slots on playback.
 
