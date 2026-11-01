@@ -36,3 +36,4 @@ ssl/
 .momcozy_ssl/
 timelapse/
 *.hevc
+bad-timelapse/

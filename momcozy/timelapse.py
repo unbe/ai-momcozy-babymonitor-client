@@ -331,8 +331,10 @@ class TimelapseRecorder:
                     newest_mtime = slot_mtime
                     newest_slot = i
 
-        if not meta_loaded and newest_mtime > 0:
-            self._current_slot = newest_slot
+        if newest_mtime > 0:
+            cur_mtime = float(self._slots_meta.get(str(self._current_slot), {}).get("mtime", 0.0))
+            if not meta_loaded or newest_mtime > cur_mtime:
+                self._current_slot = newest_slot
 
     def _save_meta(self) -> None:
         """Persist metadata to meta.json."""
@@ -668,13 +670,13 @@ class TimelapseRecorder:
     def _rotate_slot(self) -> None:
         """Advance to next circular slot, truncating any existing old slot file."""
         self._close_active_slot()
-        self._save_meta()
 
         self._current_slot = (self._current_slot + 1) % self.total_slots
         self._frames_in_slot = 0
         self._bytes_in_slot = 0
         self._slot_start_monotonic = time.monotonic()
         self._slot_start_wall = time.time()
+        self._save_meta()
 
         # Direct overwrite: open in "wb" mode to truncate previous 12-hour-old file
         slot_p = self.slot_path(self._current_slot)
@@ -973,8 +975,8 @@ class TimelapseRecorder:
         st = self.get_status()
         real_time_sec = max(1.0, float(st.get("buffered_seconds", 0.0)))
         total_frames = max(1, int(st.get("total_frames", 1)))
-        target_video_sec = max(0.1, real_time_sec / effective_ratio)
-        export_fps = max(1.0, round(total_frames / target_video_sec, 2))
+        target_video_sec = max(0.5, real_time_sec / effective_ratio)
+        export_fps = min(60.0, max(5.0, round(total_frames / target_video_sec, 2)))
 
         out_name = f"timelapse_cache_{norm_codec}_r{effective_ratio}.mp4"
         out_path = self.storage_dir / out_name
@@ -1093,8 +1095,7 @@ class TimelapseRecorder:
                         str(tmp_out),
                     ]
                 else:
-                    # Stream copy HEVC: 0% CPU, ultrafast remux with monotonic sequential timestamps
-                    setts_filter = f"setts=pts=N/(TB*{fps}):dts=N/(TB*{fps})"
+                    # Stream copy HEVC: 0% CPU, ultrafast remux
                     cmd = [
                         "ffmpeg",
                         "-y",
@@ -1103,7 +1104,6 @@ class TimelapseRecorder:
                         "-safe", "0",
                         "-i", list_path,
                         "-c:v", "copy",
-                        "-bsf:v", setts_filter,
                         "-tag:v", "hvc1",
                         "-movflags", "+faststart",
                         str(tmp_out),

@@ -1983,6 +1983,51 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mp4_h264.exists())
             self.assertGreater(mp4_h264.stat().st_size, 1000)
 
+    async def test_timelapse_export_framerate_bounds_and_no_setts_bsf(self):
+        """Verify export framerate is clamped to [5.0, 60.0] and HEVC stream copy excludes broken setts bsf."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=2,
+            )
+
+            # Slot with tiny duration but high frame count
+            slot0 = recorder.slot_path(0)
+            slot0.write_bytes(b"\x00\x00\x00\x01\x40\x01" + b"\x00" * 100)
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "frames": 250, "duration": 1.0, "bytes": slot0.stat().st_size}
+
+            captured_cmd = None
+            def mock_run(cmd, *args, **kwargs):
+                nonlocal captured_cmd
+                captured_cmd = cmd
+                # Create fake output
+                Path(cmd[-1]).write_bytes(b"fake_mp4_bytes")
+                m = MagicMock()
+                m.returncode = 0
+                return m
+
+            with patch("subprocess.run", side_effect=mock_run):
+                mp4 = await recorder.export_mp4(codec="hevc", ratio=60)
+                self.assertIsNotNone(mp4)
+                self.assertIsNotNone(captured_cmd)
+                # Ensure setts bitstream filter is NOT used (causes 0.05s collapse in FFmpeg 5.x / Bookworm)
+                self.assertNotIn("-bsf:v", captured_cmd)
+                # Ensure framerate flag was clamped to max 60.0 fps, not 250 / 0.5 = 500 fps
+                r_idx = captured_cmd.index("-r")
+                fps_arg = float(captured_cmd[r_idx + 1])
+                self.assertLessEqual(fps_arg, 60.0)
+                self.assertGreaterEqual(fps_arg, 5.0)
+
     async def test_timelapse_concurrent_export_deduplication(self):
         """Verify concurrent requests for the same export share a single in-flight task."""
         import asyncio
