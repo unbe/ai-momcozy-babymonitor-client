@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_MOTION_MERGE_GAP_SEC = 30.0
+_GENERIC_MOTION_LABELS = {"", "Motion Detected", "Motion Alert"}
+
+
 def format_duration(seconds: float) -> str:
     """Format duration in seconds to a human-readable string (e.g., '4h 12m' or '25m')."""
     total_sec = max(0, int(seconds))
@@ -31,6 +35,81 @@ def format_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours}h {minutes:02d}m"
     return f"{minutes}m {total_sec % 60:02d}s"
+
+
+def format_event_duration(seconds: float) -> str:
+    """Format a motion range duration concisely (e.g., '18s', '1m 25s', '1h 05m')."""
+    total_sec = max(0, int(round(seconds)))
+    if total_sec < 60:
+        return f"{total_sec}s"
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {total_sec % 60:02d}s"
+
+
+def merge_motion_ranges(
+    events: List[Dict[str, Any]],
+    merge_gap_sec: float = DEFAULT_MOTION_MERGE_GAP_SEC,
+) -> List[Dict[str, Any]]:
+    """Normalize motion/detection events into [time, end_time] ranges and merge nearby ranges.
+
+    Ranges of the same event type whose gap (next.time - cur.end_time) is <= merge_gap_sec
+    are merged into a single continuous range. Specific labels (e.g., 'Baby Motion',
+    'Human Detected') take precedence over generic labels ('Motion Detected', 'Motion Alert').
+    """
+    if not events:
+        return []
+
+    gap = max(0.0, float(merge_gap_sec))
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        raw_start = ev.get("time", ev.get("start_time"))
+        if raw_start is None:
+            continue
+        start = round(float(raw_start), 1)
+        raw_end = ev.get("end_time", start)
+        end = round(max(start, float(raw_end if raw_end is not None else start)), 1)
+        ev_type = str(ev.get("type", "motion"))
+        label = str(ev.get("label", "Motion Detected"))
+        item: Dict[str, Any] = {
+            "time": start,
+            "end_time": end,
+            "type": ev_type,
+            "label": label,
+        }
+        if ev.get("source") == "scan":
+            item["source"] = "scan"
+        by_type.setdefault(ev_type, []).append(item)
+
+    merged_all: List[Dict[str, Any]] = []
+    for ev_type, group in by_type.items():
+        group.sort(key=lambda x: (x["time"], x["end_time"]))
+        merged_group: List[Dict[str, Any]] = []
+        for item in group:
+            if not merged_group:
+                merged_group.append(dict(item))
+                continue
+            cur = merged_group[-1]
+            if item["time"] - cur["end_time"] <= gap:
+                cur["end_time"] = round(max(cur["end_time"], item["end_time"]), 1)
+                if cur["label"] in _GENERIC_MOTION_LABELS and item["label"] not in _GENERIC_MOTION_LABELS:
+                    cur["label"] = item["label"]
+                elif not cur["label"] and item["label"]:
+                    cur["label"] = item["label"]
+                # If a hardware/manual event merges with a scan range, retain non-scan provenance
+                if cur.get("source") == "scan" and item.get("source") != "scan":
+                    cur.pop("source", None)
+            else:
+                merged_group.append(dict(item))
+        merged_all.extend(merged_group)
+
+    merged_all.sort(key=lambda x: (x["time"], x["end_time"]))
+    return merged_all
 
 
 def format_video_duration(seconds: float) -> str:
@@ -147,6 +226,7 @@ class TimelapseRecorder:
         fps: int = 15,
         speed_ratio: int = 60,
         config_path: Optional[Path | str] = None,
+        motion_merge_gap_sec: float = DEFAULT_MOTION_MERGE_GAP_SEC,
     ) -> None:
         self.streamer = streamer
         self.storage_dir = Path(storage_dir or os.getenv("MOMCOZY_TIMELAPSE_DIR", "timelapse"))
@@ -156,6 +236,7 @@ class TimelapseRecorder:
         self.sample_interval_sec = float(sample_interval_sec)
         self.fps = int(fps)
         self.speed_ratio = int(speed_ratio) if int(speed_ratio) in (15, 30, 60, 90) else 60
+        self.motion_merge_gap_sec = float(motion_merge_gap_sec)
 
         self._running = False
         self._record_task: Optional[asyncio.Task] = None
@@ -294,7 +375,11 @@ class TimelapseRecorder:
                 data = json.loads(self.meta_file.read_text(encoding="utf-8"))
                 self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
                 self._slots_meta = data.get("slots", {})
-                self._events = data.get("events", [])
+                self._events = merge_motion_ranges(
+                    data.get("events", []),
+                    merge_gap_sec=self.motion_merge_gap_sec,
+                )
+                self._last_motion_scan_mtime = 0.0
                 self.last_session_type = str(data.get("last_session_type", "manual"))
                 if "speed_ratio" in data:
                     try:
@@ -400,36 +485,81 @@ class TimelapseRecorder:
                     pass
         self._save_meta()
 
+    def _retention_cutoff(self, latest_ts: float) -> float:
+        """Compute earliest wall-clock timestamp still covered by the circular slot buffer."""
+        max_history_sec = self.total_slots * self.slot_duration_sec
+        cutoff = latest_ts - max_history_sec
+        ordered = self.get_ordered_slots()
+        if ordered:
+            idx0, path0, meta0 = ordered[0]
+            dur0 = float(meta0.get("duration") or self.slot_duration_sec)
+            end0 = float(meta0.get("mtime") or (path0.stat().st_mtime if path0.exists() else latest_ts))
+            cutoff = min(cutoff, end0 - dur0 - 5.0)
+        return cutoff
+
     def record_event(
         self,
         event_type: str = "motion",
         label: str = "Motion Alert",
         timestamp: Optional[float] = None,
+        end_timestamp: Optional[float] = None,
+        merge_gap_sec: Optional[float] = None,
     ) -> bool:
-        """Record a motion or detection event with a timestamp.
+        """Record a motion or detection range [timestamp, end_timestamp].
 
-        Debounces events within 15 seconds to avoid duplicates.
-        Prunes events older than the circular buffer's retention window.
+        Nearby or overlapping ranges of the same type within merge_gap_sec are merged
+        into a single continuous range. Returns True if a new distinct event range was
+        created, or False if merged into an existing nearby range.
+        Prunes ranges older than the circular buffer's retention window.
         """
-        ts = float(timestamp if timestamp is not None else time.time())
-        # Debounce: if an event of the same type occurred within the last 15s, skip
-        for ev in reversed(self._events):
-            if ev.get("type") == event_type and abs(float(ev.get("time", 0.0)) - ts) < 15.0:
-                return False
+        start_ts = round(float(timestamp if timestamp is not None else time.time()), 1)
+        end_ts = round(max(start_ts, float(end_timestamp) if end_timestamp is not None else start_ts), 1)
+        gap = self.motion_merge_gap_sec if merge_gap_sec is None else max(0.0, float(merge_gap_sec))
 
-        self._events.append({
-            "time": round(ts, 1),
+        merges_with_existing = False
+        for ev in self._events:
+            if ev.get("type") != event_type:
+                continue
+            ev_start = float(ev.get("time", 0.0))
+            ev_end = max(ev_start, float(ev.get("end_time", ev_start)))
+            if start_ts <= ev_end + gap and end_ts >= ev_start - gap:
+                merges_with_existing = True
+                break
+
+        candidate = {
+            "time": start_ts,
+            "end_time": end_ts,
             "type": event_type,
             "label": label,
-        })
-        # Keep events within the circular ring buffer's historical retention window
-        max_history_sec = self.total_slots * self.slot_duration_sec
-        latest_ts = max([float(ev.get("time", 0.0)) for ev in self._events] + [ts])
-        cutoff = latest_ts - max_history_sec
-        self._events = [ev for ev in self._events if float(ev.get("time", 0.0)) >= cutoff]
-        self._save_meta()
-        logger.info("Recorded timelapse %s event: '%s' at timestamp %.1f", event_type, label, ts)
-        return True
+        }
+        merged = merge_motion_ranges(self._events + [candidate], merge_gap_sec=gap)
+
+        # Keep ranges within the circular ring buffer's historical retention window
+        latest_ts = max([float(ev.get("end_time", ev.get("time", 0.0))) for ev in merged] + [end_ts])
+        cutoff = self._retention_cutoff(latest_ts)
+        pruned = [ev for ev in merged if float(ev.get("end_time", ev.get("time", 0.0))) >= cutoff]
+
+        if pruned != self._events:
+            self._events = pruned
+            self._save_meta()
+            if not merges_with_existing:
+                logger.info(
+                    "Recorded timelapse %s range: '%s' [%.1f - %.1f]",
+                    event_type,
+                    label,
+                    start_ts,
+                    end_ts,
+                )
+            else:
+                logger.debug(
+                    "Extended timelapse %s range with '%s' [%.1f - %.1f]",
+                    event_type,
+                    label,
+                    start_ts,
+                    end_ts,
+                )
+
+        return not merges_with_existing
 
     @property
     def has_content(self) -> bool:
@@ -441,15 +571,18 @@ class TimelapseRecorder:
         self,
         threshold: float = 3.5,
         coarse_step: int = 30,
-        min_window: int = 2,
-        debounce_sec: float = 20.0,
+        min_window: int = 1,
+        merge_gap_sec: Optional[float] = None,
+        debounce_sec: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Run adaptive binary search motion detection across recorded timelapse slots on playback.
 
         Operates on-demand during playback (zero CPU overhead during recording).
         Leverages state-difference invariance: if Frame(A) ≈ Frame(B), no motion occurred
         in interval [A, B] and the entire block is skipped in O(1).
-        Only intervals with diff >= threshold are recursively subdivided to pinpoint motion onsets.
+        Intervals with diff >= threshold are recursively subdivided down to min_window to
+        identify active motion intervals [start_time, end_time], and nearby intervals within
+        merge_gap_sec are merged into cohesive motion ranges.
         Uses localized block luma differences so movements occupying ~1/10th of the frame
         are detected reliably without dilution from a static background.
         """
@@ -458,8 +591,14 @@ class TimelapseRecorder:
             return self._events
 
         latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
-        if self._last_motion_scan_mtime >= latest_mtime and self._events:
+        if self._last_motion_scan_mtime >= latest_mtime:
             return self._events
+
+        effective_gap = float(
+            merge_gap_sec
+            if merge_gap_sec is not None
+            else (debounce_sec if debounce_sec is not None else self.motion_merge_gap_sec)
+        )
 
         vps_marker = b"\x00\x00\x00\x01\x40\x01"
         indexed_frames: List[Tuple[Path, int, int, float]] = []
@@ -516,59 +655,151 @@ class TimelapseRecorder:
                     fp_cache[idx] = None
             return fp_cache[idx]
 
-        motion_frame_indices: List[int] = []
+        raw_intervals: List[Tuple[float, float]] = []
+        eff_min_window = max(1, int(min_window))
 
-        def subdivide(left: int, right: int) -> None:
-            if right - left <= min_window:
-                motion_frame_indices.append(right)
+        def subdivide(left: int, right: int, out_indices: List[Tuple[int, int]]) -> None:
+            if right - left <= eff_min_window:
+                out_indices.append((left, right))
                 return
             mid = (left + right) // 2
             fp_l = get_fp(left)
             fp_m = get_fp(mid)
             fp_r = get_fp(right)
-            if fp_l is not None and fp_m is not None:
-                if luma_fingerprint_diff(fp_l, fp_m) >= threshold:
-                    subdivide(left, mid)
-            if fp_m is not None and fp_r is not None:
-                if luma_fingerprint_diff(fp_m, fp_r) >= threshold:
-                    subdivide(mid, right)
+            diff_lm = luma_fingerprint_diff(fp_l, fp_m) if (fp_l is not None and fp_m is not None) else -1.0
+            diff_mr = luma_fingerprint_diff(fp_m, fp_r) if (fp_m is not None and fp_r is not None) else -1.0
+            left_active = diff_lm >= threshold
+            right_active = diff_mr >= threshold
+            if left_active:
+                subdivide(left, mid, out_indices)
+            if right_active:
+                subdivide(mid, right, out_indices)
+            if not left_active and not right_active:
+                # Gradual drift across mid where diff(left, right) >= threshold but each half < threshold
+                if diff_lm >= diff_mr and diff_lm >= 0.0:
+                    subdivide(left, mid, out_indices)
+                elif diff_mr >= 0.0:
+                    subdivide(mid, right, out_indices)
 
-        for start in range(0, total_frames - 1, coarse_step):
-            end = min(total_frames - 1, start + coarse_step)
-            fp_start = get_fp(start)
-            fp_end = get_fp(end)
-            if fp_start is None or fp_end is None:
+        # Partition frames into contiguous recording segments so paused recording gaps
+        # never fabricate artificial motion ranges across unrecorded wall-clock intervals.
+        max_frame_gap_sec = max(30.0, self.sample_interval_sec * 15.0)
+        segments: List[Tuple[int, int]] = []
+        seg_start = 0
+        for idx in range(1, total_frames):
+            if indexed_frames[idx][3] - indexed_frames[idx - 1][3] > max_frame_gap_sec:
+                if idx - 1 > seg_start:
+                    segments.append((seg_start, idx - 1))
+                seg_start = idx
+        if total_frames - 1 > seg_start:
+            segments.append((seg_start, total_frames - 1))
+
+        for s_begin, s_end in segments:
+            seg_leaves: List[Tuple[int, int]] = []
+            for start in range(s_begin, s_end, coarse_step):
+                end = min(s_end, start + coarse_step)
+                fp_start = get_fp(start)
+                fp_end = get_fp(end)
+                if fp_start is None or fp_end is None:
+                    continue
+                if luma_fingerprint_diff(fp_start, fp_end) >= threshold:
+                    subdivide(start, end, seg_leaves)
+
+            if not seg_leaves:
                 continue
-            diff = luma_fingerprint_diff(fp_start, fp_end)
-            if diff >= threshold:
-                subdivide(start, end)
 
-        raw_timestamps = sorted([indexed_frames[idx][3] for idx in motion_frame_indices])
-        clustered: List[Dict[str, Any]] = []
-        for ts in raw_timestamps:
-            if not clustered or (ts - float(clustered[-1]["time"])) >= debounce_sec:
-                clustered.append({
-                    "time": round(ts, 1),
+            seg_leaves.sort()
+            merged_idx: List[List[int]] = []
+            for l_idx, r_idx in seg_leaves:
+                if not merged_idx or (indexed_frames[l_idx][3] - indexed_frames[merged_idx[-1][1]][3]) > effective_gap:
+                    merged_idx.append([l_idx, r_idx])
+                else:
+                    merged_idx[-1][1] = max(merged_idx[-1][1], r_idx)
+
+            # Locally probe (1, 2, 4, 8 frames) around detected range boundaries within effective_gap
+            # so sustained motion that partially returns near a coarse anchor is captured to its full extent.
+            for s_idx, e_idx in merged_idx:
+                cur_s = s_idx
+                while cur_s > s_begin:
+                    found_prev = False
+                    for step in (1, 2, 4, 8):
+                        cand = cur_s - step
+                        if cand < s_begin or (indexed_frames[cur_s][3] - indexed_frames[cand][3]) > effective_gap:
+                            break
+                        fp_cand, fp_cur = get_fp(cand), get_fp(cur_s)
+                        if fp_cand is not None and fp_cur is not None and luma_fingerprint_diff(fp_cand, fp_cur) >= threshold:
+                            best = cand
+                            for k in range(cand, cur_s):
+                                fp_a, fp_b = get_fp(k), get_fp(k + 1)
+                                if fp_a is not None and fp_b is not None and luma_fingerprint_diff(fp_a, fp_b) >= threshold:
+                                    best = k
+                                    break
+                            cur_s = best
+                            found_prev = True
+                            break
+                    if not found_prev:
+                        break
+
+                cur_e = e_idx
+                while cur_e < s_end:
+                    found_next = False
+                    for step in (1, 2, 4, 8):
+                        cand = cur_e + step
+                        if cand > s_end or (indexed_frames[cand][3] - indexed_frames[cur_e][3]) > effective_gap:
+                            break
+                        fp_cur, fp_cand = get_fp(cur_e), get_fp(cand)
+                        if fp_cur is not None and fp_cand is not None and luma_fingerprint_diff(fp_cur, fp_cand) >= threshold:
+                            best = cand
+                            for k in range(cand, cur_e, -1):
+                                fp_a, fp_b = get_fp(k - 1), get_fp(k)
+                                if fp_a is not None and fp_b is not None and luma_fingerprint_diff(fp_a, fp_b) >= threshold:
+                                    best = k
+                                    break
+                            cur_e = best
+                            found_next = True
+                            break
+                    if not found_next:
+                        break
+
+                t_start = indexed_frames[cur_s][3]
+                t_end = indexed_frames[cur_e][3]
+                raw_intervals.append((t_start, max(t_start, t_end)))
+
+        scanned_ranges = merge_motion_ranges(
+            [
+                {
+                    "time": round(t_s, 1),
+                    "end_time": round(t_e, 1),
                     "type": "motion",
                     "label": "Motion Detected",
-                })
+                    "source": "scan",
+                }
+                for t_s, t_e in raw_intervals
+            ],
+            merge_gap_sec=effective_gap,
+        )
 
-        # Merge with existing hardware/manual events if present
-        all_events = {round(float(e["time"]), 1): e for e in self._events}
-        for c in clustered:
-            ts_key = round(float(c["time"]), 1)
-            if ts_key not in all_events:
-                all_events[ts_key] = c
-        merged = sorted(all_events.values(), key=lambda x: float(x.get("time", 0.0)))
+        # Retain non-scan (hardware/manual) events within the retention window and merge with fresh scan ranges
+        latest_frame_ts = indexed_frames[-1][3]
+        cutoff = min(self._retention_cutoff(latest_frame_ts), indexed_frames[0][3] - 5.0)
+        retained_external = [
+            ev
+            for ev in self._events
+            if ev.get("source") != "scan" and float(ev.get("end_time", ev.get("time", 0.0))) >= cutoff
+        ]
+        merged = merge_motion_ranges(
+            retained_external + scanned_ranges,
+            merge_gap_sec=effective_gap,
+        )
 
         self._events = merged
         self._last_motion_scan_mtime = latest_mtime
         self._save_meta()
         logger.info(
-            "Motion scan complete: indexed %d frames (decoded %d), detected %d motion events",
+            "Motion scan complete: indexed %d frames (decoded %d), detected %d motion ranges",
             total_frames,
             len(fp_cache),
-            len(clustered),
+            len(scanned_ranges),
         )
         return self._events
 
@@ -847,44 +1078,78 @@ class TimelapseRecorder:
         total_real_time_sec = min(total_real_time_sec, max_duration)
         video_sec = total_real_time_sec / self.speed_ratio if self.speed_ratio > 0 else 0.0
 
-        # Calculate event timeline positions mapped across concatenated recorded slots
+        # Calculate motion range timeline positions mapped across concatenated recorded slots
         events_list: List[Dict[str, Any]] = []
         if ordered and total_real_time_sec > 0:
-            for ev in self._events:
-                ev_time = float(ev.get("time", 0.0))
+            slot_spans: List[Tuple[float, float, float]] = []
+            for idx, path, meta in ordered:
+                if idx == self._current_slot and self.is_recording:
+                    dur = min(self.slot_duration_sec, max(0.0, time.monotonic() - self._slot_start_monotonic))
+                    end_t = time.time()
+                else:
+                    frames = meta.get("frames", 0)
+                    dur = float(
+                        meta.get("duration")
+                        or min(self.slot_duration_sec, (frames * 4.0 if frames > 0 else self.slot_duration_sec))
+                    )
+                    end_t = float(meta.get("mtime") or (path.stat().st_mtime if path.exists() else time.time()))
+                slot_spans.append((end_t - dur, end_t, dur))
+
+            def _project_ts(ts: float) -> float:
                 cum_dur = 0.0
-                elapsed_sec = None
-                for idx, path, meta in ordered:
-                    if idx == self._current_slot and self.is_recording:
-                        dur = min(self.slot_duration_sec, max(0.0, time.monotonic() - self._slot_start_monotonic))
-                        end_t = time.time()
-                    else:
-                        dur = float(meta.get("duration") or min(self.slot_duration_sec, (meta.get("frames", 0) * 4.0 if meta.get("frames", 0) > 0 else self.slot_duration_sec)))
-                        end_t = float(meta.get("mtime") or (path.stat().st_mtime if path.exists() else time.time()))
-                    start_t = end_t - dur
-                    if ev_time <= end_t:
-                        offset = max(0.0, min(ev_time - start_t, dur))
-                        elapsed_sec = cum_dur + offset
-                        break
-                    cum_dur += dur
+                for s_start, s_end, s_dur in slot_spans:
+                    if ts <= s_end:
+                        offset = max(0.0, min(ts - s_start, s_dur))
+                        return min(total_real_time_sec, cum_dur + offset)
+                    cum_dur += s_dur
+                return min(cum_dur, total_real_time_sec)
 
-                if elapsed_sec is None:
-                    elapsed_sec = min(cum_dur, total_real_time_sec)
+            earliest_slot_start = slot_spans[0][0]
+            latest_slot_end = slot_spans[-1][1]
 
-                if elapsed_sec <= total_real_time_sec + 30.0:  # within current buffer window
-                    percent = min(100.0, max(0.0, round((elapsed_sec / total_real_time_sec) * 100.0, 1)))
-                    ev_video_sec = round(elapsed_sec / self.speed_ratio, 1) if self.speed_ratio > 0 else 0.0
+            for ev in self._events:
+                start_time = float(ev.get("time", ev.get("start_time", 0.0)))
+                end_time = max(start_time, float(ev.get("end_time", start_time)))
+                if end_time < earliest_slot_start - 5.0 or start_time > latest_slot_end + 30.0:
+                    continue
+
+                start_elapsed = _project_ts(start_time)
+                end_elapsed = max(start_elapsed, _project_ts(end_time))
+
+                if start_elapsed <= total_real_time_sec + 30.0:
+                    percent = min(100.0, max(0.0, round((start_elapsed / total_real_time_sec) * 100.0, 2)))
+                    end_percent = min(100.0, max(percent, round((end_elapsed / total_real_time_sec) * 100.0, 2)))
+                    ev_video_sec = round(start_elapsed / self.speed_ratio, 1) if self.speed_ratio > 0 else 0.0
+                    end_video_sec = (
+                        round(max(ev_video_sec, end_elapsed / self.speed_ratio), 1)
+                        if self.speed_ratio > 0
+                        else 0.0
+                    )
+                    duration_sec = round(max(0.0, end_time - start_time), 1)
+                    start_time_str = time.strftime("%I:%M:%S %p", time.localtime(start_time))
+                    end_time_str = time.strftime("%I:%M:%S %p", time.localtime(end_time))
+                    time_str = f"{start_time_str} – {end_time_str}" if duration_sec >= 1.0 else start_time_str
                     events_list.append({
-                        "time": ev_time,
-                        "time_str": time.strftime("%I:%M:%S %p", time.localtime(ev_time)),
+                        "time": start_time,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "duration_sec": duration_sec,
+                        "duration_formatted": format_event_duration(duration_sec),
+                        "time_str": time_str,
+                        "start_time_str": start_time_str,
+                        "end_time_str": end_time_str,
                         "type": ev.get("type", "motion"),
                         "label": ev.get("label", "Motion Alert"),
-                        "elapsed_sec": round(elapsed_sec, 1),
+                        "elapsed_sec": round(start_elapsed, 1),
+                        "end_elapsed_sec": round(end_elapsed, 1),
                         "video_sec": ev_video_sec,
+                        "end_video_sec": end_video_sec,
                         "video_formatted": format_video_duration(ev_video_sec),
+                        "end_video_formatted": format_video_duration(end_video_sec),
                         "percent": percent,
+                        "end_percent": end_percent,
                     })
-            events_list.sort(key=lambda x: x["elapsed_sec"])
+            events_list.sort(key=lambda x: (x["elapsed_sec"], x["end_elapsed_sec"]))
 
         return {
             "is_recording": self.is_recording,

@@ -1979,6 +1979,7 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       box-shadow: 0 0 6px rgba(0,0,0,0.6);
       transform: translate(-50%, -50%);
       pointer-events: none;
+      z-index: 20;
       transition: transform 0.1s ease;
     }
     .timeline-bar-wrapper:hover .timeline-thumb {
@@ -1987,20 +1988,21 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     .timeline-marker {
       position: absolute;
       top: 50%;
-      width: 6px;
-      height: 16px;
-      border-radius: 3px;
-      background: #f59e0b;
-      box-shadow: 0 0 8px rgba(245, 158, 11, 0.9);
-      transform: translate(-50%, -50%);
+      min-width: 6px;
+      height: 14px;
+      border-radius: 4px;
+      background: rgba(245, 158, 11, 0.78);
+      border: 1px solid rgba(251, 191, 36, 0.95);
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.75);
+      transform: translateY(-50%);
+      box-sizing: border-box;
       cursor: pointer;
       z-index: 10;
-      transition: all 0.15s ease;
+      transition: height 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
     }
     .timeline-marker:hover {
-      width: 8px;
-      height: 20px;
-      background: #fbbf24;
+      height: 18px;
+      background: rgba(251, 191, 36, 0.95);
       box-shadow: 0 0 12px rgba(251, 191, 36, 1);
     }
     .timeline-tooltip {
@@ -2230,38 +2232,80 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
       return `${m}:${rem < 10 ? '0' : ''}${rem}`;
     }
 
+    function getEventStartSec(ev) {
+      return (video.duration && ev.percent !== undefined)
+        ? (ev.percent / 100) * video.duration
+        : ev.video_sec;
+    }
+
+    function formatRangeTooltip(ev) {
+      const hasDuration = ev.duration_sec !== undefined && ev.duration_sec >= 1;
+      const vStart = ev.video_formatted || '0:00';
+      const vEnd = ev.end_video_formatted || vStart;
+      const vSpan = vEnd !== vStart ? `${vStart}–${vEnd}` : vStart;
+      if (hasDuration && ev.duration_formatted) {
+        return `🏃 ${ev.label} • ${ev.time_str} (${ev.duration_formatted} • ${vSpan})`;
+      }
+      return `🏃 ${ev.label} • ${ev.time_str} (${vSpan})`;
+    }
+
     function renderTimelineMarkers() {
       const container = document.getElementById('timeline-markers');
       if (!container) return;
       container.innerHTML = '';
       const counter = document.getElementById('events-counter-badge');
       if (counter) {
-        counter.textContent = `🏃 ${motionEvents.length} Motion Event${motionEvents.length === 1 ? '' : 's'}`;
+        counter.textContent = `🏃 ${motionEvents.length} Motion Range${motionEvents.length === 1 ? '' : 's'}`;
       }
 
       motionEvents.forEach((ev) => {
         const el = document.createElement('div');
         el.className = 'timeline-marker';
-        el.style.left = `${ev.percent}%`;
+        const startPct = ev.percent !== undefined ? ev.percent : 0;
+        const endPct = ev.end_percent !== undefined ? Math.max(startPct, ev.end_percent) : startPct;
+        const widthPct = Math.max(0, endPct - startPct);
+        el.style.left = `clamp(0px, ${startPct}%, calc(100% - 6px))`;
+        el.style.width = `${widthPct}%`;
 
-        el.addEventListener('mouseenter', () => {
+        const updateTooltip = (e) => {
           const tt = document.getElementById('timeline-tooltip');
-          if (tt) {
-            tt.textContent = `🏃 ${ev.label} • ${ev.time_str} (${ev.video_formatted})`;
-            tt.style.left = `${ev.percent}%`;
-            tt.style.display = 'block';
+          const bar = document.getElementById('timeline-bar');
+          if (!tt) return;
+          tt.textContent = formatRangeTooltip(ev);
+          let hoverPct = (startPct + endPct) / 2;
+          if (bar && e && typeof e.clientX === 'number') {
+            const barRect = bar.getBoundingClientRect();
+            if (barRect.width > 0) {
+              hoverPct = ((e.clientX - barRect.left) / barRect.width) * 100;
+            }
           }
-        });
+          tt.style.left = `${Math.max(8, Math.min(92, hoverPct))}%`;
+          tt.style.display = 'block';
+        };
+
+        el.addEventListener('mouseenter', updateTooltip);
+        el.addEventListener('mousemove', updateTooltip);
         el.addEventListener('mouseleave', () => {
           const tt = document.getElementById('timeline-tooltip');
           if (tt) tt.style.display = 'none';
         });
+
+        const shouldSnapToStart = (e) => {
+          const rect = el.getBoundingClientRect();
+          return rect.width <= 20 || (e.clientX - rect.left) <= 12;
+        };
+
+        el.addEventListener('mousedown', (e) => {
+          if (shouldSnapToStart(e)) {
+            e.stopPropagation();
+            seekToSec(getEventStartSec(ev));
+          }
+        });
         el.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const targetSec = (video.duration && ev.percent !== undefined)
-            ? (ev.percent / 100) * video.duration
-            : ev.video_sec;
-          seekToSec(targetSec);
+          if (shouldSnapToStart(e)) {
+            e.stopPropagation();
+            seekToSec(getEventStartSec(ev));
+          }
         });
         container.appendChild(el);
       });
@@ -2313,30 +2357,22 @@ HTML_TIMELAPSE_PLAYER = """<!DOCTYPE html>
     function jumpToNextEvent() {
       if (!motionEvents.length || !video.duration) return;
       const cur = video.currentTime;
-      const next = motionEvents.find(ev => {
-        const sec = (ev.percent !== undefined) ? (ev.percent / 100) * video.duration : ev.video_sec;
-        return sec > cur + 0.8;
-      });
+      const next = motionEvents.find(ev => getEventStartSec(ev) > cur + 0.8);
       if (next) {
-        seekToSec((next.percent !== undefined) ? (next.percent / 100) * video.duration : next.video_sec);
+        seekToSec(getEventStartSec(next));
       } else if (motionEvents.length) {
-        const first = motionEvents[0];
-        seekToSec((first.percent !== undefined) ? (first.percent / 100) * video.duration : first.video_sec);
+        seekToSec(getEventStartSec(motionEvents[0]));
       }
     }
 
     function jumpToPrevEvent() {
       if (!motionEvents.length || !video.duration) return;
       const cur = video.currentTime;
-      const prev = [...motionEvents].reverse().find(ev => {
-        const sec = (ev.percent !== undefined) ? (ev.percent / 100) * video.duration : ev.video_sec;
-        return sec < cur - 0.8;
-      });
+      const prev = [...motionEvents].reverse().find(ev => getEventStartSec(ev) < cur - 0.8);
       if (prev) {
-        seekToSec((prev.percent !== undefined) ? (prev.percent / 100) * video.duration : prev.video_sec);
+        seekToSec(getEventStartSec(prev));
       } else if (motionEvents.length) {
-        const last = motionEvents[motionEvents.length - 1];
-        seekToSec((last.percent !== undefined) ? (last.percent / 100) * video.duration : last.video_sec);
+        seekToSec(getEventStartSec(motionEvents[motionEvents.length - 1]));
       }
     }
 
@@ -3305,7 +3341,7 @@ class WebServer:
         return web.json_response(self._get_timelapse_status())
 
     async def handle_timelapse_record_event(self, request: web.Request) -> web.Response:
-        """Manually or externally record a motion/detection event."""
+        """Manually or externally record a motion/detection range or point event."""
         if not self.timelapse:
             return web.json_response({"success": False, "error": "Timelapse recorder not configured."}, status=503)
         try:
@@ -3314,9 +3350,20 @@ class WebServer:
             data = {}
         ev_type = str(data.get("type", "motion"))
         label = str(data.get("label", "Motion Alert"))
-        ts = data.get("timestamp")
-        timestamp = float(ts) if isinstance(ts, (int, float)) else None
-        recorded = self.timelapse.record_event(event_type=ev_type, label=label, timestamp=timestamp)
+        ts = data.get("timestamp", data.get("start_time"))
+        timestamp = float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+        raw_end = data.get("end_timestamp", data.get("end_time"))
+        end_timestamp = float(raw_end) if isinstance(raw_end, (int, float)) and not isinstance(raw_end, bool) else None
+        raw_dur = data.get("duration")
+        if end_timestamp is None and isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool):
+            base_ts = timestamp if timestamp is not None else time.time()
+            end_timestamp = base_ts + max(0.0, float(raw_dur))
+        recorded = self.timelapse.record_event(
+            event_type=ev_type,
+            label=label,
+            timestamp=timestamp,
+            end_timestamp=end_timestamp,
+        )
         return web.json_response({
             "success": True,
             "recorded": recorded,

@@ -2205,32 +2205,49 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
             rec1 = recorder.record_event(event_type="motion", label="Motion Alert", timestamp=9700.0)
             self.assertTrue(rec1)
 
-            # 2. Try recording duplicate within 15s -> should be debounced
+            # 2. Record nearby event within merge gap (t=9705.0, +5s) -> merges into range [9700.0, 9705.0]
             rec2 = recorder.record_event(event_type="motion", label="Motion Alert", timestamp=9705.0)
             self.assertFalse(rec2)
             self.assertEqual(len(recorder._events), 1)
+            self.assertEqual(recorder._events[0]["time"], 9700.0)
+            self.assertEqual(recorder._events[0]["end_time"], 9705.0)
 
-            # 3. Record second event at t=9850.0 (450s into 600s recording -> 75%)
-            rec3 = recorder.record_event(event_type="motion", label="Baby Motion", timestamp=9850.0)
+            # 2b. Chain-extend the same range further (t=9730.0, 25s after 9705.0 <= 30s merge gap) -> [9700.0, 9730.0]
+            rec2b = recorder.record_event(event_type="motion", label="Motion Alert", timestamp=9730.0)
+            self.assertFalse(rec2b)
+            self.assertEqual(len(recorder._events), 1)
+            self.assertEqual(recorder._events[0]["time"], 9700.0)
+            self.assertEqual(recorder._events[0]["end_time"], 9730.0)
+
+            # 3. Record second separate event at t=9850.0 (120s after 9730.0 > 30s -> new range at 75%)
+            rec3 = recorder.record_event(event_type="motion", label="Baby Motion", timestamp=9850.0, end_timestamp=9880.0)
             self.assertTrue(rec3)
             self.assertEqual(len(recorder._events), 2)
 
-            # 4. Check status timeline calculation
+            # 4. Check status timeline range calculation
             st = recorder.get_status()
             self.assertEqual(st["motion_events_count"], 2)
             evs = st["events"]
             self.assertEqual(len(evs), 2)
 
-            # Ev 1: elapsed 300s, video_sec = 300 / 60 = 5.0s, percent = 50.0%
+            # Range 1: [9700.0, 9730.0] -> elapsed [300.0, 330.0], video [5.0, 5.5], percent [50.0, 55.0]
             self.assertEqual(evs[0]["elapsed_sec"], 300.0)
+            self.assertEqual(evs[0]["end_elapsed_sec"], 330.0)
+            self.assertEqual(evs[0]["duration_sec"], 30.0)
+            self.assertEqual(evs[0]["duration_formatted"], "30s")
             self.assertEqual(evs[0]["video_sec"], 5.0)
+            self.assertEqual(evs[0]["end_video_sec"], 5.5)
             self.assertEqual(evs[0]["video_formatted"], "0:05")
             self.assertEqual(evs[0]["percent"], 50.0)
+            self.assertEqual(evs[0]["end_percent"], 55.0)
 
-            # Ev 2: elapsed 450s, video_sec = 450 / 60 = 7.5s, percent = 75.0%
+            # Range 2: [9850.0, 9880.0] -> elapsed [450.0, 480.0], video [7.5, 8.0], percent [75.0, 80.0]
             self.assertEqual(evs[1]["elapsed_sec"], 450.0)
+            self.assertEqual(evs[1]["end_elapsed_sec"], 480.0)
             self.assertEqual(evs[1]["video_sec"], 7.5)
+            self.assertEqual(evs[1]["end_video_sec"], 8.0)
             self.assertEqual(evs[1]["percent"], 75.0)
+            self.assertEqual(evs[1]["end_percent"], 80.0)
 
             # 5. Verify timeline calculation with multi-slot gap within retention window
             s1 = recorder.slot_path(1)
@@ -2344,6 +2361,136 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
                 cached_events = recorder.detect_motion_events()
                 self.assertEqual(cached_events, events)
                 self.assertEqual(len(decoded_frames), prev_decoded_count)
+
+    def test_merge_motion_ranges_helper(self):
+        """Verify pure merge_motion_ranges merges nearby/overlapping ranges and preserves labels."""
+        from momcozy.timelapse import merge_motion_ranges, format_event_duration
+
+        self.assertEqual(merge_motion_ranges([]), [])
+        self.assertEqual(format_event_duration(0), "0s")
+        self.assertEqual(format_event_duration(42.4), "42s")
+        self.assertEqual(format_event_duration(85.0), "1m 25s")
+        self.assertEqual(format_event_duration(3900.0), "1h 05m")
+
+        raw = [
+            {"time": 100.0, "end_time": 112.0, "type": "motion", "label": "Motion Detected", "source": "scan"},
+            {"time": 125.0, "type": "motion", "label": "Human Detected"},  # 13s gap <= 30s -> merges & upgrades label
+            {"time": 150.0, "end_time": 165.0, "type": "motion", "label": "Motion Alert"},  # 25s gap <= 30s -> merges
+            {"time": 130.0, "end_time": 135.0, "type": "crying", "label": "Cry Alert"},  # distinct type kept separate
+            {"time": 250.0, "end_time": 260.0, "type": "motion", "label": "Motion Detected", "source": "scan"},  # 85s gap > 30s
+        ]
+        merged = merge_motion_ranges(raw, merge_gap_sec=30.0)
+        self.assertEqual(len(merged), 3)
+
+        # First merged motion range: [100.0, 165.0], upgraded label 'Human Detected', non-scan provenance preserved
+        self.assertEqual(merged[0]["time"], 100.0)
+        self.assertEqual(merged[0]["end_time"], 165.0)
+        self.assertEqual(merged[0]["type"], "motion")
+        self.assertEqual(merged[0]["label"], "Human Detected")
+        self.assertNotIn("source", merged[0])
+
+        # Second: distinct crying event at [130.0, 135.0]
+        self.assertEqual(merged[1]["time"], 130.0)
+        self.assertEqual(merged[1]["end_time"], 135.0)
+        self.assertEqual(merged[1]["type"], "crying")
+
+        # Third: separate motion range [250.0, 260.0]
+        self.assertEqual(merged[2]["time"], 250.0)
+        self.assertEqual(merged[2]["end_time"], 260.0)
+        self.assertEqual(merged[2]["source"], "scan")
+
+    async def test_timelapse_sustained_motion_ranges_and_session_gaps(self):
+        """Verify sustained/intermittent motion merges into ranges and paused session gaps do not bridge."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        from aiohttp.test_utils import make_mocked_request
+        from momcozy.timelapse import TimelapseRecorder
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = False
+
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=4,
+                slot_duration_sec=300.0,
+                speed_ratio=60,
+                motion_merge_gap_sec=30.0,
+            )
+
+            vps_marker = b"\x00\x00\x00\x01\x40\x01"
+            # Slot 0: 150 frames over 300s (2s/frame), t = 1000..1300
+            # Motion episode 1: frames 10..35 (t ~ 1020..1070, 50s sustained movement with a 10s pause in middle)
+            # Stillness: frames 36..109 (148s quiet)
+            # Motion episode 2: frames 110..115 (t ~ 1220..1230, 10s movement)
+            s0 = recorder.slot_path(0)
+            p0 = b"".join(vps_marker + bytes([0, i]) + b"\x00" * 40 for i in range(150))
+            s0.write_bytes(p0)
+            recorder._slots_meta["0"] = {"mtime": 1300.0, "duration": 300.0, "frames": 150, "bytes": len(p0)}
+
+            # Slot 1: recorded after a 1-hour pause! t = 4900..5200 (150 frames)
+            # Scene changed completely during the 1-hour pause (from last state of slot 0 to new state in slot 1),
+            # then remains completely still throughout slot 1! Must NOT create a fake 1-hour motion range!
+            s1 = recorder.slot_path(1)
+            p1 = b"".join(vps_marker + bytes([1, i]) + b"\x00" * 40 for i in range(150))
+            s1.write_bytes(p1)
+            recorder._slots_meta["1"] = {"mtime": 5200.0, "duration": 300.0, "frames": 150, "bytes": len(p1)}
+
+            def mock_luma(chunk):
+                slot_id = chunk[6]
+                frame_idx = chunk[7]
+                if slot_id == 0:
+                    if frame_idx < 10:
+                        return b"\x10" * 256
+                    if frame_idx <= 20:
+                        # Moving continuously (10..20)
+                        return bytes([0x10 + (frame_idx - 9) * 5]) * 256
+                    if frame_idx <= 25:
+                        # Brief 10s pause (21..25)
+                        return bytes([0x10 + 11 * 5]) * 256
+                    if frame_idx <= 35:
+                        # Resumes moving (26..35)
+                        return bytes([0x10 + 11 * 5 + (frame_idx - 25) * 5]) * 256
+                    if frame_idx < 110:
+                        # Still (36..109)
+                        return bytes([0x10 + 21 * 5]) * 256
+                    if frame_idx <= 115:
+                        # Second motion burst (110..115)
+                        return bytes([0x10 + 21 * 5 + (frame_idx - 109) * 6]) * 256
+                    return bytes([0x10 + 27 * 6]) * 256
+                # Slot 1: totally different brightness (e.g. daylight vs night), completely static within slot 1
+                return b"\xd0" * 256
+
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                ranges = await recorder.scan_motion_events(force=True)
+
+            # Should detect EXACTLY 2 merged motion ranges in Slot 0, and ZERO cross-pause ranges into Slot 1!
+            self.assertEqual(len(ranges), 2)
+
+            # Range 1 spans ~frames 9..35 (~50s continuous episode, NOT split every 20s!)
+            self.assertAlmostEqual(ranges[0]["time"], 1000.0 + (9 / 149) * 300.0, delta=4.0)
+            self.assertAlmostEqual(ranges[0]["end_time"], 1000.0 + (35 / 149) * 300.0, delta=4.0)
+            self.assertGreater(ranges[0]["end_time"] - ranges[0]["time"], 45.0)
+
+            # Range 2 spans ~frames 109..115 (~12s episode)
+            self.assertAlmostEqual(ranges[1]["time"], 1000.0 + (109 / 149) * 300.0, delta=4.0)
+            self.assertAlmostEqual(ranges[1]["end_time"], 1000.0 + (115 / 149) * 300.0, delta=4.0)
+
+            # Also verify POST /api/timelapse/event accepts explicit range (end_timestamp / duration)
+            server = WebServer(monitor=MagicMock(), streamer=mock_streamer, timelapse_dir=td)
+            server.timelapse = recorder
+            req_range = make_mocked_request("POST", "/api/timelapse/event")
+            req_range._read_bytes = b'{"type": "motion", "label": "Crib Visit", "timestamp": 5000.0, "duration": 45.0}'
+            resp_range = await server.handle_timelapse_record_event(req_range)
+            self.assertEqual(resp_range.status, 200)
+            st = recorder.get_status()
+            self.assertEqual(len(st["events"]), 3)
+            self.assertEqual(st["events"][2]["label"], "Crib Visit")
+            self.assertEqual(st["events"][2]["duration_sec"], 45.0)
+            self.assertGreater(st["events"][2]["end_percent"], st["events"][2]["percent"])
 
 
 class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
