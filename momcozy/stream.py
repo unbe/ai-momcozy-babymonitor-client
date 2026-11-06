@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import logging
 import struct
@@ -238,6 +239,7 @@ class MomcozyHevcHandler:
         cached_sps: Optional[bytes] = None,
         cached_pps: Optional[bytes] = None,
         on_params_updated: Optional[Callable[[Optional[bytes], Optional[bytes], Optional[bytes]], None]] = None,
+        is_full_rate_needed: Optional[Callable[[], bool]] = None,
     ) -> None:
         try:
             import av
@@ -250,11 +252,13 @@ class MomcozyHevcHandler:
         self._on_frame = on_frame
         self._on_hevc = on_hevc
         self._is_transcoding_needed = is_transcoding_needed
+        self._is_full_rate_needed = is_full_rate_needed
         self._on_params_updated = on_params_updated
         self._transcoding_active = False
         self._buffer = bytearray()
         self._fu_buffer = bytearray()
         self._fu_is_key = False
+        self._fu_discard = False
         self._param_buffer = bytearray()
         self._latest_vps: Optional[bytes] = cached_vps
         self._latest_sps: Optional[bytes] = cached_sps
@@ -332,6 +336,7 @@ class MomcozyHevcHandler:
             nal_type = (nal_hdr >> 1) & 0x3F
 
             completed_au: Optional[tuple[bytes, bool]] = None
+            full_rate = True if self._is_full_rate_needed is None else bool(self._is_full_rate_needed())
 
             if nal_type == 49:  # FU (Fragmentation Unit)
                 if len(payload) < 3:
@@ -340,21 +345,29 @@ class MomcozyHevcHandler:
                 s = bool(fu_hdr & 0x80)
                 e = bool(fu_hdr & 0x40)
                 ftype = fu_hdr & 0x3F
+                is_key = (16 <= ftype <= 21)
                 if s:
-                    self._fu_buffer = bytearray(b"\x00\x00\x00\x01")
-                    b0 = (payload[0] & 0x81) | (ftype << 1)
-                    b1 = payload[1]
-                    self._fu_buffer.extend([b0, b1])
-                    self._fu_buffer.extend(payload[3:])
-                    self._fu_is_key = (16 <= ftype <= 21)
+                    if not is_key and not full_rate:
+                        self._fu_discard = True
+                        self._fu_buffer.clear()
+                    else:
+                        self._fu_discard = False
+                        self._fu_buffer = bytearray(b"\x00\x00\x00\x01")
+                        b0 = (payload[0] & 0x81) | (ftype << 1)
+                        b1 = payload[1]
+                        self._fu_buffer.extend([b0, b1])
+                        self._fu_buffer.extend(payload[3:])
+                        self._fu_is_key = is_key
                 else:
-                    if self._fu_buffer:
+                    if not self._fu_discard and self._fu_buffer:
                         self._fu_buffer.extend(payload[3:])
 
-                if e and self._fu_buffer:
-                    nalu_bytes = bytes(self._fu_buffer)
-                    self._fu_buffer = bytearray()
-                    completed_au = self._build_au(nalu_bytes, self._fu_is_key)
+                if e:
+                    if not self._fu_discard and self._fu_buffer:
+                        nalu_bytes = bytes(self._fu_buffer)
+                        self._fu_buffer = bytearray()
+                        completed_au = self._build_au(nalu_bytes, self._fu_is_key)
+                    self._fu_discard = False
 
             elif nal_type == 48:  # AP (Aggregation Packet)
                 ap_off = 2
@@ -381,7 +394,8 @@ class MomcozyHevcHandler:
                         self._param_buffer.extend(nalu_with_start)
                     else:
                         is_key = (16 <= single_type <= 21)
-                        completed_au = self._build_au(nalu_with_start, is_key)
+                        if is_key or full_rate:
+                            completed_au = self._build_au(nalu_with_start, is_key)
 
             else:  # Single NAL unit
                 nalu_with_start = b"\x00\x00\x00\x01" + payload
@@ -399,7 +413,8 @@ class MomcozyHevcHandler:
                     self._param_buffer.extend(nalu_with_start)
                 else:
                     is_key = (16 <= nal_type <= 21)
-                    completed_au = self._build_au(nalu_with_start, is_key)
+                    if is_key or full_rate:
+                        completed_au = self._build_au(nalu_with_start, is_key)
 
             if completed_au:
                 au_bytes, is_key = completed_au
@@ -450,12 +465,114 @@ def _put_drop_oldest(queue: "asyncio.Queue[Any]", item: Any) -> None:
         pass
 
 
+_KCP_HEADER_STRUCT = struct.Struct("<IBBHIIII")
+_HMAC_PRECOMPUTED_CACHE: dict[bytes, tuple[hashlib._Hash, hashlib._Hash]] = {}
+
+
+def fast_hmac_sha1(key: bytes, message: bytes) -> bytes:
+    """Fast HMAC-SHA1 using precomputed inner/outer SHA1 padding states."""
+    state = _HMAC_PRECOMPUTED_CACHE.get(key)
+    if state is None:
+        padded_key = key.ljust(64, b"\x00") if len(key) <= 64 else hashlib.sha1(key).digest().ljust(64, b"\x00")
+        ipad = bytes(b ^ 0x36 for b in padded_key)
+        opad = bytes(b ^ 0x5C for b in padded_key)
+        state = (hashlib.sha1(ipad), hashlib.sha1(opad))
+        if len(_HMAC_PRECOMPUTED_CACHE) > 16:
+            _HMAC_PRECOMPUTED_CACHE.clear()
+        _HMAC_PRECOMPUTED_CACHE[key] = state
+
+    h_in, h_out = state
+    h = h_in.copy()
+    h.update(message)
+    h2 = h_out.copy()
+    h2.update(h.digest())
+    return h2.digest()
+
+
+def fast_parse_segment(raw: bytes) -> Optional[Any]:
+    """Fast KCP segment unpack using pre-compiled struct.Struct."""
+    if len(raw) < 24:
+        return None
+    conv, cmd, frag, wnd, ts, sn, una, length = _KCP_HEADER_STRUCT.unpack_from(raw)
+    if 24 + length > len(raw):
+        return None
+    from tuya_ipc_p2p_sdk.transport.kcp_segment import KcpSegment
+
+    return KcpSegment(conv, cmd, frag, wnd, ts, sn, una, raw[24 : 24 + length])
+
+
+def fast_build_segment(
+    conversation: int,
+    command: int,
+    fragment: int,
+    window: int,
+    timestamp: int,
+    sequence: int,
+    unacknowledged: int,
+    data: bytes = b"",
+) -> bytes:
+    """Fast KCP segment pack using pre-compiled struct.Struct."""
+    hdr = _KCP_HEADER_STRUCT.pack(
+        conversation & 0xFFFFFFFF,
+        command & 0xFF,
+        fragment & 0xFF,
+        window & 0xFFFF,
+        timestamp & 0xFFFFFFFF,
+        sequence & 0xFFFFFFFF,
+        unacknowledged & 0xFFFFFFFF,
+        len(data),
+    )
+    return hdr + data if data else hdr
+
+
+def fast_unwrap_media_frame(media_key: bytes, payload: bytes) -> bytes:
+    """Fast unwrap of inbound media frames with struct unpack and fast HMAC."""
+    if len(payload) < 24:
+        from tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pProtocolError
+
+        raise TuyaIpcP2pProtocolError("Failed to read media frame: payload too short")
+    inner = struct.unpack_from(">H", payload, 2)[0]
+    if inner < 20 or 4 + inner > len(payload):
+        from tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pProtocolError
+
+        raise TuyaIpcP2pProtocolError(f"Failed to read media frame: bad inner length {inner}")
+    end = 4 + inner
+    segment = payload[4 : end - 20]
+    tag = payload[end - 20 : end]
+    if tag != fast_hmac_sha1(media_key, segment):
+        from tuya_ipc_p2p_sdk.exceptions import TuyaIpcP2pProtocolError
+
+        raise TuyaIpcP2pProtocolError("Failed to read media frame: tag mismatch")
+    return segment
+
+
 def _patch_tuya_stream_session() -> None:
     """Monkey-patch tuya_ipc_p2p_sdk to handle BM04 HEVC video and G.711 A-law audio."""
     from tuya_ipc_p2p_sdk.camera_stream import CameraStream
     from tuya_ipc_p2p_sdk.crypto import decrypt_record
     from tuya_ipc_p2p_sdk.stream_session import StreamSession
     from tuya_ipc_p2p_sdk.transport.kcp_segment import parse_segment
+
+    # 0. Monkey-patch transport framing and KCP segment handling with fast implementations
+    try:
+        import tuya_ipc_p2p_sdk.crypto as sdk_crypto
+        import tuya_ipc_p2p_sdk.transport.relay_framing as relay_framing
+        import tuya_ipc_p2p_sdk.transport.relay_connection as relay_connection
+        import tuya_ipc_p2p_sdk.transport.kcp_segment as kcp_segment
+        import tuya_ipc_p2p_sdk.transport.relay_session as relay_session
+        import tuya_ipc_p2p_sdk.transport.kcp_conversation as kcp_conversation
+
+        sdk_crypto.hmac_sha1 = fast_hmac_sha1
+        relay_framing.hmac_sha1 = fast_hmac_sha1
+        relay_framing.unwrap_media_frame = fast_unwrap_media_frame
+        relay_connection.unwrap_media_frame = fast_unwrap_media_frame
+        kcp_segment.parse_segment = fast_parse_segment
+        relay_session.parse_segment = fast_parse_segment
+        kcp_segment.build_segment = fast_build_segment
+        kcp_conversation.build_segment = fast_build_segment
+    except Exception as exc:
+        logger.debug("Failed applying fast transport patches to tuya_ipc_p2p_sdk: %s", exc)
+
     # 1. Patch StreamSession to manage video and audio handlers
     orig_init = StreamSession.__init__
 
@@ -465,10 +582,16 @@ def _patch_tuya_stream_session() -> None:
             self._on_frame,
             getattr(self, "_on_hevc", None),
             getattr(self, "_is_transcoding_needed", None),
+            is_full_rate_needed=getattr(self, "_is_full_rate_needed", None),
         )
         self._momcozy_audio = MomcozyAudioHandler(getattr(self, "_on_pcm", None))
 
     def momcozy_on_media_record(self: Any, record: bytes) -> None:
+        if hasattr(self, "_camera_stream"):
+            try:
+                self._camera_stream._last_frame_at = time.monotonic()
+            except Exception:
+                pass
         try:
             pt = decrypt_record(self._answer_key, record)
         except Exception as exc:
@@ -519,6 +642,7 @@ def _patch_tuya_stream_session() -> None:
         self._hevc_subscribers: Set[asyncio.Queue[tuple[bytes, bool]]] = set()
         self._is_transcoding_needed: Optional[Callable[[], bool]] = None
         self._is_audio_needed: Optional[Callable[[], bool]] = None
+        self._is_full_rate_needed: Optional[Callable[[], bool]] = None
 
     def momcozy_on_audio(self: Any, pcm: bytes) -> None:
         for subscriber in list(self._audio_subscribers):
@@ -556,9 +680,12 @@ def _patch_tuya_stream_session() -> None:
         session._on_hevc = self._on_hevc
         session._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
         session._is_audio_needed = getattr(self, "_is_audio_needed", None)
+        session._is_full_rate_needed = getattr(self, "_is_full_rate_needed", None)
+        session._camera_stream = self
         if hasattr(session, "_momcozy_hevc"):
             session._momcozy_hevc._on_hevc = self._on_hevc
             session._momcozy_hevc._is_transcoding_needed = getattr(self, "_is_transcoding_needed", None)
+            session._momcozy_hevc._is_full_rate_needed = getattr(self, "_is_full_rate_needed", None)
             cached_params = getattr(self, "_cached_params", None)
             if cached_params:
                 vps, sps, pps = cached_params
@@ -869,6 +996,10 @@ class VideoStreamer:
         """Return True only if an active listener is consuming audio."""
         return len(self._audio_listeners) > 0
 
+    def is_full_rate_needed(self) -> bool:
+        """Return True only if an active viewer or pending snapshot requires all delta frames."""
+        return len(self._listeners) > 0 or len(self._hevc_listeners) > 0 or len(self._snapshot_requests) > 0
+
     @property
     def last_error(self) -> Optional[str]:
         return self._last_error
@@ -1110,6 +1241,7 @@ class VideoStreamer:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
                     stream._is_transcoding_needed = self.is_transcoding_needed
                     stream._is_audio_needed = self.is_audio_needed
+                    stream._is_full_rate_needed = self.is_full_rate_needed
                     stream._cached_params = (self._cached_vps, self._cached_sps, self._cached_pps)
 
                     def update_params(vps: Optional[bytes], sps: Optional[bytes], pps: Optional[bytes]) -> None:

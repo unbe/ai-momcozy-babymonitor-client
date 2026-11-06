@@ -3022,6 +3022,144 @@ class TestNightVisionAutomationStateMachine(unittest.TestCase):
         self.assertAlmostEqual(server._monitor_tick_delay(), 30.0, places=1)
 
 
+class TestStreamOptimizations(unittest.TestCase):
+    """Test fast transport and delta-frame dropping optimizations."""
+
+    def test_fast_hmac_sha1(self):
+        import hmac
+        import hashlib
+        from momcozy.stream import fast_hmac_sha1
+
+        for key in [b"secret", b"k" * 16, b"k" * 64, b"long_key_" * 10]:
+            for msg in [b"", b"short", b"x" * 1400]:
+                expected = hmac.new(key, msg, hashlib.sha1).digest()
+                actual = fast_hmac_sha1(key, msg)
+                self.assertEqual(actual, expected)
+
+    def test_fast_kcp_segment_pack_unpack(self):
+        from momcozy.stream import fast_build_segment, fast_parse_segment
+        import tuya_ipc_p2p_sdk.transport.kcp_segment as sdk_kcp
+
+        raw = fast_build_segment(
+            conversation=101,
+            command=81,
+            fragment=2,
+            window=128,
+            timestamp=55555,
+            sequence=12,
+            unacknowledged=11,
+            data=b"hello fast kcp",
+        )
+        expected_raw = sdk_kcp.build_segment(101, 81, 2, 128, 55555, 12, 11, b"hello fast kcp")
+        self.assertEqual(raw, expected_raw)
+
+        seg = fast_parse_segment(raw)
+        self.assertIsNotNone(seg)
+        self.assertEqual(seg.conversation, 101)
+        self.assertEqual(seg.command, 81)
+        self.assertEqual(seg.fragment, 2)
+        self.assertEqual(seg.window, 128)
+        self.assertEqual(seg.timestamp, 55555)
+        self.assertEqual(seg.sequence, 12)
+        self.assertEqual(seg.unacknowledged, 11)
+        self.assertEqual(seg.data, b"hello fast kcp")
+
+    def test_fast_unwrap_media_frame(self):
+        from momcozy.stream import fast_unwrap_media_frame, fast_build_segment
+        import tuya_ipc_p2p_sdk.transport.relay_framing as relay_framing
+
+        key = b"relay_media_key_16b"
+        segment = fast_build_segment(1, 81, 0, 128, 100, 1, 0, b"media payload")
+        frame = relay_framing.media_frame(key, segment)
+        unwrapped = fast_unwrap_media_frame(key, frame[4:])
+        self.assertEqual(unwrapped, segment)
+
+    def test_hevc_handler_delta_frame_filtering(self):
+        """Verify MomcozyHevcHandler drops delta frames when full rate is not needed."""
+        import struct
+        from momcozy.stream import MomcozyHevcHandler
+
+        delivered = []
+        def on_hevc(chunk, is_key):
+            delivered.append((chunk, is_key))
+
+        full_rate_needed = False
+        handler = MomcozyHevcHandler(
+            on_frame=None,
+            on_hevc=on_hevc,
+            is_transcoding_needed=lambda: False,
+            is_full_rate_needed=lambda: full_rate_needed,
+        )
+
+        def make_record(payload_bytes):
+            header = bytearray(28)
+            header[0:8] = b"\x03\x00\x01\x00\x00\x00\x00\x00"
+            struct.pack_into("<I", header, 16, 0)
+            total_payload = 12 + len(payload_bytes)
+            struct.pack_into("<I", header, 24, total_payload)
+            meta = bytes(12)
+            return bytes(header) + meta + payload_bytes
+
+        # Parameter sets: VPS, SPS, PPS
+        vps = bytes([(32 << 1), 0x01, 0x00, 0x01])
+        sps = bytes([(33 << 1), 0x01, 0x00, 0x02])
+        pps = bytes([(34 << 1), 0x01, 0x00, 0x03])
+        handler.feed_record(make_record(vps))
+        handler.feed_record(make_record(sps))
+        handler.feed_record(make_record(pps))
+
+        # Keyframe IDR single NAL (NAL 19)
+        idr = bytes([(19 << 1), 0x01, 0xAA, 0xBB])
+        handler.feed_record(make_record(idr))
+        self.assertEqual(len(delivered), 1)
+        self.assertTrue(delivered[-1][1])
+
+        # Delta frame single NAL (NAL 1) with full_rate_needed=False -> dropped
+        delta_nal = bytes([(1 << 1), 0x01, 0x11, 0x22])
+        handler.feed_record(make_record(delta_nal))
+        self.assertEqual(len(delivered), 1)
+
+        # Delta frame FU (NAL 49, ftype=1) with full_rate_needed=False -> dropped
+        fu_start = bytes([(49 << 1), 0x01, 0x81, 0x33])
+        fu_end = bytes([(49 << 1), 0x01, 0x41, 0x44])
+        handler.feed_record(make_record(fu_start))
+        handler.feed_record(make_record(fu_end))
+        self.assertEqual(len(delivered), 1)
+
+        # Enable full_rate_needed = True -> Delta frames now delivered!
+        full_rate_needed = True
+        handler.feed_record(make_record(delta_nal))
+        self.assertEqual(len(delivered), 2)
+        self.assertFalse(delivered[-1][1])
+
+        handler.feed_record(make_record(fu_start))
+        handler.feed_record(make_record(fu_end))
+        self.assertEqual(len(delivered), 3)
+        self.assertFalse(delivered[-1][1])
+
+    def test_video_streamer_full_rate_needed(self):
+        """Verify VideoStreamer.is_full_rate_needed reports True only when regular viewers exist."""
+        import asyncio
+        from momcozy.stream import VideoStreamer
+
+        streamer = VideoStreamer(device_id="test_dev", local_key="key123")
+        self.assertFalse(streamer.is_full_rate_needed())
+
+        q_kf = asyncio.Queue()
+        streamer._hevc_keyframe_listeners.add(q_kf)
+        self.assertFalse(streamer.is_full_rate_needed())
+
+        q_full = asyncio.Queue()
+        streamer._hevc_listeners.add(q_full)
+        self.assertTrue(streamer.is_full_rate_needed())
+
+        streamer._hevc_listeners.discard(q_full)
+        self.assertFalse(streamer.is_full_rate_needed())
+
+        streamer._listeners.add(q_full)
+        self.assertTrue(streamer.is_full_rate_needed())
+
+
 if __name__ == "__main__":
     unittest.main()
 

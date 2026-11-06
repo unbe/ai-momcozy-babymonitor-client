@@ -113,8 +113,12 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * Decodes only the single incoming IDR HEVC keyframe using single-threaded decode (`thread_count=1`), avoiding worker thread pool allocation and teardown per check.
     * Inspects the decoded YUV420p chroma planes $U$ (plane 1) and $V$ (plane 2) directly ($|U-128| + |V-128|$). In infrared monochrome, chroma values are neutral 128 (0.0 saturation). Direct chroma plane inspection eliminates `libswscale` software rescaling, RGB24 format conversions, and buffer allocations.
     * Fallback functions (`analyze_night_vision_frame`, `detect_night_vision_from_jpeg`) remain available for JPEG inputs and backward compatibility.
-  * **Keyframe-Only Subscription Filtering (`subscribe_hevc(keyframes_only=True)`):**
-    * In `VideoStreamer._broadcast_hevc`, delta frames are filtered at broadcast time and never queued to keyframe listeners. The timelapse recorder receives only keyframes (~1 frame/sec) rather than all 15 fps, eliminating ~93% of async queue wakeups and task reschedules.
+  * **Keyframe-Only Subscription Filtering & Headless Delta-Frame Discard:**
+    * In `VideoStreamer._broadcast_hevc`, delta frames are filtered at broadcast time and never queued to keyframe listeners.
+    * **Headless Delta-Frame Discard (`is_full_rate_needed`):** When only keyframe listeners (such as `TimelapseRecorder` or background night vision checks) are active and no live browser viewers (`_hevc_listeners` / `_listeners`) or snapshots are requested, `MomcozyHevcHandler` drops non-intra delta fragments (`ftype < 16` and non-IDR slices) immediately at the NAL fragment stage. This avoids assembling ~19 delta frames/sec into bytearrays, constructing Access Units, and pushing them into asyncio queues. When a viewer connects (e.g., via WebSocket `/ws/stream`), `is_full_rate_needed()` dynamically returns `True`, and full 20 fps frame assembly resumes instantaneously.
+  * **Tuya P2P Transport & Crypto Fast Paths:**
+    * **Precomputed HMAC-SHA1 Padding Cache (`fast_hmac_sha1`):** `tuya_ipc_p2p_sdk` originally called `hmac.new(key, msg, hashlib.sha1)` on every packet and ACK. Because the session `media_key` is static, `fast_hmac_sha1` precomputes the inner/outer SHA1 padding hashes (`key ^ 0x36`, `key ^ 0x5C`) once per key, using `.copy().update(...)`. This eliminates Python `HMAC` class allocations on 100–200 packets/sec and speeds up HMAC calculation by ~1.6x.
+    * **Fast KCP Segment & Framing (`fast_parse_segment`, `fast_build_segment`, `fast_unwrap_media_frame`):** Replaces iterative `int.from_bytes()` and `int.to_bytes()` with pre-compiled `struct.Struct("<IBBHIIII")` packing and unpacking (3.4x faster ACK packing).
   * **Adaptive Check Cadence:**
     * Night vision sampling operates adaptively:
       * **60s:** During active timelapse recording in stable darkness, checks occur once every 60 seconds (cutting nighttime CPU decode overhead by 75%).
