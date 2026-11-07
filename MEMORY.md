@@ -249,7 +249,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
 * **Canonical Routes & Subcommands (Strict No-Aliases Policy):**
   * Only one canonical route/command exists per capability: `/audio` (no `/audio.mp3`), `/detection_snapshot.jpg` (no `/api/detection_snapshot`), `POST /api/timelapse/clear` (no `/api/timelapse/erase`), dedicated `/api/timelapse/*` routes (no duplicate timelapse actions inside `/api/control`), and `momcozy sync` (no `keys` alias).
 * **Single-Source Packaging & Modular Tests:**
-  * `pyproject.toml` is the single source of truth for runtime dependencies (including `cryptography>=38.0.0`) and `package-data` (`momcozy = ["static/*"]`); `requirements.txt` delegates via `-e .`.
+  * `pyproject.toml` is the single source of truth for runtime dependencies (including `cryptography>=38.0.0`) and `package-data` (`momcozy = ["static/*"]`); `requirements.txt` delegates via `-e .`, and `Dockerfile` (`python:3.13-slim-trixie`, `pip>=26.2`) caches dependencies via `pip install --no-cache-dir --only-deps .` followed by `pip install --no-cache-dir --no-deps -e .`.
   * Developer ADB key-extraction utility lives in `scripts/adb_extractor.py` outside the installable `momcozy` package.
   * Unit and regression tests are split by domain across `tests/test_device_and_cli.py`, `tests/test_cloud.py`, `tests/test_stream.py`, `tests/test_timelapse_and_nv.py`, and `tests/test_web_and_hls.py`.
 

@@ -1,7 +1,7 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.13-slim-trixie
 
 # Install system dependencies required for OpenCV, PyAV (FFmpeg), VA-API hardware acceleration, and health checks.
-# Note: i965-va-driver-shaders (in non-free) provides the encoding shaders required for Intel Haswell Gen 7.5.
+# Note: i965-va-driver-shaders (in non-free on amd64) provides the encoding shaders required for Intel Haswell Gen 7.5.
 RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
  || sed -i 's/main/main non-free/' /etc/apt/sources.list 2>/dev/null || true \
  && apt-get update && apt-get install -y --no-install-recommends \
@@ -10,7 +10,7 @@ RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list
     vainfo \
     procps \
     libgl1 \
-    libglib2.0-0 \
+    libglib2.0-0t64 \
     ca-certificates \
     curl \
     openssl \
@@ -21,7 +21,7 @@ WORKDIR /app
 
 # Install python dependencies first for optimal Docker layer caching
 COPY pyproject.toml /app/
-RUN python3 -c "import subprocess, tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; subprocess.run(['pip', 'install', '--no-cache-dir', *deps], check=True)"
+RUN pip install --no-cache-dir --only-deps .
 
 # Copy application source
 COPY momcozy /app/momcozy
@@ -29,7 +29,7 @@ COPY momcozy.py /app/momcozy.py
 COPY README.md /app/README.md
 
 # Install package so `momcozy` command line is ready
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --no-deps -e .
 
 # Create directory for persistent configuration and timelapse recordings
 RUN mkdir -p /config /timelapse && ln -s /timelapse /app/timelapse
