@@ -45,29 +45,34 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * Successful frame rendering resets all retry and error counters.
 
 ### 4. Snapshots & Single Keyframe Extraction
-* Live snapshots burst-decode the in-memory rolling GOP (Group of Pictures) buffer using PyAV/OpenCV without interrupting or blocking pass-through HEVC consumers.
+* **Single-Flight Snapshot Coalescing (`VideoStreamer.get_snapshot`):** Live snapshots burst-decode the in-memory rolling GOP (Group of Pictures) buffer using PyAV/OpenCV without interrupting pass-through HEVC consumers. Concurrent `get_snapshot()` callers share a single in-flight `_capture_fresh_snapshot` task (`asyncio.shield`), preventing duplicate simultaneous PyAV GOP decodes.
+* **Bounded Streaming MP3 Sink (`_ChunkSink`):** `StreamingMp3Encoder` writes muxed MP3 packets into a bounded `bytearray`-backed `_ChunkSink` drained on every `encode()` call rather than an append-only `io.BytesIO`, ensuring $O(1)$ memory across multi-hour audio sessions.
+* **Idempotent Tuya P2P SDK Patching:** `_patch_tuya_stream_session()` guards `StreamSession` method wrapping behind `_momcozy_patched` so repeated `create_p2p_client()` calls never stack recursive wrappers, and `_configure_tuya_p2p_sdk()` preserves `sdk_crypto.hmac_sha1 = fast_hmac_sha1`.
 * Single-keyframe extraction (`get_keyframe()`) resolves the next arriving or cached HEVC keyframe Access Unit with SPS/PPS prepended. This allows fast direct analysis (e.g., night vision thumbnail decoding) without holding or decoding the entire GOP.
 
 ### 5. Lease-Based Stream Lifecycle & Monotonic Deadlines
 * **Problem:** Previously, stream lifetime relied on manual, ad-hoc cancellations and reschedulings of `_schedule_idle_stop` across multiple callers (WebSocket viewer connect/disconnect, timelapse start/stop, periodic night vision checks, snapshot requests). This led to race conditions where short-lived checks could either prematurely kill viewer lingering or postpone viewer disconnect deadlines.
 * **Lease Architecture (`VideoStreamer`):**
-  * Multiple components hold concurrent leases (`acquire(holder, linger=...)` and `release(holder, linger=...)` or `async with streamer.lease(...)`).
+  * Multiple components hold concurrent leases (`acquire(linger=...)` and `release(lease, linger=...)` or `with streamer.lease(...)`) — including `HlsTranscoder`, `TimelapseRecorder`, WebSocket/MJPEG/audio subscribers, and snapshot checks.
   * While active leases exist, the camera P2P connection stays alive.
   * When the last lease is released, `VideoStreamer` sets an idle shutdown deadline:
     $$\text{deadline} = \max(\text{current\_deadline}, \text{now} + \text{linger})$$
     This monotonic deadline guarantee ensures that a zero-linger release (such as an automatic 5-minute night vision check) never truncates an existing 300-second grace period from a disconnected user session.
   * Re-acquiring a lease cancels any scheduled idle shutdown timer immediately.
-* **Keyframe-Aware Queue Resynchronization (`_hevc_resync`):**
-  * When a consumer's queue overflows under backpressure, `_hevc_resync` drops pending frames until the next valid keyframe (IDR slice with SPS/PPS) arrives, preventing decoder corruption in downstream clients.
+* **Keyframe-Aware Queue Resynchronization (`_hevc_resync` & `HlsTranscoder._feed_frames_task`):**
+  * When a consumer's queue overflows under backpressure (both in `VideoStreamer` WebSocket queues and `HlsTranscoder`'s FFmpeg feed queue), stale queued chunks are dropped and subsequent delta frames are skipped until the next valid keyframe (IDR slice with SPS/PPS) arrives, preventing decoder corruption in downstream clients.
 
-### 5. Device Discovery & Dynamic IP Handling
+### 6. Device Discovery, Non-Blocking Startup & Dynamic IP Handling
 * **Local LAN Control:** Momcozy/Tuya Protocol 3.3 communicates directly with the camera over local TCP port 6668 for instant PTZ commands and sensor telemetry.
+* **Deferred LAN Probe on `serve` Startup (`probe_lan=False`):**
+  * During `momcozy.py serve`, `MomcozyMonitor` initializes with `probe_lan=False` and `WebServer.run()` binds HTTP/HTTPS TCP ports *before* launching `VideoStreamer` and a background `asyncio.to_thread(monitor.test_local_lan_connection)` task. This guarantees `/health` and dashboard pages respond immediately even when the camera IP is offline or being rediscovered via UDP broadcast.
+  * `WebServer.get_local_lan_ip()` caches the outbound interface IP with a 60-second TTL instead of opening a UDP socket on every `/api/status` request.
 * **Auto-Rediscovery on IP Change (DHCP):**
   * When a camera's IP changes (e.g. DHCP lease renewal), connection attempts to the stale IP fail with `ConnectionRefusedError` or timeout.
   * `test_local_lan_connection(allow_rediscovery=True)` detects this failure and automatically triggers an in-band UDP broadcast scan using `tinytuya.deviceScan(False, 3)` matching the camera's `device_id` / `gwId`.
-  * When rediscovered at a new IP, `MomcozyMonitor` updates its address, fires `on_ip_discovered(new_ip)` to persist the new IP to `.momcozy.json`, and reconnects via Local LAN.
+  * When rediscovered at a new IP, `MomcozyMonitor` updates its address, fires `on_ip_discovered(new_ip)` to persist the new IP via `ConfigStore`, and reconnects via Local LAN.
 
-### 6. 12-Hour Circular Disk-Backed Timelapse Buffer
+### 7. 12-Hour Circular Disk-Backed Timelapse Buffer
 * **Selectable Speed Ratios:** Supports selectable speed ratios: `1:15`, `1:30`, `1:60` (default), and `1:90`.
   * `1:60`: 12 hours of real time in 12 minutes (720 seconds) of video.
   * `1:30`: 12 hours in 24 minutes.
@@ -91,8 +96,8 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * When streaming video files via `web.FileResponse` over HTTPS, client scrub/seek actions or window closures trigger `ConnectionResetError: [Errno 104] Connection reset by peer`.
   * Python standard library `asyncio` (`base_events.py` `_sendfile_fallback`) wraps SSL transports with `_SendfileProtocol`. Upon connection reset, `_SendfileProtocol.restore()` attempts `self._transport.set_protocol(self._proto)`. On Python 3.12/3.13, `_SSLProtocolTransport`'s internal `_ssl_protocol` is already `None`, crashing with `AttributeError: 'NoneType' object has no attribute '_set_app_protocol'`. This masked `ConnectionError` and logged unhandled server exceptions.
   * Resolved by forcing `AIOHTTP_NOSENDFILE=1` and utilizing `SafeFileResponse` in `handle_timelapse_video`. This streams file chunks directly via aiohttp's writer without invoking `loop.sendfile()`, allowing `aiohttp.web_protocol` to cleanly catch `ConnectionError` as an expected premature client disconnect.
-* **Timelapse Export Performance, Caching & Hardware Acceleration (VA-API without X Server):**
-  * **Headless VA-API Direct Rendering (DRM):** In headless Linux/Docker environments, libva outputs cosmetic warnings (`error: can't connect to X server!`) before automatically falling back to direct DRM render nodes (`/dev/dri/renderD128`). There is **no requirement for an X server** to use DRI / VA-API. Setting `LIBVA_DRIVER_NAME=i965` enables direct Intel Quick Sync hardware video encoding on Haswell (Gen 7.5) and newer Intel GPUs.
+* **Timelapse Export Performance, Caching & Hardware Acceleration (`momcozy/hwaccel.py`):**
+  * **Headless VA-API Direct Rendering (DRM):** In headless Linux/Docker environments, libva outputs cosmetic warnings (`error: can't connect to X server!`) before automatically falling back to direct DRM render nodes (`/dev/dri/renderD128`). There is **no requirement for an X server** to use DRI / VA-API. Centralized `detect_vaapi_device()` (`momcozy/hwaccel.py`) auto-detects `/dev/dri/renderD128` without forcing `LIBVA_DRIVER_NAME=i965`, allowing libva to select the native driver (`iHD` on Intel Gen 8+, `i965` on Haswell, `radeonsi` on AMD) while honoring any explicit `LIBVA_DRIVER_NAME` set in the environment.
   * **Download Intent & Instant Stream-Copy:** When saving/downloading timelapses (`download=1` or UI download buttons), the default is always native stream-copy HEVC (`codec=hevc`). This remuxes 12 hours of video in < 0.5s at 0% CPU with pristine original 1080p quality, natively supported by all major OS video players (QuickTime, VLC, Windows 10/11 Films & TV, Android, iOS). A dedicated "⬇ Download H.264" option is also provided for legacy players.
   * **In-Flight Export Deduplication (Thundering Herd Prevention):** Multiple concurrent requests or HTTP retries (e.g. `wget` reconnecting on timeout) for the same `(codec, ratio)` export await a shared running `asyncio.Task` (`_in_flight_exports`), eliminating duplicate concurrent FFmpeg processes from pegging host CPU/GPU cores.
   * **Cache TTL Window During Active Recording:** During active recording, slot files are appended every 2 seconds. A sliding cache TTL (20s for HEVC, 60s for H.264) avoids invalidating and regenerating exports on every keyframe, providing instant (< 5ms) responses for scrubbing, page reloads, and downloads.
@@ -108,9 +113,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Decoupled State Machine Architecture (`momcozy/nightvision.py`):**
     * The debounce timing, suppression, and activation/deactivation logic is implemented as a pure, testable state machine `NightVisionAutomation`.
     * It takes inputs `(now, is_dark, recording, session_auto)` and returns actions (`Action.NONE`, `Action.START_AUTO`, `Action.STOP_AUTO`, `Action.MARK_AUTO`). It has zero I/O or network dependencies, making testing instantaneous and deterministic without mocks.
-  * **Direct HEVC Keyframe Analysis & Chroma Inspection (`analyze_hevc_keyframe`):**
+  * **Direct HEVC Keyframe Analysis & Planar Stride Safety (`analyze_hevc_keyframe`, `extract_hevc_keyframe_luma`):**
     * Decodes only the single incoming IDR HEVC keyframe using single-threaded decode (`thread_count=1`), avoiding worker thread pool allocation and teardown per check.
     * Inspects the decoded YUV420p chroma planes $U$ (plane 1) and $V$ (plane 2) directly ($|U-128| + |V-128|$). In infrared monochrome, chroma values are neutral 128 (0.0 saturation). Direct chroma plane inspection eliminates `libswscale` software rescaling, RGB24 format conversions, and buffer allocations.
+    * **Planar Row-Stride (`plane.line_size`) Requirement:** PyAV/FFmpeg aligns planar YUV row buffers to SIMD boundaries (32/64 bytes), so `plane.line_size >= plane_width`. Both `analyze_hevc_keyframe` (`momcozy/nightvision.py`) and `extract_hevc_keyframe_luma` (`momcozy/timelapse.py`) MUST index pixels using `py * plane.line_size + px` (and clamp sample coordinates within `[0, plane_w - 1]` / `[0, plane_h - 1]`) rather than `py * width + px` to avoid reading skewed rows or padding bytes.
     * Fallback functions (`analyze_night_vision_frame`, `detect_night_vision_from_jpeg`) remain available for JPEG inputs and backward compatibility.
   * **Keyframe-Only Subscription Filtering & Headless Delta-Frame Discard:**
     * In `VideoStreamer._broadcast_hevc`, delta frames are filtered at broadcast time and never queued to keyframe listeners.
@@ -154,7 +160,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
   * **Night Vision Sync Setting Persistence Across Server Restarts:**
     * Night Vision sync preference (`sync_night_vision`) is persisted strictly in the user configuration file `.momcozy.json` (`timelapse_sync_night_vision`), not in `timelapse/meta.json`.
     * On server startup, `TimelapseRecorder` checks for persisted preferences from (1) environment variable `MOMCOZY_TIMELAPSE_SYNC_NV`, (2) `.momcozy.json` (or CLI `--sync-night-vision`).
-    * **In-Place Config Persistence:** Settings in `.momcozy.json` are written directly in-place via `cfg_path.write_text()`. In Docker deployments (`./.momcozy.json:/config/.momcozy.json`), atomic replace (`os.replace`) fails with `[Errno 16] EBUSY` because Linux prohibits replacing active file mount points. Direct in-place writing avoids temporary files and works seamlessly across both host and container bind mounts.
+    * **Thread-Safe In-Place Config Persistence (`ConfigStore`, `momcozy/config.py`):** All reads and mutations of `.momcozy.json` go through `ConfigStore.read()`, `ConfigStore.mutate()`, and `ConfigStore.update()`, guarded by per-resolved-path `threading.RLock` locks. Updates merge into existing JSON keys (never clobbering `local_key`, `camera_name`, `mac`, `ip`, `dps`, or `tuya_session`) and write directly in-place via `cfg_path.write_text()`. In Docker deployments (`./.momcozy.json:/config/.momcozy.json`), atomic rename (`os.replace`) fails with `[Errno 16] EBUSY` or breaks single-file bind-mount inodes; in-place locked writes preserve the inode safely across concurrent threads. Similarly, `TimelapseRecorder` guards `_slots_meta` and `_events` with a `threading.RLock` and writes `meta.json` via unique `tempfile.NamedTemporaryFile` staging before `os.replace`.
     * Decoupling user configuration from slot buffer metadata (`meta.json`) ensures single source of truth: clearing footage (`[🗑️ Erase]`), slot rotations, or restoring slot files from an external backup never modifies or reverts the user's Night Vision automation preference.
   * **Session Continuity (Append vs. Restart):**
     * When auto-start triggers:
@@ -188,7 +194,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * **Fix:** The broken `setts` bitstream filter was removed. Pure stream-copy with `-r <fps> -f concat -safe 0 -i list.txt -c:v copy -tag:v hvc1 -movflags +faststart` allows FFmpeg's MP4 muxer to generate clean, monotonic container timestamps strictly matching the specified `-r <fps>` (15, 30, 60) at 0% CPU with perfect duration and seeking support.
     * **Framerate Bounds Clamping:** In `export_mp4()`, `export_fps` is clamped to `[5.0, 60.0]` (`min(60.0, max(5.0, round(total_frames / target_video_sec, 2)))`), and `target_video_sec` has a floor of `0.5s`, preventing short buffer intervals from ever requesting absurd framerates.
     * **Slot Rotation Metadata Synchronization:** `_rotate_slot()` saves `meta.json` after updating `_current_slot`, and `_load_meta()` aligns `_current_slot` with the most recently modified slot file on disk.
-  * **Zero-Boundary Clamp & Hung Player Loop Prevention:** In `/timelapse`, user seek functions clamp targets to `Math.max(0.05, Math.min(video.duration - 0.05, target))`. Removed any event listeners that mutated `currentTime` inside `seeking` callbacks. In `video.onerror`, recovery is capped to a maximum of 2 attempts (`recoveryAttempts < 2`) and waits for `loadedmetadata` before applying `currentTime`, eliminating recursive `Range: bytes=0-` fetch loops.
+  * **Zero-Boundary Clamp & Hung Player Loop Prevention:** In `/timelapse` (`momcozy/static/timelapse.js`), user seek functions clamp targets to `Math.max(0.05, Math.min(video.duration - 0.05, target))`. Removed any event listeners that mutated `currentTime` inside `seeking` callbacks. In `video.onerror`, recovery is capped (`recoveryAttempts < 10`, switching to `codec=h264` on the first failure when native HEVC decode fails) and waits for `loadedmetadata` before applying `currentTime`, eliminating recursive `Range: bytes=0-` fetch loops.
 * **On-Demand Playback Motion Detection via Adaptive Binary Search:**
   * **0% Recording CPU & Silent Handheld Monitor:** No video frames are analyzed during recording, and the camera's hardware `motion_switch` remains completely OFF, guaranteeing the 5" handheld parent monitor tablet never beeps or wakes up.
   * **State-Difference Invariance:** Leveraging that scene states do not spontaneously return to the identical millimeter posture after motion, the detector evaluates coarse anchor intervals (e.g. 1 minute). If $\Delta(Frame(A), Frame(B)) < \text{threshold}$, the entire interval is skipped in $O(1)$.
@@ -209,10 +215,12 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * When `timelapse/` files (`slot_*.hevc` or `meta.json`) are restored, copied, or modified from the host filesystem while the server is running, `_sync_meta_if_changed()` automatically detects the changes on disk (tracking `meta.json` modification time and slot file presence) and re-evaluates slots without requiring a server restart.
     * If `meta.json` was omitted or contains 0-frame entries during restore, `_load_meta` and `get_status` automatically reconcile against actual `slot_*.hevc` files on disk, approximating frame counts from file sizes (`max(1, size // 35000)`) and computing valid slot durations.
     * `has_content` in `get_status()` aligns with `self.has_content` (verifying whether valid slot files exist on disk), ensuring UI buttons (like `[▶ Watch]` and `[🗑️ Erase]`) enable as expected.
-* **Tuya Cloud Authentication, Rate Limit Backoff & Session Reuse:**
-  * **Telemetry (`_fetch_cloud_dps`):**
-    * When local LAN control is unreachable, status polling queries Tuya Cloud. Previously, failed auth retried every 15 seconds unconditionally, hammering Tuya's login endpoint.
-    * Implemented backoff tracking in `_dps_cache`: on generic auth errors (`LOGIN_TOKEN_FAILED`, `PERMISSION_DENIED`), backoff escalates exponentially (30s -> 60s -> 300s -> 900s).
+* **Tuya Cloud Authentication, Rate Limit Backoff & Session Reuse (`TuyaSessionManager`):**
+  * **Centralized `TuyaSessionManager` (`momcozy/tuya_cloud.py`):**
+    * Thread-safe session hub managing `TuyaSession` / `AccountSession` coercion, auth failure backoff, persistence callbacks, and bidirectional listener propagation between `MomcozyMonitor`, CLI/cloud DP pollers (`_fetch_cloud_dps`, `_publish_cloud_dps`), and `VideoStreamer`.
+    * Shared `resolve_tuya_region`, `build_uid_token_request`, and `build_uid_login_payload` helpers deduplicate OEM Tuya gateway authentication across synchronous (`TuyaGatewayClient`) and async (`MomcozyGatewayClient`) clients.
+    * Device share removal (`MomcozyCloudApi.remove_device_share` / `momcozy share remove`) revokes both the Tuya Home `relationId` (`smartlife.m.sharing.device.delete` via `remove_tuya_device_share`) and Momcozy Cloud share metadata so revoked users immediately lose live P2P stream access.
+    * On generic auth errors (`LOGIN_TOKEN_FAILED`, `PERMISSION_DENIED`), backoff escalates exponentially (30s -> 60s -> 300s -> 900s).
     * On `USER_SESSION_LIMIT` ("You have loged in too many times today"), backoff starts at 30 minutes (1800s) up to 2 hours (7200s) to allow Tuya's rate-limit window to reset without burning requests.
     * Re-authentication is restricted strictly to true session expiration/invalidation errors (`USER_SESSION_INVALID`, `NOT_EXISTS_SESSION`, `SIGN_INVALID`, `TOKEN_INVALID`, `USER_SESSION_HAS_EXPIRED`, `PERMISSION_DENIED`), avoiding burn-down on generic network timeouts or device offline errors.
   * **Persistent Session Reuse Across Streamer Lifecycles (`tuya_session` in `.momcozy.json`):**
@@ -220,14 +228,31 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * **Eliminating Login on 5-Minute Night Vision Sampling:** Previously, idle night vision checks woke up every 5 minutes and tore down `TuyaIpcP2pClient`, triggering a fresh `smartlife.m.user.uid.password.login` call ~288 times/day and rapidly hitting Tuya's account rate limit (`USER_SESSION_LIMIT`).
     * `VideoStreamer` retains its `_account_session` across `start()` and `stop()` cycles and pre-populates `client._account` in `create_p2p_client`.
     * When `client.async_stream_config()` runs, `client.async_account()` returns the cached `AccountSession` immediately, executing zero login HTTP requests during idle checks and viewer connections.
-    * Whenever Tuya returns session expiration, the client re-authenticates once, fires `on_session_updated`, and updates both in-memory cache and `.momcozy.json`.
-    * Shared cross-component synchronization ensures telemetry polls (`_fetch_cloud_dps`, `_publish_cloud_dps`) and the video streamer share the same valid session without redundant logins.
+    * Whenever Tuya returns session expiration, the client re-authenticates once, fires `on_session_updated`, and `TuyaSessionManager` updates `MomcozyMonitor`, `VideoStreamer`, and `.momcozy.json`.
   * **Video Streamer (`VideoStreamer._stream_loop`):**
     * Reconnect backoff differentiates between transient network glitches (up to 120s) and authentication/rate-limit failures.
     * On `USER_SESSION_LIMIT`, backoff escalates to 1800s–7200s (30m–2h). On token rejection (`LOGIN_TOKEN_FAILED`), backoff scales up to 900s (15m).
   * **Detection Snapshot Loading (`/detection_snapshot.jpg`):**
     * The dashboard avoids unconditionally requesting `/detection_snapshot.jpg` on cold initial load before `has_detection_snapshot` is reported.
     * `handle_detection_snapshot` returns an immediate `404` when the stream is not connected and no snapshot/frame is cached, avoiding 5-second `504 Gateway Timeout` errors on cold dashboard loads.
+
+### 8. Frontend Static Architecture, Web Security & Packaging
+* **Static Frontend Assets (`momcozy/static/`):**
+  * Dashboard and timelapse HTML, CSS, JavaScript, and SVG assets live as standalone files in `momcozy/static/` (`dashboard.html`, `dashboard.css`, `dashboard.js`, `timelapse.html`, `timelapse.css`, `timelapse.js`, `favicon.svg`) and are served via `/static/{filename}` with strict path-traversal rejection.
+  * **DOM XSS Prevention & JS Syntax Verification:** Both `dashboard.js` and `timelapse.js` strictly forbid `.innerHTML` assignments, building UI elements exclusively with `document.createElement()` and `.textContent`. Automated tests in `tests/test_web_and_hls.py` enforce zero `.innerHTML` usage and run `node --check` on every static `.js` file.
+* **CSRF Protection Without Authentication (`momcozy/web.py`):**
+  * By design for frictionless home LAN / baby monitor usage, HTTP authentication is **not** enabled.
+  * State-changing HTTP methods (`POST`, `PUT`, `DELETE`, `PATCH`) are protected by `_csrf_middleware` + `is_trusted_request_origin()`, which rejects cross-origin browser requests whenever `Sec-Fetch-Site: cross-site` or a mismatched `Origin` header is present while allowing same-origin UI fetches and non-browser CLI/curl tools (which send neither header).
+* **Private Temporary Directories & Docker Build Hygiene:**
+  * `HlsTranscoder` allocates a private temporary directory via `tempfile.mkdtemp(prefix="momcozy_hls_")` when `output_dir` is omitted (avoiding predictable shared `/tmp/momcozy_hls` symlink collisions) and removes owned directories in `stop()`.
+  * `.dockerignore` excludes `.momcozy.json`, `ssl/`, `.momcozy_ssl/`, `*.pem`, `timelapse/`, and `*.hevc` so credentials, private keys, and recordings never leak into Docker build contexts.
+* **Canonical Routes & Subcommands (Strict No-Aliases Policy):**
+  * Only one canonical route/command exists per capability: `/audio` (no `/audio.mp3`), `/detection_snapshot.jpg` (no `/api/detection_snapshot`), `POST /api/timelapse/clear` (no `/api/timelapse/erase`), dedicated `/api/timelapse/*` routes (no duplicate timelapse actions inside `/api/control`), and `momcozy sync` (no `keys` alias).
+* **Single-Source Packaging & Modular Tests:**
+  * `pyproject.toml` is the single source of truth for runtime dependencies (including `cryptography>=38.0.0`) and `package-data` (`momcozy = ["static/*"]`); `requirements.txt` delegates via `-e .`.
+  * Developer ADB key-extraction utility lives in `scripts/adb_extractor.py` outside the installable `momcozy` package.
+  * Unit and regression tests are split by domain across `tests/test_device_and_cli.py`, `tests/test_cloud.py`, `tests/test_stream.py`, `tests/test_timelapse_and_nv.py`, and `tests/test_web_and_hls.py`.
+
 
 
 

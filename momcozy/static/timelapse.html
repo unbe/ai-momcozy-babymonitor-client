@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Momcozy BM04 - 12-Hour Timelapse</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/timelapse.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title-group">
+        <span style="font-size: 1.3rem;">⏱️</span>
+        <div>
+          <h1 style="display:flex; align-items:center; gap:8px;">
+            <span>Timelapse</span>
+            <span id="player-ratio-badge" style="background:rgba(66,153,225,0.15); color:#60a5fa; font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:6px; border:1px solid rgba(66,153,225,0.3);" title="Timelapse Recording Speed Ratio">1:60</span>
+          </h1>
+          <div style="font-size: 0.75rem; color: var(--text-muted);">Momcozy BM04</div>
+        </div>
+      </div>
+      <div>
+        <a href="/" class="btn">← Back to Dashboard</a>
+      </div>
+    </div>
+    <div class="video-container">
+      <video id="timelapse-video" controls autoplay playsinline loop></video>
+      <div id="loading" class="overlay-msg">
+        <div class="spinner"></div>
+        <span>Preparing timelapse playback...</span>
+      </div>
+      <div id="error-box" class="overlay-msg" style="display:none; color:#f87171;">
+        <span>⚠️ Unable to play video in browser. Please download the file to view.</span>
+      </div>
+    </div>
+    <div class="timeline-card">
+      <div class="timeline-bar-wrapper" id="timeline-wrapper">
+        <div class="timeline-bar" id="timeline-bar" onclick="seekFromTimeline(event)">
+          <div class="timeline-progress" id="timeline-progress"></div>
+          <div class="timeline-markers" id="timeline-markers"></div>
+          <div class="timeline-thumb" id="timeline-thumb"></div>
+        </div>
+        <div id="timeline-tooltip" class="timeline-tooltip"></div>
+      </div>
+      <div class="timeline-meta-row">
+        <div class="timeline-time-info">
+          <span id="current-time-text">0:00</span> / <span id="duration-time-text">0:00</span>
+        </div>
+        <div class="timeline-nav-group">
+          <button class="nav-event-btn" id="prev-event-btn" onclick="jumpToPrevEvent()" title="Jump to previous motion event (Key: P)">⏮️ Prev Motion</button>
+          <span id="events-counter-badge" class="badge event-counter-badge">🏃 0 Motion Events</span>
+          <button class="nav-event-btn" id="next-event-btn" onclick="jumpToNextEvent()" title="Jump to next motion event (Key: N)">Next Motion ⏭️</button>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <div class="speed-group">
+        <span>Speed:</span>
+        <button class="btn speed-btn active" onclick="setSpeed(1, this)">1x</button>
+        <button class="btn speed-btn" onclick="setSpeed(2, this)">2x</button>
+        <button class="btn speed-btn" onclick="setSpeed(4, this)">4x</button>
+        <button class="btn speed-btn" onclick="setSpeed(8, this)">8x</button>
+      </div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <button class="btn" onclick="reloadVideo()">🔄 Refresh</button>
+        <a id="dl-btn" href="/api/timelapse/video.mp4?codec=hevc&download=1" class="btn primary" download="momcozy_timelapse.mp4" title="Native fast HEVC stream-copy (instant download)">⬇ Download MP4</a>
+        <a id="dl-h264-btn" href="/api/timelapse/video.mp4?codec=h264&download=1" class="btn" download="momcozy_timelapse_h264.mp4" title="H.264 version for legacy players" style="font-size:0.75rem;">⬇ Download H.264</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/timelapse.js"></script>
+</body>
+</html>

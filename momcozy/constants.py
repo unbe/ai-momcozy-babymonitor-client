@@ -136,6 +136,7 @@ class LullabyMode(str, Enum):
 
     SINGLE_REPEAT = "0"
     ALL_REPEAT = "1"
+    PLAY_ONCE = "2"
 
 
 LULLABY_TRACKS: Final[Dict[str, str]] = {

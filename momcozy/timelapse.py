@@ -13,9 +13,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from .config import ConfigStore
+from .hwaccel import detect_vaapi_device
 
 if TYPE_CHECKING:
     from .stream import VideoStreamer
@@ -149,16 +153,20 @@ def extract_hevc_keyframe_luma(chunk: bytes, grid_size: int = 16) -> Optional[by
         if not last_frame or not last_frame.planes:
             return None
 
-        y = memoryview(last_frame.planes[0])
+        plane = last_frame.planes[0]
+        y = memoryview(plane)
         w, h = last_frame.width, last_frame.height
-        step_x = max(1, w // grid_size)
-        step_y = max(1, h // grid_size)
+        if w <= 0 or h <= 0:
+            return None
+        stride = getattr(plane, "line_size", w) or w
         samples = bytearray(grid_size * grid_size)
         idx = 0
         for r in range(grid_size):
-            row_offset = (r * step_y + step_y // 2) * w
+            py = min(h - 1, ((2 * r + 1) * h) // (2 * grid_size))
+            row_offset = py * stride
             for c in range(grid_size):
-                samples[idx] = y[row_offset + c * step_x + step_x // 2]
+                px = min(w - 1, ((2 * c + 1) * w) // (2 * grid_size))
+                samples[idx] = y[row_offset + px]
                 idx += 1
         return bytes(samples)
     except Exception as exc:
@@ -241,6 +249,7 @@ class TimelapseRecorder:
         self._running = False
         self._record_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        self._meta_lock = threading.RLock()
 
         # Slot state
         self._current_slot = 0
@@ -280,23 +289,7 @@ class TimelapseRecorder:
 
     def _detect_vaapi_device(self) -> Optional[str]:
         """Detect available VA-API device path for hardware acceleration."""
-        hwaccel = os.getenv("MOMCOZY_HWACCEL", "auto").lower()
-        if hwaccel in ("none", "cpu", "disabled", "false", "0"):
-            return None
-
-        vaapi_dev = os.getenv("MOMCOZY_VAAPI_DEVICE")
-        if vaapi_dev:
-            if Path(vaapi_dev).exists() or hwaccel in ("vaapi", "force"):
-                return vaapi_dev
-
-        for dev in ("/dev/dri/renderD128", "/dev/dri/card0"):
-            if Path(dev).exists():
-                return dev
-
-        if hwaccel in ("vaapi", "force"):
-            return "/dev/dri/renderD128"
-
-        return None
+        return detect_vaapi_device()
 
     def set_speed_ratio(self, ratio: int | str) -> int:
         """Set the speed ratio (15, 30, 60, 90)."""
@@ -342,104 +335,119 @@ class TimelapseRecorder:
         env_val = os.environ.get("MOMCOZY_TIMELAPSE_SYNC_NV") or os.environ.get("MOMCOZY_SYNC_NIGHT_VISION")
         if env_val is not None:
             return env_val.strip().lower() in ("1", "true", "yes", "on", "enable", "enabled")
-        cfg_path = self._get_config_path()
-        try:
-            if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                if "timelapse_sync_night_vision" in cfg:
-                    return bool(cfg["timelapse_sync_night_vision"])
-        except Exception:
-            pass
+        cfg = ConfigStore.read(self._get_config_path())
+        if "timelapse_sync_night_vision" in cfg:
+            return bool(cfg["timelapse_sync_night_vision"])
         return None
 
     def _persist_sync_setting(self, enabled: bool) -> None:
         """Persist night vision sync preference to config file."""
         cfg_path = self._get_config_path()
         try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-            if cfg.get("timelapse_sync_night_vision") != bool(enabled):
+            def _apply(cfg: Dict[str, Any]) -> bool:
+                if cfg.get("timelapse_sync_night_vision") == bool(enabled):
+                    return False
                 cfg["timelapse_sync_night_vision"] = bool(enabled)
-                cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                return True
+
+            ConfigStore.mutate(cfg_path, _apply, create=True)
         except Exception as exc:
             logger.warning("Could not persist timelapse_sync_night_vision to config %s: %s", cfg_path, exc)
 
     def _load_meta(self) -> None:
         """Load metadata from meta.json or reconstruct from existing slot files."""
-        if not self.storage_dir.exists():
-            return
+        with self._meta_lock:
+            if not self.storage_dir.exists():
+                return
 
-        meta_loaded = False
-        if self.meta_file.exists():
-            try:
-                self._last_meta_file_mtime = self.meta_file.stat().st_mtime
-                data = json.loads(self.meta_file.read_text(encoding="utf-8"))
-                self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
-                self._slots_meta = data.get("slots", {})
-                self._events = merge_motion_ranges(
-                    data.get("events", []),
-                    merge_gap_sec=self.motion_merge_gap_sec,
-                )
-                self._last_motion_scan_mtime = 0.0
-                self.last_session_type = str(data.get("last_session_type", "manual"))
-                if "speed_ratio" in data:
-                    try:
-                        r = int(data["speed_ratio"])
-                        if r in (15, 30, 60, 90):
-                            self.speed_ratio = r
-                    except Exception:
-                        pass
-                meta_loaded = True
-            except Exception as exc:
-                logger.warning("Error reading timelapse meta.json: %s", exc)
+            meta_loaded = False
+            if self.meta_file.exists():
+                try:
+                    self._last_meta_file_mtime = self.meta_file.stat().st_mtime
+                    data = json.loads(self.meta_file.read_text(encoding="utf-8"))
+                    self._current_slot = int(data.get("current_slot", 0)) % self.total_slots
+                    self._slots_meta = data.get("slots", {})
+                    self._events = merge_motion_ranges(
+                        data.get("events", []),
+                        merge_gap_sec=self.motion_merge_gap_sec,
+                    )
+                    self._last_motion_scan_mtime = 0.0
+                    self.last_session_type = str(data.get("last_session_type", "manual"))
+                    if "speed_ratio" in data:
+                        try:
+                            r = int(data["speed_ratio"])
+                            if r in (15, 30, 60, 90):
+                                self.speed_ratio = r
+                        except Exception:
+                            pass
+                    meta_loaded = True
+                except Exception as exc:
+                    logger.warning("Error reading timelapse meta.json: %s", exc)
 
-        # Reconcile with any slot files present on disk (fills in missing slots or estimates 0-frame entries)
-        newest_slot = self._current_slot
-        newest_mtime = 0.0
-        for i in range(self.total_slots):
-            p = self.slot_path(i)
-            if p.exists() and p.stat().st_size > 0:
-                s_key = str(i)
-                st = p.stat()
-                slot_info = self._slots_meta.get(s_key)
-                if not slot_info or not slot_info.get("frames"):
-                    approx_frames = max(1, st.st_size // 35000)
-                    self._slots_meta[s_key] = {
-                        "mtime": slot_info.get("mtime", st.st_mtime) if slot_info else st.st_mtime,
-                        "frames": approx_frames,
-                        "bytes": st.st_size,
-                        "duration": slot_info.get("duration", min(self.slot_duration_sec, approx_frames * 4.0)) if slot_info else min(self.slot_duration_sec, approx_frames * 4.0),
-                    }
-                slot_mtime = float(self._slots_meta[s_key].get("mtime", st.st_mtime))
-                if slot_mtime > newest_mtime:
-                    newest_mtime = slot_mtime
-                    newest_slot = i
+            # Reconcile with any slot files present on disk (fills in missing slots or estimates 0-frame entries)
+            newest_slot = self._current_slot
+            newest_mtime = 0.0
+            for i in range(self.total_slots):
+                p = self.slot_path(i)
+                if p.exists() and p.stat().st_size > 0:
+                    s_key = str(i)
+                    st = p.stat()
+                    slot_info = self._slots_meta.get(s_key)
+                    if not slot_info or not slot_info.get("frames"):
+                        approx_frames = max(1, st.st_size // 35000)
+                        self._slots_meta[s_key] = {
+                            "mtime": slot_info.get("mtime", st.st_mtime) if slot_info else st.st_mtime,
+                            "frames": approx_frames,
+                            "bytes": st.st_size,
+                            "duration": slot_info.get("duration", min(self.slot_duration_sec, approx_frames * 4.0)) if slot_info else min(self.slot_duration_sec, approx_frames * 4.0),
+                        }
+                    slot_mtime = float(self._slots_meta[s_key].get("mtime", st.st_mtime))
+                    if slot_mtime > newest_mtime:
+                        newest_mtime = slot_mtime
+                        newest_slot = i
 
-        if newest_mtime > 0:
-            cur_mtime = float(self._slots_meta.get(str(self._current_slot), {}).get("mtime", 0.0))
-            if not meta_loaded or newest_mtime > cur_mtime:
-                self._current_slot = newest_slot
+            if newest_mtime > 0:
+                cur_mtime = float(self._slots_meta.get(str(self._current_slot), {}).get("mtime", 0.0))
+                if not meta_loaded or newest_mtime > cur_mtime:
+                    self._current_slot = newest_slot
 
     def _save_meta(self) -> None:
-        """Persist metadata to meta.json."""
-        try:
-            self.storage_dir.mkdir(parents=True, exist_ok=True)
-            meta = {
-                "total_slots": self.total_slots,
-                "slot_duration_sec": self.slot_duration_sec,
-                "sample_interval_sec": self.sample_interval_sec,
-                "fps": self.fps,
-                "speed_ratio": self.speed_ratio,
-                "current_slot": self._current_slot,
-                "slots": self._slots_meta,
-                "events": self._events,
-                "last_session_type": self.last_session_type,
-            }
-            tmp_meta = self.storage_dir / "meta.json.tmp"
-            tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            tmp_meta.replace(self.meta_file)
-            self._last_meta_file_mtime = self.meta_file.stat().st_mtime
-        except Exception as exc:
-            logger.debug("Failed saving timelapse meta.json: %s", exc)
+        """Persist metadata to meta.json atomically under _meta_lock."""
+        with self._meta_lock:
+            tmp_path: Optional[Path] = None
+            try:
+                self.storage_dir.mkdir(parents=True, exist_ok=True)
+                meta = {
+                    "total_slots": self.total_slots,
+                    "slot_duration_sec": self.slot_duration_sec,
+                    "sample_interval_sec": self.sample_interval_sec,
+                    "fps": self.fps,
+                    "speed_ratio": self.speed_ratio,
+                    "current_slot": self._current_slot,
+                    "slots": dict(self._slots_meta),
+                    "events": list(self._events),
+                    "last_session_type": self.last_session_type,
+                }
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    dir=self.storage_dir,
+                    prefix="meta.json.",
+                    suffix=".tmp",
+                    encoding="utf-8",
+                    delete=False,
+                ) as tmp_f:
+                    tmp_path = Path(tmp_f.name)
+                    json.dump(meta, tmp_f, indent=2)
+                    tmp_f.flush()
+                tmp_path.replace(self.meta_file)
+                self._last_meta_file_mtime = self.meta_file.stat().st_mtime
+            except Exception as exc:
+                logger.debug("Failed saving timelapse meta.json: %s", exc)
+                if tmp_path is not None and tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
 
     def set_sync_night_vision(self, enabled: bool) -> bool:
         """Enable or disable automatic timelapse synchronization with Night Vision."""
@@ -451,39 +459,40 @@ class TimelapseRecorder:
 
     def clear(self) -> None:
         """Clear all previous timelapse slot recordings and metadata."""
-        if self._active_file:
-            try:
-                self._active_file.close()
-            except Exception:
-                pass
-            self._active_file = None
-
-        self._current_slot = 0
-        self._frames_in_slot = 0
-        self._bytes_in_slot = 0
-        self._slot_start_monotonic = time.monotonic()
-        self._slot_start_wall = time.time()
-        self._slots_meta = {}
-        self._events = []
-        self._last_motion_scan_mtime = 0.0
-        self._exports_cache.clear()
-        for task in list(self._in_flight_exports.values()):
-            if not task.done():
-                task.cancel()
-        self._in_flight_exports.clear()
-
-        if self.storage_dir.exists():
-            for p in self.storage_dir.glob("slot_*.hevc"):
+        with self._meta_lock:
+            if self._active_file:
                 try:
-                    p.unlink()
-                except OSError:
+                    self._active_file.close()
+                except Exception:
                     pass
-            for p in self.storage_dir.glob("timelapse_cache_*.mp4*"):
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-        self._save_meta()
+                self._active_file = None
+
+            self._current_slot = 0
+            self._frames_in_slot = 0
+            self._bytes_in_slot = 0
+            self._slot_start_monotonic = time.monotonic()
+            self._slot_start_wall = time.time()
+            self._slots_meta = {}
+            self._events = []
+            self._last_motion_scan_mtime = 0.0
+            self._exports_cache.clear()
+            for task in list(self._in_flight_exports.values()):
+                if not task.done():
+                    task.cancel()
+            self._in_flight_exports.clear()
+
+            if self.storage_dir.exists():
+                for p in self.storage_dir.glob("slot_*.hevc"):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                for p in self.storage_dir.glob("timelapse_cache_*.mp4*"):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            self._save_meta()
 
     def _retention_cutoff(self, latest_ts: float) -> float:
         """Compute earliest wall-clock timestamp still covered by the circular slot buffer."""
@@ -516,50 +525,54 @@ class TimelapseRecorder:
         end_ts = round(max(start_ts, float(end_timestamp) if end_timestamp is not None else start_ts), 1)
         gap = self.motion_merge_gap_sec if merge_gap_sec is None else max(0.0, float(merge_gap_sec))
 
-        merges_with_existing = False
-        for ev in self._events:
-            if ev.get("type") != event_type:
-                continue
-            ev_start = float(ev.get("time", 0.0))
-            ev_end = max(ev_start, float(ev.get("end_time", ev_start)))
-            if start_ts <= ev_end + gap and end_ts >= ev_start - gap:
-                merges_with_existing = True
-                break
+        with self._meta_lock:
+            merges_with_existing = False
+            with self._meta_lock:
+                events_snapshot = list(self._events)
 
-        candidate = {
-            "time": start_ts,
-            "end_time": end_ts,
-            "type": event_type,
-            "label": label,
-        }
-        merged = merge_motion_ranges(self._events + [candidate], merge_gap_sec=gap)
+            for ev in events_snapshot:
+                if ev.get("type") != event_type:
+                    continue
+                ev_start = float(ev.get("time", 0.0))
+                ev_end = max(ev_start, float(ev.get("end_time", ev_start)))
+                if start_ts <= ev_end + gap and end_ts >= ev_start - gap:
+                    merges_with_existing = True
+                    break
 
-        # Keep ranges within the circular ring buffer's historical retention window
-        latest_ts = max([float(ev.get("end_time", ev.get("time", 0.0))) for ev in merged] + [end_ts])
-        cutoff = self._retention_cutoff(latest_ts)
-        pruned = [ev for ev in merged if float(ev.get("end_time", ev.get("time", 0.0))) >= cutoff]
+            candidate = {
+                "time": start_ts,
+                "end_time": end_ts,
+                "type": event_type,
+                "label": label,
+            }
+            merged = merge_motion_ranges(self._events + [candidate], merge_gap_sec=gap)
 
-        if pruned != self._events:
-            self._events = pruned
-            self._save_meta()
-            if not merges_with_existing:
-                logger.info(
-                    "Recorded timelapse %s range: '%s' [%.1f - %.1f]",
-                    event_type,
-                    label,
-                    start_ts,
-                    end_ts,
-                )
-            else:
-                logger.debug(
-                    "Extended timelapse %s range with '%s' [%.1f - %.1f]",
-                    event_type,
-                    label,
-                    start_ts,
-                    end_ts,
-                )
+            # Keep ranges within the circular ring buffer's historical retention window
+            latest_ts = max([float(ev.get("end_time", ev.get("time", 0.0))) for ev in merged] + [end_ts])
+            cutoff = self._retention_cutoff(latest_ts)
+            pruned = [ev for ev in merged if float(ev.get("end_time", ev.get("time", 0.0))) >= cutoff]
 
-        return not merges_with_existing
+            if pruned != self._events:
+                self._events = pruned
+                self._save_meta()
+                if not merges_with_existing:
+                    logger.info(
+                        "Recorded timelapse %s range: '%s' [%.1f - %.1f]",
+                        event_type,
+                        label,
+                        start_ts,
+                        end_ts,
+                    )
+                else:
+                    logger.debug(
+                        "Extended timelapse %s range with '%s' [%.1f - %.1f]",
+                        event_type,
+                        label,
+                        start_ts,
+                        end_ts,
+                    )
+
+            return not merges_with_existing
 
     @property
     def has_content(self) -> bool:
@@ -781,27 +794,29 @@ class TimelapseRecorder:
 
         # Retain non-scan (hardware/manual) events within the retention window and merge with fresh scan ranges
         latest_frame_ts = indexed_frames[-1][3]
-        cutoff = min(self._retention_cutoff(latest_frame_ts), indexed_frames[0][3] - 5.0)
-        retained_external = [
-            ev
-            for ev in self._events
-            if ev.get("source") != "scan" and float(ev.get("end_time", ev.get("time", 0.0))) >= cutoff
-        ]
-        merged = merge_motion_ranges(
-            retained_external + scanned_ranges,
-            merge_gap_sec=effective_gap,
-        )
+        with self._meta_lock:
+            cutoff = min(self._retention_cutoff(latest_frame_ts), indexed_frames[0][3] - 5.0)
+            retained_external = [
+                ev
+                for ev in self._events
+                if ev.get("source") != "scan" and float(ev.get("end_time", ev.get("time", 0.0))) >= cutoff
+            ]
+            merged = merge_motion_ranges(
+                retained_external + scanned_ranges,
+                merge_gap_sec=effective_gap,
+            )
 
-        self._events = merged
-        self._last_motion_scan_mtime = latest_mtime
-        self._save_meta()
+            self._events = merged
+            self._last_motion_scan_mtime = latest_mtime
+            self._save_meta()
+            result_events = list(self._events)
         logger.info(
             "Motion scan complete: indexed %d frames (decoded %d), detected %d motion ranges",
             total_frames,
             len(fp_cache),
             len(scanned_ranges),
         )
-        return self._events
+        return result_events
 
     async def scan_motion_events(self, force: bool = False) -> List[Dict[str, Any]]:
         """Asynchronously run detect_motion_events in executor thread."""
@@ -889,12 +904,13 @@ class TimelapseRecorder:
             elapsed = 0.0
             if self._slot_start_monotonic > 0:
                 elapsed = min(self.slot_duration_sec, time.monotonic() - self._slot_start_monotonic)
-            self._slots_meta[str(self._current_slot)] = {
-                "mtime": time.time(),
-                "duration": round(elapsed, 1),
-                "frames": self._frames_in_slot,
-                "bytes": sz,
-            }
+            with self._meta_lock:
+                self._slots_meta[str(self._current_slot)] = {
+                    "mtime": time.time(),
+                    "duration": round(elapsed, 1),
+                    "frames": self._frames_in_slot,
+                    "bytes": sz,
+                }
 
     def _rotate_slot(self) -> None:
         """Advance to next circular slot, truncating any existing old slot file."""
@@ -1032,7 +1048,9 @@ class TimelapseRecorder:
 
     def get_ordered_slots(self) -> List[Tuple[int, Path, Dict[str, Any]]]:
         """Return all non-empty slot files in chronological order (oldest to newest)."""
-        self._sync_meta_if_changed()
+        with self._meta_lock:
+            self._sync_meta_if_changed()
+            slots_snapshot = {k: dict(v) for k, v in self._slots_meta.items()}
         valid_slots = []
         for i in range(self.total_slots):
             p = self.slot_path(i)
@@ -1040,7 +1058,7 @@ class TimelapseRecorder:
                 try:
                     sz = p.stat().st_size
                     if sz > 0:
-                        meta = self._slots_meta.get(str(i), {})
+                        meta = slots_snapshot.get(str(i), {})
                         mtime = meta.get("mtime") or p.stat().st_mtime
                         valid_slots.append((i, p, mtime, meta))
                 except OSError:
@@ -1107,7 +1125,10 @@ class TimelapseRecorder:
             earliest_slot_start = slot_spans[0][0]
             latest_slot_end = slot_spans[-1][1]
 
-            for ev in self._events:
+            with self._meta_lock:
+                events_snapshot = list(self._events)
+
+            for ev in events_snapshot:
                 start_time = float(ev.get("time", ev.get("start_time", 0.0)))
                 end_time = max(start_time, float(ev.get("end_time", start_time)))
                 if end_time < earliest_slot_start - 5.0 or start_time > latest_slot_end + 30.0:
@@ -1299,9 +1320,6 @@ class TimelapseRecorder:
 
                 tmp_out = output_file.with_suffix(".tmp.mp4")
                 env = os.environ.copy()
-                if "LIBVA_DRIVER_NAME" not in env:
-                    # Intel Haswell Gen 7.5 uses i965 driver
-                    env["LIBVA_DRIVER_NAME"] = "i965"
 
                 if codec.lower() == "h264":
                     vaapi_dev = self._detect_vaapi_device()

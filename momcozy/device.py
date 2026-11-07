@@ -148,6 +148,7 @@ class MomcozyMonitor:
         on_ip_discovered: Optional[Callable[[str], None]] = None,
         tuya_session: Optional[Any] = None,
         save_tuya_session: Optional[Callable[[Any], None]] = None,
+        probe_lan: bool = True,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
@@ -175,7 +176,7 @@ class MomcozyMonitor:
 
         self._device: Optional[tinytuya.Device] = None
         self.control_diagnostic: str = ""
-        self._init_local_device()
+        self._init_local_device(probe_lan=probe_lan)
 
     def test_local_lan_connection(self, allow_rediscovery: bool = True) -> bool:
         """Test direct TCP connection to port 6668 on the camera IP."""
@@ -223,7 +224,7 @@ class MomcozyMonitor:
             )
             return False
 
-    def _init_local_device(self) -> None:
+    def _init_local_device(self, probe_lan: bool = True) -> None:
         if self.ip:
             self._device = tinytuya.Device(
                 dev_id=self.device_id,
@@ -233,7 +234,12 @@ class MomcozyMonitor:
             )
             self._device.set_socketPersistent(True)
             self._device.set_socketTimeout(1.0)
-            self.test_local_lan_connection()
+            if probe_lan:
+                self.test_local_lan_connection()
+            else:
+                self._lan_tcp_unavailable = True
+                self.control_diagnostic = f"Local LAN probe pending for {self.ip}:6668"
+                self.control_diagnostic = f"Local LAN probe pending for {self.ip}:6668"
         else:
             self.control_diagnostic = (
                 f"No local IP address configured for camera {self.device_id}. "
@@ -667,6 +673,8 @@ class MomcozyMonitor:
             tuya_uid=self.stream_tuya_uid,
             tuya_token=self.stream_tuya_token,
             tuya_region=self.stream_tuya_region,
+            session=self.tuya_session,
+            on_session_updated=self.save_tuya_session,
         ) as client:
             stream = client.create_camera_stream(self.device_id, self.local_key)
             await stream.async_start()

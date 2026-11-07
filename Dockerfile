@@ -20,8 +20,8 @@ RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list
 WORKDIR /app
 
 # Install python dependencies first for optimal Docker layer caching
-COPY requirements.txt pyproject.toml /app/
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml /app/
+RUN python3 -c "import subprocess, tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; subprocess.run(['pip', 'install', '--no-cache-dir', *deps], check=True)"
 
 # Copy application source
 COPY momcozy /app/momcozy

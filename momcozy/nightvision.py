@@ -86,12 +86,25 @@ def analyze_hevc_keyframe(
 
         # YUV420p planes: plane 0 = Y (luma), plane 1 = U (chroma Cb), plane 2 = V (chroma Cr)
         # In infrared monochrome, U and V are neutral 128 (no color saturation).
-        # Inspecting U and V directly eliminates libswscale software scaling and RGB24 conversion.
-        if len(last_frame.planes) >= 3:
-            u = memoryview(last_frame.planes[1])
-            v = memoryview(last_frame.planes[2])
-            step = max(1, len(u) // 256)
-            diff = sum(abs(u[i] - 128) + abs(v[i] - 128) for i in range(0, 256 * step, step)) / 256
+        # Sample a 2D grid using plane line_size so horizontal row padding is never read.
+        if len(last_frame.planes) >= 3 and last_frame.width >= 2 and last_frame.height >= 2:
+            u_plane = last_frame.planes[1]
+            v_plane = last_frame.planes[2]
+            u = memoryview(u_plane)
+            v = memoryview(v_plane)
+            uv_w = getattr(u_plane, "width", 0) or max(1, last_frame.width // 2)
+            uv_h = getattr(u_plane, "height", 0) or max(1, last_frame.height // 2)
+            u_stride = getattr(u_plane, "line_size", uv_w) or uv_w
+            v_stride = getattr(v_plane, "line_size", uv_w) or uv_w
+            total = 0
+            for r in range(THUMBNAIL_SIZE):
+                py = min(uv_h - 1, ((2 * r + 1) * uv_h) // (2 * THUMBNAIL_SIZE))
+                u_row = py * u_stride
+                v_row = py * v_stride
+                for c in range(THUMBNAIL_SIZE):
+                    px = min(uv_w - 1, ((2 * c + 1) * uv_w) // (2 * THUMBNAIL_SIZE))
+                    total += abs(u[u_row + px] - 128) + abs(v[v_row + px] - 128)
+            diff = total / (THUMBNAIL_SIZE * THUMBNAIL_SIZE)
         else:
             thumb = last_frame.reformat(width=THUMBNAIL_SIZE, height=THUMBNAIL_SIZE, format="rgb24")
             diff = thumbnail_color_diff(thumb.to_ndarray().tobytes())

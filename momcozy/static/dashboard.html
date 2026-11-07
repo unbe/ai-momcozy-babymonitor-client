@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Momcozy BM04 Baby Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script>
+    window.serverLanIp = '';
+    window.serverPort = 8421;
+    window.serverHttpPort = 8420;
+  </script>
+</head>
+<body>
+  <div id="toast-container"></div>
+  <div class="container">
+    <header>
+      <div>
+        <h1>🍼 Momcozy BM04 Monitor</h1>
+        <div style="font-size: 0.76rem; color: var(--text-muted); margin-top: 3px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+          <span>Control: <strong id="hdr-control-transport" style="color:var(--text);">Checking...</strong> <span id="hdr-control-diag" style="color:var(--text-muted); font-size:0.7rem; display:none;"></span></span>
+          <span>&bull;</span>
+          <span>Stream: <strong id="hdr-stream-transport" style="color:var(--text);">Cloud Relay (Tuya P2P)</strong></span>
+        </div>
+      </div>
+      <span id="conn-badge" class="badge active">Connected</span>
+    </header>
+
+    <div class="video-card">
+      <div class="video-overlay" id="video-overlay">
+        <div class="live-dot" id="live-dot"></div>
+        <span id="stream-badge">LIVE STREAM</span>
+      </div>
+      <div class="video-ctrls-group">
+        <button class="video-ctrl-btn" id="audio-btn" onclick="toggleAudio()" title="Live Audio">
+          <svg id="audio-off-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+          <svg id="audio-on-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+          <span id="audio-btn-text">Audio</span>
+        </button>
+        <button class="video-ctrl-btn" id="cast-btn" onclick="handleCastClick(event)" title="Cast to TV / Chromecast">
+          <svg id="cast-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
+            <line x1="2" y1="20" x2="2.01" y2="20"/>
+          </svg>
+          <span id="cast-btn-text">Cast</span>
+        </button>
+        <button class="video-ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
+          <svg id="fs-enter-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+          <svg id="fs-exit-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none;"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
+          <span id="fs-btn-text">Fullscreen</span>
+        </button>
+      </div>
+      <canvas id="stream-canvas" style="display:none;"></canvas>
+      <img id="stream-img" alt="Camera Stream" style="display:none;">
+      <audio id="live-audio" preload="none"></audio>
+      <div id="video-error" class="video-error-overlay hidden">
+        <div style="font-size: 2.2rem;">⚠️</div>
+        <div id="video-error-title" style="font-weight: 700; font-size: 1.05rem;">Live Stream Offline</div>
+        <div id="video-error-detail" style="font-size: 0.85rem; color: #E2E8F0; max-width: 90%; line-height: 1.4;"></div>
+        <button class="btn primary" onclick="retryStream()" style="margin-top: 8px;">🔄 Retry Stream</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Sensor Telemetry -->
+      <div class="card">
+        <h2>🌡️ Environment Sensors <span class="badge" id="temp-badge">Normal</span></h2>
+        <div class="temp-display" id="temp-val">--.-°C <span>(--.-°F)</span></div>
+        <div style="margin-top: 12px;">
+          <div class="control-row">
+            <span>Baby Crying Alert</span>
+            <span id="cry-stat" class="badge">No</span>
+          </div>
+          <div class="control-row">
+            <span>Motion Detection</span>
+            <span id="motion-stat" class="badge">Clear</span>
+          </div>
+          <div class="control-row">
+            <span>Night Vision</span>
+            <span id="nv-stat" class="badge">Auto</span>
+          </div>
+          <div class="control-row">
+            <span>Privacy Mode</span>
+            <span id="priv-stat" class="badge">Off</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- PTZ Pan & Tilt -->
+      <div class="card">
+        <h2>🕹️ Camera Pan & Tilt</h2>
+        <div class="ptz-grid">
+          <div></div>
+          <button class="btn" onclick="ptzStep('0')">▲</button>
+          <div></div>
+          <button class="btn" onclick="ptzStep('6')">◀</button>
+          <button class="btn" onclick="ptzStop()">⏹</button>
+          <button class="btn" onclick="ptzStep('2')">▶</button>
+          <div></div>
+          <button class="btn" onclick="ptzStep('4')">▼</button>
+          <div></div>
+        </div>
+        <div style="text-align: center; margin-top: 8px;">
+          <a href="/snapshot" target="_blank" class="btn" style="text-decoration:none; display:inline-flex;">📷 Snapshot</a>
+        </div>
+      </div>
+
+      <!-- Lullaby Controls -->
+      <div class="card">
+        <h2>🎵 Soothing Lullaby</h2>
+        <div class="control-row">
+          <span>Track</span>
+          <select id="lullaby-track" onchange="changeLullaby()">
+            <option value="0">Brahms' Lullaby</option>
+            <option value="1">Hush Little Baby</option>
+            <option value="2">London Bridge</option>
+            <option value="3">Twinkle Twinkle</option>
+            <option value="4">White Noise</option>
+            <option value="5">Heartbeat</option>
+            <option value="6">Rainforest</option>
+            <option value="7">Gentle Stream</option>
+          </select>
+        </div>
+        <div class="control-row">
+          <span>Volume</span>
+          <input type="range" id="lullaby-vol" min="0" max="100" value="50" onchange="setLullabyVol(this.value)">
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn primary" style="flex:1;" onclick="toggleLullaby(true)">▶ Play</button>
+          <button class="btn" style="flex:1;" onclick="toggleLullaby(false)">⏹ Stop</button>
+        </div>
+      </div>
+
+      <!-- Settings -->
+      <div class="card">
+        <h2>⚙️ Monitor Settings</h2>
+        <div class="control-row">
+          <span>Night Vision</span>
+          <select id="nv-select" onchange="setNightVision(this.value)">
+            <option value="0">Auto</option>
+            <option value="1">Always Off</option>
+            <option value="2">Always On</option>
+          </select>
+        </div>
+        <div class="control-row">
+          <span>Privacy / Sleep Mode</span>
+          <button class="btn" id="priv-btn" onclick="togglePrivacy()">Toggle</button>
+        </div>
+        <div class="control-row">
+          <span>LED Indicator Light</span>
+          <button class="btn" onclick="toggleLed()">Toggle LED</button>
+        </div>
+        <div class="control-row">
+          <span>Flip 180° (Crib mount)</span>
+          <button class="btn" onclick="toggleFlip()">Flip</button>
+        </div>
+      </div>
+
+      <!-- Detection Snapshot Card -->
+      <div class="card">
+        <h2>📸 Detection Snapshot <span class="badge" id="detect-badge">Event Log</span></h2>
+        <div style="position:relative; width:100%; aspect-ratio:16/9; background:#1A202C; border-radius:8px; overflow:hidden; margin:8px 0 12px 0; display:flex; align-items:center; justify-content:center; box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);">
+          <img id="detect-img" src="" alt="Latest Detection Snapshot" style="width:100%; height:100%; object-fit:contain; cursor:pointer; display:none;" onclick="viewFullDetectSnapshot()" title="Click to view full size">
+          <div id="detect-empty" style="color:#A0AEC0; font-size:0.85rem; text-align:center; padding:12px;">No detection event recorded yet</div>
+        </div>
+        <div class="control-row">
+          <span>Trigger Event</span>
+          <span id="detect-trigger" class="badge" style="background:#EDF2F7; color:var(--text);">Sound / Cry Alert</span>
+        </div>
+        <div class="control-row">
+          <span>Recorded At</span>
+          <span id="detect-time" style="font-size:0.85rem; font-weight:600; color:var(--text);">Checking...</span>
+        </div>
+        <div class="control-row" id="detect-cloud-row" style="display:none;">
+          <span>Camera Event File</span>
+          <span id="detect-cloud-file" style="font-family:monospace; font-size:0.72rem; color:var(--text-muted); max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn" style="flex:1; font-size:0.82rem;" onclick="viewFullDetectSnapshot()">🔍 Full Size</button>
+          <button class="btn primary" style="flex:1; font-size:0.82rem;" onclick="captureLiveSnapshot()">📷 Capture Now</button>
+        </div>
+      </div>
+
+      <!-- Timelapse Card -->
+      <div class="card" id="timelapse-card">
+        <h2>⏱️ Timelapse <span class="badge" id="timelapse-badge">Stopped</span></h2>
+        <div class="control-row">
+          <span>Speed Ratio</span>
+          <select id="timelapse-ratio-select" onchange="changeTimelapseRatio(this.value)" style="font-size:0.82rem; font-weight:600; cursor:pointer;" title="Select Timelapse Speed Ratio">
+            <option value="15">1:15</option>
+            <option value="30">1:30</option>
+            <option value="60" selected>1:60</option>
+            <option value="90">1:90</option>
+          </select>
+        </div>
+        <div class="control-row">
+          <span>Time Recorded</span>
+          <span style="font-weight:600; font-size:0.85rem;">
+            <span id="timelapse-buffered">0m 00s</span>
+            <span style="color:var(--text-muted); font-weight:normal; font-size:0.8rem;"> (<span id="timelapse-vlen">0:00</span> video)</span>
+          </span>
+        </div>
+        <div class="control-row">
+          <span>Motion Events</span>
+          <span id="timelapse-events-badge" class="badge" style="background:rgba(255,255,255,0.08); color:var(--text-muted); font-size:0.75rem;">0 events</span>
+        </div>
+        <div class="control-row">
+          <span>Storage</span>
+          <span id="timelapse-storage" style="font-size:0.85rem; font-weight:600;">0.0 MB</span>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:12px;">
+          <button class="btn primary" id="timelapse-toggle-btn" style="flex:1.2;" onclick="toggleTimelapseRecord()">⏺ Start Recording</button>
+          <button class="btn" id="timelapse-watch-btn" style="flex:1;" onclick="openTimelapsePlayback()" disabled>▶ Watch</button>
+          <button class="btn" id="timelapse-erase-btn" style="flex:0.8; background:rgba(239,68,68,0.12); color:#ef4444; border:1px solid rgba(239,68,68,0.3); font-size:0.85rem;" onclick="eraseTimelapse()" disabled title="Erase all recorded timelapse footage">🗑️ Erase</button>
+        </div>
+        <div style="margin-top:8px;">
+          <button id="timelapse-sync-nv-btn" class="btn" style="width:100%; font-size:0.82rem; transition:all 0.2s;" onclick="toggleNightVisionSync()" title="Automatically start/resume timelapse immediately on night vision and stop on daylight (>=120s)"><span class="nv-moon">🌙</span> Sync with Night Vision: OFF</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="/static/dashboard.js"></script>
+  <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1" async></script>
+</body>
+</html>

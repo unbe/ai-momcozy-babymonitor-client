@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import io
 import logging
 import struct
 import time
@@ -29,6 +28,11 @@ from .tuya_cloud import (
     PACKAGE_NAME,
     SDK_VERSION,
     TTID,
+    TuyaSession,
+    build_uid_login_payload,
+    build_uid_token_request,
+    is_tuya_fatal_auth_error,
+    is_tuya_rate_limit_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +83,26 @@ class MomcozyAudioHandler:
             self._on_pcm(pcm_bytes)
 
 
+class _ChunkSink:
+    """Bounded writable byte sink for PyAV streaming muxers."""
+
+    __slots__ = ("_buf",)
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        self._buf.extend(data)
+        return len(data)
+
+    def drain(self) -> bytes:
+        if not self._buf:
+            return b""
+        out = bytes(self._buf)
+        self._buf.clear()
+        return out
+
+
 class StreamingMp3Encoder:
     """Encodes continuous 16-bit 8000Hz PCM stream into live MP3 (audio/mpeg) frames."""
 
@@ -89,9 +113,8 @@ class StreamingMp3Encoder:
             raise ImportError("Audio streaming requires 'av'. Install with pip install av") from e
 
         self.sample_rate = sample_rate
-        self._buf = io.BytesIO()
-        self._read_pos = 0
-        self._container = av.open(self._buf, mode="w", format="mp3")
+        self._sink = _ChunkSink()
+        self._container = av.open(self._sink, mode="w", format="mp3")
         self._stream = self._container.add_stream("mp3", rate=sample_rate)
         self._stream.bit_rate = bit_rate
 
@@ -104,12 +127,7 @@ class StreamingMp3Encoder:
         frame.sample_rate = self.sample_rate
         for packet in self._stream.encode(frame):
             self._container.mux(packet)
-        curr = self._buf.tell()
-        self._buf.seek(self._read_pos)
-        out = self._buf.read()
-        self._read_pos = curr
-        self._buf.seek(curr)
-        return out
+        return self._sink.drain()
 
     def flush(self) -> bytes:
         try:
@@ -118,11 +136,7 @@ class StreamingMp3Encoder:
             self._container.close()
         except Exception:
             pass
-        curr = self._buf.tell()
-        self._buf.seek(self._read_pos)
-        out = self._buf.read()
-        self._read_pos = curr
-        return out
+        return self._sink.drain()
 
 
 def make_wav_header(sample_rate: int = 8000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -551,7 +565,9 @@ def _patch_tuya_stream_session() -> None:
     from tuya_ipc_p2p_sdk.camera_stream import CameraStream
     from tuya_ipc_p2p_sdk.crypto import decrypt_record
     from tuya_ipc_p2p_sdk.stream_session import StreamSession
-    from tuya_ipc_p2p_sdk.transport.kcp_segment import parse_segment
+
+    if getattr(StreamSession, "_momcozy_patched", False):
+        return
 
     # 0. Monkey-patch transport framing and KCP segment handling with fast implementations
     try:
@@ -757,9 +773,8 @@ def _configure_tuya_p2p_sdk() -> None:
             if hasattr(mod, attr):
                 setattr(mod, attr, val)
 
-    import hmac
     import tuya_ipc_p2p_sdk.crypto as sdk_crypto
-    sdk_crypto.hmac_sha1 = lambda key, message: hmac.digest(key, message, "sha1")
+    sdk_crypto.hmac_sha1 = fast_hmac_sha1
 
 
 def create_p2p_client(
@@ -783,7 +798,7 @@ def create_p2p_client(
         TuyaIpcP2pAuthenticationError,
         TuyaIpcP2pGatewayError,
     )
-    from tuya_ipc_p2p_sdk.gateway.client import GatewayClient, _encrypt_password
+    from tuya_ipc_p2p_sdk.gateway.client import GatewayClient
     from tuya_ipc_p2p_sdk.json_types import require_str
     from tuya_ipc_p2p_sdk.models import AccountSession, MqttIdentity
 
@@ -816,22 +831,17 @@ def create_p2p_client(
                     token_obj = await self._async_call_object(
                         "smartlife.m.user.username.token.get",
                         "2.0",
-                        {"countryCode": uid_cc, "username": tuya_uid, "isUid": True},
+                        build_uid_token_request(uid_cc, tuya_uid),
                     )
-                    encrypted_pw = _encrypt_password(
-                        require_str(token_obj, "publicKey"),
-                        require_str(token_obj, "exponent"),
-                        md5_hex(tuya_token),
+                    login_post = build_uid_login_payload(
+                        country_code=uid_cc,
+                        uid=tuya_uid,
+                        token=tuya_token,
+                        public_key=require_str(token_obj, "publicKey"),
+                        exponent=str(token_obj.get("exponent") or "65537"),
+                        rsa_token=require_str(token_obj, "token"),
+                        create_group=True,
                     )
-                    login_post = {
-                        "countryCode": uid_cc,
-                        "uid": tuya_uid,
-                        "passwd": encrypted_pw,
-                        "token": require_str(token_obj, "token"),
-                        "ifencrypt": 1,
-                        "createGroup": True,
-                        "options": '{"group": 1}',
-                    }
                     try:
                         account = await self._async_call_object(
                             "smartlife.m.user.uid.password.login.reg",
@@ -866,22 +876,16 @@ def create_p2p_client(
             return acc
 
     account_session: Optional[AccountSession] = None
-    if session is not None:
-        if isinstance(session, AccountSession):
-            account_session = session
-        elif hasattr(session, "sid") and hasattr(session, "ecode"):
+    if isinstance(session, AccountSession):
+        account_session = session
+    elif session is not None:
+        coerced = TuyaSession.coerce(session, default_uid=tuya_uid or "")
+        if coerced is not None:
             account_session = AccountSession(
-                sid=str(session.sid),
-                ecode=str(session.ecode),
-                uid=str(getattr(session, "uid", tuya_uid or "")),
-                device_fingerprint=str(getattr(session, "device_fingerprint", "a" * 44)),
-            )
-        elif isinstance(session, dict) and session.get("sid") and session.get("ecode"):
-            account_session = AccountSession(
-                sid=str(session["sid"]),
-                ecode=str(session["ecode"]),
-                uid=str(session.get("uid", tuya_uid or "")),
-                device_fingerprint=str(session.get("device_fingerprint", "a" * 44)),
+                sid=coerced.sid,
+                ecode=coerced.ecode,
+                uid=coerced.uid,
+                device_fingerprint=coerced.device_fingerprint,
             )
 
     client = TuyaIpcP2pClient(
@@ -961,7 +965,10 @@ class VideoStreamer:
         self._latest_hevc_keyframe: Optional[bytes] = None
         self._keyframe_time: float = 0.0
         self._gop_chunks: list[bytes] = []
+        self._gop_version: int = 0
         self._snapshot_requests: Set[object] = set()
+        self._in_flight_snapshot: Optional[asyncio.Task[bytes]] = None
+        self._snapshot_waiters: int = 0
         self._stream_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
         self.keepalive_predicate: Optional[Callable[[], bool]] = None
@@ -1239,6 +1246,7 @@ class VideoStreamer:
         self._latest_hevc_keyframe = None
         self._keyframe_time = 0.0
         self._gop_chunks = []
+        self._gop_version += 1
 
     def _broadcast_hevc(self, chunk: bytes, is_key: bool) -> None:
         """Fan out an HEVC chunk to pass-through listeners.
@@ -1410,8 +1418,10 @@ class VideoStreamer:
                                 self._latest_hevc_keyframe = chunk
                                 self._keyframe_time = time.monotonic()
                                 self._gop_chunks = [chunk]
+                                self._gop_version += 1
                             elif self._gop_chunks and len(self._gop_chunks) < 150:
                                 self._gop_chunks.append(chunk)
+                                self._gop_version += 1
 
                             self._broadcast_hevc(chunk, is_key)
                     finally:
@@ -1431,23 +1441,8 @@ class VideoStreamer:
                 err_str = str(e)
                 self._last_error = err_str
 
-                is_rate_limit = any(
-                    rl in err_str
-                    for rl in (
-                        "USER_SESSION_LIMIT",
-                        "You have loged in too many times today",
-                    )
-                )
-
-                is_fatal_auth = is_rate_limit or any(
-                    fatal in err_str
-                    for fatal in (
-                        "LOGIN_TOKEN_FAILED",
-                        "USER_SESSION_INVALID",
-                        "Incorrect user token",
-                        "PERMISSION_DENIED",
-                    )
-                )
+                is_rate_limit = is_tuya_rate_limit_error(err_str)
+                is_fatal_auth = is_tuya_fatal_auth_error(err_str)
 
                 if is_rate_limit:
                     auth_failures += 1
@@ -1565,8 +1560,44 @@ class VideoStreamer:
         err_suffix = f": {self._last_error}" if self._last_error else ""
         raise TimeoutError(f"Timed out waiting for keyframe from camera{err_suffix}")
 
+    async def _capture_fresh_snapshot(self, timeout_seconds: float, start_time: float) -> bytes:
+        """Single-flight worker capturing or decoding a fresh JPEG frame."""
+        req_id = object()
+        self._snapshot_requests.add(req_id)
+        last_decoded_version = -1
+        try:
+            loop = asyncio.get_running_loop()
+            while time.monotonic() - start_time < timeout_seconds:
+                # A frame decoded by the live transcoder since the request started:
+                if self._latest_frame and self._latest_frame_time >= start_time:
+                    return self._latest_frame
+                # Otherwise decode the GOP buffered so far (only when GOP changed):
+                curr_ver = self._gop_version
+                if self._gop_chunks and curr_ver != last_decoded_version:
+                    last_decoded_version = curr_ver
+                    chunks_copy = list(self._gop_chunks)
+                    jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, chunks_copy)
+                    if jpeg_bytes:
+                        self._latest_frame = jpeg_bytes
+                        self._latest_frame_time = time.monotonic()
+                        if not self._latest_detection_snapshot:
+                            self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
+                        return jpeg_bytes
+                if self._last_error and time.monotonic() - start_time > 3.0:
+                    raise RuntimeError(f"Camera stream error: {self._last_error}")
+                await asyncio.sleep(0.03)
+
+            if self._latest_frame:
+                logger.warning("Timed out waiting for fresh frame; returning latest available frame")
+                return self._latest_frame
+
+            err_suffix = f": {self._last_error}" if self._last_error else ""
+            raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
+        finally:
+            self._snapshot_requests.discard(req_id)
+
     async def get_snapshot(self, timeout_seconds: float = 10.0, max_age: float = 0.5) -> bytes:
-        """Capture a single JPEG: a recent live frame, else a burst-decode of the rolling GOP."""
+        """Capture a single JPEG: a recent live frame, else a deduplicated burst-decode of the rolling GOP."""
         with self.lease():
             if not self._running:
                 await self.start()
@@ -1574,36 +1605,35 @@ class VideoStreamer:
             if self._latest_frame and (time.monotonic() - self._latest_frame_time) < max_age:
                 return self._latest_frame
 
-            req_id = object()
-            self._snapshot_requests.add(req_id)
-            start_time = time.monotonic()
-            try:
-                loop = asyncio.get_running_loop()
-                while time.monotonic() - start_time < timeout_seconds:
-                    # A frame decoded by the live transcoder since the request started:
-                    if self._latest_frame and self._latest_frame_time >= start_time:
-                        return self._latest_frame
-                    # Otherwise decode the GOP buffered so far:
-                    if self._gop_chunks:
-                        jpeg_bytes = await loop.run_in_executor(None, decode_hevc_gop_to_jpeg, list(self._gop_chunks))
-                        if jpeg_bytes:
-                            self._latest_frame = jpeg_bytes
-                            self._latest_frame_time = time.monotonic()
-                            if not self._latest_detection_snapshot:
-                                self.capture_detection_snapshot(trigger="Snapshot Baseline", frame=jpeg_bytes)
-                            return jpeg_bytes
-                    if self._last_error and time.monotonic() - start_time > 3.0:
-                        raise RuntimeError(f"Camera stream error: {self._last_error}")
-                    await asyncio.sleep(0.03)
+            task = self._in_flight_snapshot
+            if task is None or task.done():
+                start_time = time.monotonic()
+                task = asyncio.create_task(
+                    self._capture_fresh_snapshot(max(timeout_seconds, 10.0), start_time)
+                )
+                self._in_flight_snapshot = task
 
+                def _clear_task(done_task: asyncio.Task[bytes]) -> None:
+                    if self._in_flight_snapshot is done_task:
+                        self._in_flight_snapshot = None
+
+                task.add_done_callback(_clear_task)
+
+            self._snapshot_waiters += 1
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+            except TimeoutError:
                 if self._latest_frame:
                     logger.warning("Timed out waiting for fresh frame; returning latest available frame")
                     return self._latest_frame
-
                 err_suffix = f": {self._last_error}" if self._last_error else ""
-                raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}")
+                raise TimeoutError(f"Timed out waiting for video frame from camera{err_suffix}") from None
             finally:
-                self._snapshot_requests.discard(req_id)
+                self._snapshot_waiters = max(0, self._snapshot_waiters - 1)
+                if self._snapshot_waiters == 0 and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
 
     async def get_clean_frame(self, timeout_seconds: float = 25.0) -> bytes:
         """Capture a clean, newly decoded JPEG frame from the camera."""

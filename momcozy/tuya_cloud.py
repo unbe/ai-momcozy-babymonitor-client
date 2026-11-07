@@ -13,10 +13,11 @@ import hmac
 import json
 import logging
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import requests
 from cryptography.exceptions import InvalidTag
@@ -24,6 +25,8 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Constants reverse-engineered from Momcozy BM04 APK (com.lute.momcozy) & libthing_security.so
 PACKAGE_NAME = "com.lute.momcozy"
@@ -83,8 +86,37 @@ TUYA_GATEWAY_URLS = {
     "cn": "https://a1.tuyacn.com/api.json",
     "86": "https://a1.tuyacn.com/api.json",
     "in": "https://a1-in.iotbing.com/api.json",
+    "ap": "https://a1-in.iotbing.com/api.json",
     "91": "https://a1-in.iotbing.com/api.json",
 }
+
+_REGION_CODE_MAP: Dict[str, str] = {
+    "33": "eu",
+    "eu": "eu",
+    "we": "eu",
+    "1": "us",
+    "us": "us",
+    "na": "us",
+    "86": "cn",
+    "cn": "cn",
+    "91": "in",
+    "in": "in",
+    "ap": "in",
+}
+
+
+def resolve_tuya_region(
+    tuya_region: Optional[str] = None,
+    account_region: Optional[str] = None,
+    default: str = "us",
+) -> str:
+    """Resolve Momcozy / Tuya region identifiers into canonical Tuya region code ('eu', 'us', 'cn', 'in')."""
+    for candidate in (tuya_region, account_region):
+        if candidate:
+            mapped = _REGION_CODE_MAP.get(str(candidate).strip().lower())
+            if mapped:
+                return mapped
+    return default
 
 
 def md5_hex(value: str) -> str:
@@ -150,6 +182,81 @@ def encrypt_password_rsa(modulus_decimal: str, exponent_decimal: str, password_m
     return public_key.encrypt(password_md5.encode("ascii"), padding.PKCS1v15()).hex()
 
 
+def build_uid_token_request(country_code: str, uid: str) -> Dict[str, Any]:
+    """Build request body for smartlife.m.user.username.token.get."""
+    return {
+        "countryCode": str(country_code),
+        "username": uid,
+        "isUid": True,
+    }
+
+
+def build_uid_login_payload(
+    country_code: str,
+    uid: str,
+    token: str,
+    public_key: str,
+    exponent: str,
+    rsa_token: str,
+    create_group: bool = True,
+) -> Dict[str, Any]:
+    """Build RSA-encrypted UID password login payload for Tuya Gateway."""
+    encrypted_pw = encrypt_password_rsa(str(public_key), str(exponent), md5_hex(token))
+    payload: Dict[str, Any] = {
+        "countryCode": str(country_code),
+        "uid": uid,
+        "passwd": encrypted_pw,
+        "token": str(rsa_token),
+        "ifencrypt": 1,
+        "options": '{"group": 1}',
+    }
+    if create_group:
+        payload["createGroup"] = True
+    return payload
+
+
+def is_tuya_rate_limit_error(exc_or_msg: Any) -> bool:
+    """Return True if error represents Tuya daily login rate limiting (USER_SESSION_LIMIT)."""
+    err_str = str(exc_or_msg)
+    return any(
+        marker in err_str
+        for marker in (
+            "USER_SESSION_LIMIT",
+            "You have loged in too many times today",
+        )
+    )
+
+
+def is_tuya_session_expired_error(exc_or_msg: Any) -> bool:
+    """Return True if error indicates the cached Tuya session has expired or been invalidated."""
+    err_str = str(exc_or_msg)
+    return any(
+        marker in err_str
+        for marker in (
+            "USER_SESSION_INVALID",
+            "NOT_EXISTS_SESSION",
+            "SIGN_INVALID",
+            "TOKEN_INVALID",
+            "USER_SESSION_HAS_EXPIRED",
+            "PERMISSION_DENIED",
+        )
+    )
+
+
+def is_tuya_fatal_auth_error(exc_or_msg: Any) -> bool:
+    """Return True if error indicates rejected credentials or rate limiting requiring extended backoff."""
+    err_str = str(exc_or_msg)
+    return is_tuya_rate_limit_error(err_str) or any(
+        marker in err_str
+        for marker in (
+            "LOGIN_TOKEN_FAILED",
+            "USER_SESSION_INVALID",
+            "Incorrect user token",
+            "PERMISSION_DENIED",
+        )
+    )
+
+
 @dataclass
 class TuyaSession:
     """Active Tuya Cloud session credentials."""
@@ -182,6 +289,157 @@ class TuyaSession:
             uid=str(data.get("uid", "")),
             device_fingerprint=str(data.get("device_fingerprint") or DEFAULT_DEVICE_FINGERPRINT),
         )
+
+    @classmethod
+    def coerce(cls, session: Any, default_uid: str = "") -> Optional[TuyaSession]:
+        """Coerce a TuyaSession, AccountSession, or dict into a TuyaSession."""
+        if isinstance(session, cls):
+            return session
+        if isinstance(session, dict):
+            return cls.from_dict(session)
+        if hasattr(session, "sid") and hasattr(session, "ecode") and session.sid and session.ecode:
+            return cls(
+                sid=str(session.sid),
+                ecode=str(session.ecode),
+                uid=str(getattr(session, "uid", "") or default_uid),
+                device_fingerprint=str(
+                    getattr(session, "device_fingerprint", "") or DEFAULT_DEVICE_FINGERPRINT
+                ),
+            )
+        return None
+
+
+class TuyaSessionManager:
+    """Centralized thread-safe Tuya session cache, backoff tracker, and synchronization hub."""
+
+    def __init__(
+        self,
+        initial_session: Any = None,
+        default_uid: str = "",
+        persist_cb: Optional[Callable[[TuyaSession], None]] = None,
+    ) -> None:
+        self._lock = threading.RLock()
+        self.default_uid = default_uid
+        self.session: Optional[TuyaSession] = TuyaSession.coerce(initial_session, default_uid=default_uid)
+        self._persist_cb = persist_cb
+        self._listeners: List[Callable[[TuyaSession], None]] = []
+        self.last_auth_attempt: float = 0.0
+        self.auth_failure_count: int = 0
+        self.auth_backoff: float = 15.0
+        self.fatal_auth_error: bool = False
+
+    def add_listener(self, listener: Callable[[TuyaSession], None]) -> None:
+        """Register a callback notified whenever the active TuyaSession is updated."""
+        with self._lock:
+            if listener not in self._listeners:
+                self._listeners.append(listener)
+
+    def can_attempt_auth(self, now: Optional[float] = None) -> bool:
+        """Return True if authentication backoff window has elapsed."""
+        ts = time.time() if now is None else now
+        with self._lock:
+            if self.last_auth_attempt <= 0.0:
+                return True
+            return (ts - self.last_auth_attempt) >= self.auth_backoff
+
+    def record_auth_success(self) -> None:
+        """Reset authentication failure counters after a successful login."""
+        with self._lock:
+            self.auth_failure_count = 0
+            self.auth_backoff = 15.0
+            self.fatal_auth_error = False
+
+    def record_auth_failure(self, exc: Exception, now: Optional[float] = None) -> None:
+        """Record an authentication failure and escalate backoff appropriately."""
+        ts = time.time() if now is None else now
+        with self._lock:
+            self.last_auth_attempt = ts
+            self.auth_failure_count += 1
+            if is_tuya_rate_limit_error(exc):
+                self.fatal_auth_error = True
+                self.auth_backoff = min(7200.0, max(1800.0, self.auth_backoff * 2.0))
+                logger.warning(
+                    "Tuya Cloud rate limit hit (USER_SESSION_LIMIT): %s "
+                    "(attempt %d, retrying after %.0fs / %.1fm)",
+                    exc,
+                    self.auth_failure_count,
+                    self.auth_backoff,
+                    self.auth_backoff / 60.0,
+                )
+            elif is_tuya_fatal_auth_error(exc):
+                self.fatal_auth_error = True
+                self.auth_backoff = min(900.0, max(30.0, self.auth_backoff * 2.0))
+                logger.warning(
+                    "Tuya Cloud auth rejected: %s (attempt %d, backing off for %.0fs)",
+                    exc,
+                    self.auth_failure_count,
+                    self.auth_backoff,
+                )
+            else:
+                self.auth_backoff = min(300.0, max(15.0, self.auth_backoff * 1.5))
+                logger.debug(
+                    "Tuya Cloud auth failed: %s (attempt %d, backing off for %.0fs)",
+                    exc,
+                    self.auth_failure_count,
+                    self.auth_backoff,
+                )
+
+    def update_session(self, session: Any, *, persist: bool = True) -> Optional[TuyaSession]:
+        """Update cached session, reset backoff, persist if configured, and notify listeners."""
+        coerced = TuyaSession.coerce(session, default_uid=self.default_uid)
+        if coerced is None:
+            return None
+        with self._lock:
+            self.session = coerced
+            self.record_auth_success()
+            listeners = list(self._listeners)
+            persist_cb = self._persist_cb if persist else None
+
+        if persist_cb is not None:
+            try:
+                persist_cb(coerced)
+            except Exception as exc:
+                logger.warning("Failed persisting Tuya session: %s", exc)
+
+        for listener in listeners:
+            try:
+                listener(coerced)
+            except Exception as exc:
+                logger.debug("TuyaSessionManager listener error: %s", exc)
+        return coerced
+
+    def get_or_login(
+        self,
+        tuya_client: "TuyaGatewayClient",
+        country_code: str,
+        uid: str,
+        token: str,
+        *,
+        force_refresh: bool = False,
+    ) -> Optional[TuyaSession]:
+        """Return active TuyaSession or perform UID login respecting auth backoff."""
+        with self._lock:
+            if self.session is not None and not force_refresh:
+                return self.session
+            now = time.time()
+            if not self.can_attempt_auth(now):
+                return None
+            self.last_auth_attempt = now
+
+        try:
+            fresh = tuya_client.login_with_uid(
+                country_code=country_code,
+                uid=uid,
+                token=token,
+            )
+        except Exception as exc:
+            self.record_auth_failure(exc, now)
+            if force_refresh:
+                with self._lock:
+                    self.session = None
+            return None
+
+        return self.update_session(fresh, persist=True)
 
 
 class TuyaGatewayClient:
@@ -287,11 +545,7 @@ class TuyaGatewayClient:
         token_res = self.call_api(
             "smartlife.m.user.username.token.get",
             "2.0",
-            {
-                "countryCode": str(country_code),
-                "username": uid,
-                "isUid": True,
-            },
+            build_uid_token_request(country_code, uid),
         )
         if not isinstance(token_res, dict) or not token_res.get("publicKey") or not token_res.get("token"):
             raise RuntimeError(f"Invalid token response from Tuya username.token.get: {token_res}")
@@ -300,27 +554,24 @@ class TuyaGatewayClient:
         exponent = str(token_res.get("exponent", "65537"))
         rsa_token = str(token_res["token"])
 
-        # 2. Encrypt MD5 of token using RSA
-        pw_md5 = md5_hex(token)
-        encrypted_pw = encrypt_password_rsa(pub_key, exponent, pw_md5)
-
-        # 3. Submit UID password login
-        login_post = {
-            "countryCode": str(country_code),
-            "uid": uid,
-            "passwd": encrypted_pw,
-            "token": rsa_token,
-            "ifencrypt": 1,
-            "createGroup": True,
-            "options": '{"group": 1}',
-        }
+        # 2. Submit RSA-encrypted UID password login
+        login_post = build_uid_login_payload(
+            country_code=country_code,
+            uid=uid,
+            token=token,
+            public_key=pub_key,
+            exponent=exponent,
+            rsa_token=rsa_token,
+            create_group=True,
+        )
 
         try:
             account = self.call_api("smartlife.m.user.uid.password.login.reg", "1.0", login_post)
         except Exception:
             # Fallback to direct login endpoint
-            login_post.pop("createGroup", None)
-            account = self.call_api("smartlife.m.user.uid.password.login", "1.0", login_post)
+            fallback_post = dict(login_post)
+            fallback_post.pop("createGroup", None)
+            account = self.call_api("smartlife.m.user.uid.password.login", "1.0", fallback_post)
 
         if not isinstance(account, dict) or not account.get("sid") or not account.get("ecode"):
             raise RuntimeError(f"Tuya UID login did not return session credentials: {account}")

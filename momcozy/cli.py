@@ -12,15 +12,22 @@ import asyncio
 import getpass
 import json
 import logging
-import os
 import sys
+import time as _time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .cloud import DEFAULT_CONFIG_PATH, MomcozyCloudApi, normalize_config_path
-from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection, Sensitivity
+from .config import ConfigStore
+from .constants import LULLABY_TRACKS, NightVisionMode, PtzDirection
 from .device import MomcozyMonitor
 from .stream import VideoStreamer
+from .tuya_cloud import (
+    TuyaSession,
+    TuyaSessionManager,
+    is_tuya_session_expired_error,
+    resolve_tuya_region,
+)
 from .web import WebServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -31,12 +38,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
     """Resolve device credentials from CLI arguments or saved config file."""
     raw_cfg = args.config if hasattr(args, "config") and args.config else DEFAULT_CONFIG_PATH
     config_path = normalize_config_path(raw_cfg)
-    saved = {}
-    if config_path.exists():
-        try:
-            saved = json.loads(config_path.read_text())
-        except Exception:
-            pass
+    saved = ConfigStore.read(config_path)
 
     dev_id = getattr(args, "device_id", None) or os.environ.get("MOMCOZY_DEVICE_ID") or saved.get("device_id")
     local_key = getattr(args, "local_key", None) or os.environ.get("MOMCOZY_LOCAL_KEY") or saved.get("local_key")
@@ -54,22 +56,20 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     ext_id = (first.get("metadata") or {}).get("extDeviceId") or first.get("sn", "").replace("BM04-", "")
                     if ext_id:
                         dev_id = ext_id
-                        saved["client_install_id"] = saved.get("device_id")
-                        saved["device_id"] = dev_id
-                        saved["camera_name"] = first.get("deviceName", "BM04")
+                        updates = {
+                            "client_install_id": saved.get("device_id"),
+                            "device_id": dev_id,
+                            "camera_name": first.get("deviceName", "BM04"),
+                        }
                         if first.get("mac"):
-                            saved["mac"] = first.get("mac")
-                        config_path.write_text(json.dumps(saved, indent=2))
+                            updates["mac"] = first.get("mac")
+                        saved = ConfigStore.update(config_path, updates, create=False)
             except Exception as e:
                 logger.debug("Could not auto-resolve device ID from cloud: %s", e)
 
     # Persist IP if explicitly passed via CLI
     if getattr(args, "ip", None) and config_path.exists():
-        saved["ip"] = args.ip
-        try:
-            config_path.write_text(json.dumps(saved, indent=2))
-        except Exception:
-            pass
+        saved = ConfigStore.update(config_path, {"ip": args.ip}, create=False)
 
     # Log local IP resolution source
     if getattr(args, "ip", None):
@@ -84,40 +84,6 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             config_path,
         )
 
-    # Attempt local network auto-discovery if IP is missing
-    if not ip and dev_id:
-        logger.info("Scanning local network for camera %s via UDP broadcast...", dev_id)
-        try:
-            import tinytuya
-            devices = tinytuya.deviceScan(False, 6)
-            for dev_ip, dev_info in devices.items():
-                if dev_info.get("gwId") == dev_id or dev_info.get("id") == dev_id:
-                    ip = dev_ip
-                    logger.info("Discovered camera %s on local network at %s", dev_id, ip)
-                    saved["ip"] = ip
-                    if config_path.exists():
-                        try:
-                            config_path.write_text(json.dumps(saved, indent=2))
-                            logger.info("Saved discovered IP %s to %s", ip, config_path)
-                        except Exception:
-                            pass
-                    break
-        except Exception as scan_err:
-            logger.debug("Local network scan encountered error: %s", scan_err)
-
-        if not ip:
-            logger.warning(
-                "Camera %s was NOT discovered on local network via UDP broadcast.\n"
-                "  • Reason: UDP broadcasts (ports 6666/6667) do not cross different subnets/VLANs or Docker bridge networks.\n"
-                "  • How to enable local control: Provide your camera's LAN IP address directly using:\n"
-                "      - Environment variable: MOMCOZY_IP=<CAMERA_IP>\n"
-                "      - Or in %s: {\"ip\": \"<CAMERA_IP>\"}\n"
-                "      - Or CLI flag: --ip <CAMERA_IP>\n"
-                "  • Device control will fall back to Tuya Cloud Gateway.",
-                dev_id,
-                config_path,
-            )
-
     # Auto-resolve local_key from Tuya Cloud if missing
     if not local_key and config_path.exists():
         try:
@@ -125,10 +91,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             if api and api.tuya_creds and api.tuya_creds.token:
                 logger.info("Retrieving Tuya encryption key for device %s from Tuya Cloud...", dev_id)
                 synced = api.sync_devices_and_keys(config_path, raise_on_error=True)
-                try:
-                    saved = json.loads(config_path.read_text())
-                except Exception:
-                    pass
+                saved = ConfigStore.read(config_path)
                 if dev_id and dev_id in synced and synced[dev_id].get("local_key"):
                     local_key = synced[dev_id]["local_key"]
                     logger.info("Retrieved and saved Tuya local encryption key for %s", dev_id)
@@ -164,125 +127,35 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
     tuya_uid = tuya_cfg.get("uid")
     tuya_token = tuya_cfg.get("token")
     account_reg = saved.get("region")
-    stream_reg = "eu" if (str(tuya_reg) == "33" or account_reg == "EU") else "us"
+    stream_reg = resolve_tuya_region(tuya_reg, account_reg, default="us")
 
     cc = saved.get("country_code", "1")
     phone_code_map = {"CH": "41", "DE": "49", "US": "1", "CA": "1", "GB": "44", "UK": "44", "FR": "33"}
     stream_cc = phone_code_map.get(str(cc).upper(), str(cc))
 
-    import time as _time
-
-    from .tuya_cloud import TuyaSession
     tuya_session_data = saved.get("tuya_session")
     initial_tuya_session = TuyaSession.from_dict(tuya_session_data) if isinstance(tuya_session_data, dict) else None
 
-    _dps_cache: dict = {
-        "ts": 0.0,
-        "dps": saved.get("dps") if isinstance(saved.get("dps"), dict) else {},
-        "session": initial_tuya_session,
-        "client": None,
-        "last_auth_attempt": 0.0,
-        "auth_failure_count": 0,
-        "auth_backoff": 15.0,
-        "fatal_auth_error": False,
-        "streamer": None,
-    }
-
-    def _save_tuya_session(session: Any) -> None:
+    def _persist_tuya_session(ts_obj: TuyaSession) -> None:
         if not config_path.exists():
             return
-        if hasattr(session, "to_dict"):
-            sess_dict = session.to_dict()
-        elif hasattr(session, "sid") and hasattr(session, "ecode"):
-            sess_dict = {
-                "sid": str(session.sid),
-                "ecode": str(session.ecode),
-                "uid": str(getattr(session, "uid", tuya_uid or "")),
-                "device_fingerprint": str(getattr(session, "device_fingerprint", "a" * 44)),
-            }
-        elif isinstance(session, dict):
-            sess_dict = dict(session)
-        else:
-            return
-        ts_obj = TuyaSession.from_dict(sess_dict)
-        if ts_obj:
-            _dps_cache["session"] = ts_obj
-            if _dps_cache.get("streamer"):
-                try:
-                    _dps_cache["streamer"].update_session(ts_obj)
-                except Exception:
-                    pass
         try:
-            cfg = json.loads(config_path.read_text())
-            cfg["tuya_session"] = sess_dict
-            config_path.write_text(json.dumps(cfg, indent=2))
-            os.chmod(config_path, 0o600)
+            ConfigStore.update(config_path, {"tuya_session": ts_obj.to_dict()}, create=False)
             logger.debug("Saved persistent Tuya session to %s", config_path)
         except Exception as exc:
             logger.warning("Could not persist Tuya session to config %s: %s", config_path, exc)
 
-    def _is_rate_limit_error(exc: Exception) -> bool:
-        err_str = str(exc)
-        return any(
-            err in err_str
-            for err in (
-                "USER_SESSION_LIMIT",
-                "You have loged in too many times today",
-            )
-        )
+    session_mgr = TuyaSessionManager(
+        initial_session=initial_tuya_session,
+        default_uid=tuya_uid or "",
+        persist_cb=_persist_tuya_session,
+    )
 
-    def _is_fatal_tuya_auth_error(exc: Exception) -> bool:
-        err_str = str(exc)
-        return any(
-            err in err_str
-            for err in (
-                "LOGIN_TOKEN_FAILED",
-                "USER_SESSION_INVALID",
-                "Incorrect user token",
-                "PERMISSION_DENIED",
-            )
-        ) or _is_rate_limit_error(exc)
-
-    def _can_attempt_tuya_auth(now: float) -> bool:
-        return (now - _dps_cache["last_auth_attempt"]) >= _dps_cache["auth_backoff"]
-
-    def _record_tuya_auth_failure(exc: Exception, now: float) -> None:
-        _dps_cache["last_auth_attempt"] = now
-        _dps_cache["auth_failure_count"] += 1
-        if _is_rate_limit_error(exc):
-            _dps_cache["fatal_auth_error"] = True
-            # Rate limit (USER_SESSION_LIMIT): back off for 30 minutes, max 2 hours
-            _dps_cache["auth_backoff"] = min(7200.0, max(1800.0, _dps_cache["auth_backoff"] * 2.0))
-            logger.warning(
-                "Tuya Cloud rate limit hit (USER_SESSION_LIMIT): %s (attempt %d, retrying after longer delay: %.0fs / %.1fm)",
-                exc,
-                _dps_cache["auth_failure_count"],
-                _dps_cache["auth_backoff"],
-                _dps_cache["auth_backoff"] / 60.0,
-            )
-        elif _is_fatal_tuya_auth_error(exc):
-            _dps_cache["fatal_auth_error"] = True
-            # Invalid token / auth failure: 30s -> 60s -> 300s -> 900s (15 min)
-            _dps_cache["auth_backoff"] = min(900.0, max(30.0, _dps_cache["auth_backoff"] * 2.0))
-            logger.warning(
-                "Tuya Cloud auth rejected: %s (attempt %d, backing off for %.0fs)",
-                exc,
-                _dps_cache["auth_failure_count"],
-                _dps_cache["auth_backoff"],
-            )
-        else:
-            _dps_cache["auth_backoff"] = min(300.0, max(15.0, _dps_cache["auth_backoff"] * 1.5))
-            logger.debug(
-                "Tuya Cloud auth failed: %s (attempt %d, backing off for %.0fs)",
-                exc,
-                _dps_cache["auth_failure_count"],
-                _dps_cache["auth_backoff"],
-            )
-
-    def _record_tuya_auth_success() -> None:
-        _dps_cache["auth_failure_count"] = 0
-        _dps_cache["auth_backoff"] = 15.0
-        _dps_cache["fatal_auth_error"] = False
+    _dps_cache: dict = {
+        "ts": 0.0,
+        "dps": saved.get("dps") if isinstance(saved.get("dps"), dict) else {},
+        "client": None,
+    }
 
     def _fetch_cloud_dps() -> dict:
         now = _time.time()
@@ -295,53 +168,35 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             return _dps_cache["dps"]
         t_client = _dps_cache["client"] or api_inst.get_tuya_client()
         _dps_cache["client"] = t_client
-        t_session = _dps_cache["session"]
+        t_session = session_mgr.get_or_login(
+            t_client,
+            country_code=api_inst.tuya_creds.region,
+            uid=api_inst.tuya_creds.uid,
+            token=api_inst.tuya_creds.token,
+        )
         if t_session is None:
-            if not _can_attempt_tuya_auth(now):
-                return _dps_cache["dps"]
-            _dps_cache["last_auth_attempt"] = now
-            try:
-                t_session = t_client.login_with_uid(
-                    country_code=api_inst.tuya_creds.region,
-                    uid=api_inst.tuya_creds.uid,
-                    token=api_inst.tuya_creds.token,
-                )
-                _dps_cache["session"] = t_session
-                _save_tuya_session(t_session)
-                _record_tuya_auth_success()
-            except Exception as exc:
-                _record_tuya_auth_failure(exc, now)
-                return _dps_cache["dps"]
+            return _dps_cache["dps"]
 
-        session_expired = False
+        info = None
         try:
             info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
         except Exception as exc:
-            if any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID", "TOKEN_INVALID", "USER_SESSION_HAS_EXPIRED", "PERMISSION_DENIED")):
+            if is_tuya_session_expired_error(exc):
                 logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
-                session_expired = True
-            else:
-                logger.warning("Tuya get_device_info error: %s", exc)
-                info = None
-
-        if session_expired:
-            if not _can_attempt_tuya_auth(now):
-                return _dps_cache["dps"]
-            _dps_cache["last_auth_attempt"] = now
-            try:
-                t_session = t_client.login_with_uid(
+                t_session = session_mgr.get_or_login(
+                    t_client,
                     country_code=api_inst.tuya_creds.region,
                     uid=api_inst.tuya_creds.uid,
                     token=api_inst.tuya_creds.token,
+                    force_refresh=True,
                 )
-                _dps_cache["session"] = t_session
-                _save_tuya_session(t_session)
-                _record_tuya_auth_success()
-                info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
-            except Exception as exc:
-                _record_tuya_auth_failure(exc, now)
-                _dps_cache["session"] = None
-                info = None
+                if t_session is not None:
+                    try:
+                        info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+                    except Exception as retry_exc:
+                        logger.warning("Tuya get_device_info retry error: %s", retry_exc)
+            else:
+                logger.warning("Tuya get_device_info error: %s", exc)
 
         if isinstance(info, dict) and info.get("dps"):
             _dps_cache["dps"] = info["dps"]
@@ -354,63 +209,51 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         api_inst = MomcozyCloudApi.load_session(config_path)
         if not api_inst or not api_inst.tuya_creds or not api_inst.tuya_creds.token:
             return False
-        now = _time.time()
-        if not _can_attempt_tuya_auth(now):
+        if not session_mgr.can_attempt_auth():
             logger.warning("Tuya Cloud publish_dps skipped: currently in auth error backoff.")
             return False
         t_client = _dps_cache["client"] or api_inst.get_tuya_client()
         _dps_cache["client"] = t_client
-        t_session = _dps_cache["session"]
+        t_session = session_mgr.get_or_login(
+            t_client,
+            country_code=api_inst.tuya_creds.region,
+            uid=api_inst.tuya_creds.uid,
+            token=api_inst.tuya_creds.token,
+        )
         if t_session is None:
-            _dps_cache["last_auth_attempt"] = now
-            try:
-                t_session = t_client.login_with_uid(
-                    country_code=api_inst.tuya_creds.region,
-                    uid=api_inst.tuya_creds.uid,
-                    token=api_inst.tuya_creds.token,
-                )
-                _dps_cache["session"] = t_session
-                _save_tuya_session(t_session)
-                _record_tuya_auth_success()
-            except Exception as exc:
-                _record_tuya_auth_failure(exc, now)
-                return False
+            return False
         try:
             return t_client.publish_dps(t_session, dev_id, dps_dict)
         except Exception as exc:
-            if any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID", "TOKEN_INVALID", "USER_SESSION_HAS_EXPIRED", "PERMISSION_DENIED")):
+            if is_tuya_session_expired_error(exc):
                 logger.debug("Cloud publish_dps session expired, refreshing session: %s", exc)
-                if not _can_attempt_tuya_auth(now):
-                    return False
-                _dps_cache["last_auth_attempt"] = now
-                try:
-                    t_session = t_client.login_with_uid(
-                        country_code=api_inst.tuya_creds.region,
-                        uid=api_inst.tuya_creds.uid,
-                        token=api_inst.tuya_creds.token,
-                    )
-                    _dps_cache["session"] = t_session
-                    _save_tuya_session(t_session)
-                    _record_tuya_auth_success()
-                    return t_client.publish_dps(t_session, dev_id, dps_dict)
-                except Exception as auth_exc:
-                    _record_tuya_auth_failure(auth_exc, now)
-                    _dps_cache["session"] = None
-                    return False
+                t_session = session_mgr.get_or_login(
+                    t_client,
+                    country_code=api_inst.tuya_creds.region,
+                    uid=api_inst.tuya_creds.uid,
+                    token=api_inst.tuya_creds.token,
+                    force_refresh=True,
+                )
+                if t_session is not None:
+                    try:
+                        return t_client.publish_dps(t_session, dev_id, dps_dict)
+                    except Exception as retry_exc:
+                        logger.warning("Cloud publish_dps retry error: %s", retry_exc)
+                        return False
+                return False
             logger.warning("Cloud publish_dps error: %s", exc)
             return False
 
     def _on_ip_discovered(new_ip: str) -> None:
         if config_path.exists():
             try:
-                data = json.loads(config_path.read_text())
-                data["ip"] = new_ip
-                config_path.write_text(json.dumps(data, indent=2))
+                ConfigStore.update(config_path, {"ip": new_ip}, create=False)
                 logger.info("Saved newly discovered IP %s to %s", new_ip, config_path)
             except Exception as e:
                 logger.debug("Failed saving newly discovered IP to config: %s", e)
 
-    return MomcozyMonitor(
+    defer_lan_probe = getattr(args, "subcommand", None) == "serve"
+    monitor = MomcozyMonitor(
         device_id=dev_id,
         local_key=local_key or "",
         ip=ip,
@@ -425,10 +268,28 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         cloud_dp_publisher=_publish_cloud_dps if (tuya_uid and tuya_token) else None,
         initial_dps=saved.get("dps") if isinstance(saved.get("dps"), dict) else None,
         on_ip_discovered=_on_ip_discovered,
-        tuya_session=_dps_cache["session"],
-        save_tuya_session=_save_tuya_session,
+        tuya_session=session_mgr.session,
+        save_tuya_session=session_mgr.update_session,
+        probe_lan=not defer_lan_probe,
     )
-    monitor._dps_cache = _dps_cache
+    monitor.session_manager = session_mgr  # type: ignore[attr-defined]
+    session_mgr.add_listener(lambda s: setattr(monitor, "tuya_session", s))
+
+    if not defer_lan_probe and not monitor.ip and monitor.device_id:
+        monitor.test_local_lan_connection(allow_rediscovery=True)
+        if not monitor.ip:
+            logger.warning(
+                "Camera %s was NOT discovered on local network via UDP broadcast.\n"
+                "  • Reason: UDP broadcasts (ports 6666/6667) do not cross different subnets/VLANs or Docker bridge networks.\n"
+                "  • How to enable local control: Provide your camera's LAN IP address directly using:\n"
+                "      - Environment variable: MOMCOZY_IP=<CAMERA_IP>\n"
+                "      - Or in %s: {\"ip\": \"<CAMERA_IP>\"}\n"
+                "      - Or CLI flag: --ip <CAMERA_IP>\n"
+                "  • Device control will fall back to Tuya Cloud Gateway.",
+                dev_id,
+                config_path,
+            )
+
     return monitor
 
 
@@ -752,6 +613,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if (monitor.stream_tuya_uid and monitor.stream_tuya_token) or (
         monitor.stream_email and monitor.stream_password
     ):
+        session_mgr = getattr(monitor, "session_manager", None)
         streamer = VideoStreamer(
             device_id=monitor.device_id,
             local_key=monitor.local_key,
@@ -766,8 +628,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
             session=monitor.tuya_session,
             on_session_updated=monitor.save_tuya_session,
         )
-        if hasattr(monitor, "_dps_cache") and isinstance(monitor._dps_cache, dict):
-            monitor._dps_cache["streamer"] = streamer
+        if session_mgr is not None:
+            session_mgr.add_listener(streamer.update_session)
 
     ssl_context = None
     ssl_flag = getattr(args, "ssl", False) or bool(os.environ.get("MOMCOZY_SSL"))
@@ -832,13 +694,8 @@ def cmd_share(args: argparse.Namespace) -> None:
 
     dev_id = args.device_id
     if not dev_id:
-        config_path = config_target
-        if config_path.exists():
-            try:
-                cfg = json.loads(config_path.read_text())
-                dev_id = cfg.get("device_id")
-            except Exception:
-                pass
+        cfg = ConfigStore.read(config_target)
+        dev_id = cfg.get("device_id")
     if not dev_id:
         print("Error: No target device ID specified or found in config.", file=sys.stderr)
         sys.exit(1)
@@ -867,8 +724,12 @@ def cmd_share(args: argparse.Namespace) -> None:
     elif args.action == "remove":
         print(f"Revoking share for member {args.member_code} on device {dev_id}...")
         try:
-            api.delete_device_share(dev_id, args.member_code)
+            relation_id = getattr(args, "relation_id", None)
+            res = api.remove_device_share(dev_id, args.member_code, relation_id=relation_id)
             print(f"✓ Successfully revoked share for {args.member_code}!")
+            revoked_ids = res.get("revoked_relation_ids") or []
+            if revoked_ids:
+                print(f"  • Tuya Relations Revoked: {', '.join(str(r) for r in revoked_ids)}")
         except Exception as e:
             print(f"Error revoking share: {e}", file=sys.stderr)
             sys.exit(1)
@@ -987,7 +848,7 @@ real-time temperature and baby crying detection, and a modern Web UI."""
     )
     p_devices.set_defaults(func=cmd_devices)
 
-    # sync / keys
+    # sync
     p_sync = sub.add_parser(
         "sync",
         help="Synchronize device encryption keys & IP from cloud",
@@ -995,14 +856,6 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_sync.set_defaults(func=cmd_sync)
-
-    p_keys = sub.add_parser(
-        "keys",
-        help="Alias for 'sync' - fetch device encryption keys",
-        description="Alias for 'sync'. Retrieves local encryption keys and device metadata from Tuya Cloud.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_keys.set_defaults(func=cmd_sync)
 
     # status
     p_status = sub.add_parser(
@@ -1167,6 +1020,7 @@ real-time temperature and baby crying detection, and a modern Web UI."""
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_srem.add_argument("member_code", help="Member code of the shared user to revoke")
+    p_srem.add_argument("--relation-id", type=int, help="Optional Tuya share relation ID (automatically queried if omitted)")
 
     # share search <account>
     p_ssearch = share_sub.add_parser(

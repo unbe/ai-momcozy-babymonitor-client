@@ -36,3 +36,6 @@ timelapse/
 .DS_Store
 .momcozy.json
 config/
+ssl/
+.momcozy_ssl/
+*.pem

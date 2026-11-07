@@ -7,9 +7,7 @@ retrieving account information, and querying linked Tuya devices & encryption ke
 from __future__ import annotations
 
 import base64
-import json
 import logging
-import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from argon2.low_level import Type, hash_secret_raw
 
+from .config import ConfigStore, DEFAULT_CONFIG_PATH, normalize_config_path
 from .constants import (
     API_BASE_URL,
     APP_ID,
@@ -32,31 +31,6 @@ from .constants import (
 )
 
 logger = logging.getLogger(__name__)
-
-def _resolve_default_config_path() -> Path:
-    env_cfg = os.environ.get("MOMCOZY_CONFIG")
-    if env_cfg:
-        p = Path(env_cfg).resolve()
-        if p.is_dir():
-            return p / ".momcozy.json"
-        return p
-    # Next to the main script (repo / project root)
-    script_dir = Path(__file__).resolve().parent.parent
-    return script_dir / ".momcozy.json"
-
-
-DEFAULT_CONFIG_PATH = _resolve_default_config_path()
-
-
-def normalize_config_path(path: Path | str) -> Path:
-    """Normalize a config path. If pointing to a directory, append .momcozy.json or momcozy.json."""
-    p = Path(path).expanduser()
-    if p.is_dir():
-        for candidate in (".momcozy.json", "momcozy.json"):
-            if (p / candidate).is_file():
-                return p / candidate
-        return p / ".momcozy.json"
-    return p
 
 
 def hash_password(plain_password: str) -> str:
@@ -346,9 +320,10 @@ class MomcozyCloudApi:
         return res.get("tuyaUserInfoBeanList", [])
 
     def delete_device_share(self, tuya_dev_id: str, member_code: str) -> Dict[str, Any]:
-        """Revoke a user's shared access to the device.
+        """Revoke a user's shared access metadata on Momcozy Cloud.
 
         Calls DELETE /api/app/third/tuya/device/{tuyaDevId}/share/{memberCode}.
+        Use `remove_device_share()` to revoke both Tuya Home and Momcozy Cloud access.
         """
         if not self.token:
             raise RuntimeError("Must be logged in to revoke device share")
@@ -358,56 +333,119 @@ class MomcozyCloudApi:
             raise RuntimeError(f"Revoke device share failed: {data.get('message', 'Unknown error')}")
         return data.get("result", {})
 
+    def remove_tuya_device_share(
+        self,
+        tuya_dev_id: str,
+        member_code: str,
+        relation_id: Optional[int] = None,
+    ) -> List[int]:
+        """Revoke Tuya Home device share relationship(s) matching `member_code` or `relation_id`."""
+        if not self.tuya_creds or not self.tuya_creds.token:
+            self.get_tuya_credentials()
+        if not self.tuya_creds or not self.tuya_creds.token:
+            raise RuntimeError("No Tuya credentials available for Tuya Home share revocation")
+
+        tuya_client = self.get_tuya_client()
+        session = self.get_active_tuya_session(tuya_client)
+        target_ids: List[int] = []
+
+        if relation_id is not None:
+            target_ids.append(int(relation_id))
+        else:
+            members = tuya_client.query_shared_users(session, tuya_dev_id)
+            needle = str(member_code).strip()
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                rel = member.get("relationId") if member.get("relationId") is not None else member.get("id")
+                if rel is None:
+                    continue
+                candidate_fields = (
+                    member.get("userAccount"),
+                    member.get("username"),
+                    member.get("userName"),
+                    member.get("memberCode"),
+                    member.get("uid"),
+                    member.get("mobile"),
+                    member.get("account"),
+                    rel,
+                )
+                if any(val is not None and str(val).strip() == needle for val in candidate_fields):
+                    target_ids.append(int(rel))
+
+        revoked: List[int] = []
+        for rel_id in target_ids:
+            if tuya_client.revoke_device_share(session, tuya_dev_id, rel_id):
+                revoked.append(rel_id)
+        return revoked
+
+    def remove_device_share(
+        self,
+        tuya_dev_id: str,
+        member_code: str,
+        relation_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Revoke device share across both Tuya Home Cloud and Momcozy Cloud."""
+        revoked_relations: List[int] = []
+        try:
+            revoked_relations = self.remove_tuya_device_share(
+                tuya_dev_id=tuya_dev_id,
+                member_code=member_code,
+                relation_id=relation_id,
+            )
+            if revoked_relations:
+                logger.info(
+                    "Revoked Tuya Home share relation(s) %s for member %s on %s",
+                    revoked_relations,
+                    member_code,
+                    tuya_dev_id,
+                )
+        except Exception as exc:
+            logger.warning("Tuya Home Cloud share revocation warning: %s", exc)
+
+        momcozy_res = self.delete_device_share(tuya_dev_id, member_code)
+        return {
+            "device_id": tuya_dev_id,
+            "member_code": member_code,
+            "revoked_relation_ids": revoked_relations,
+            "momcozy": momcozy_res,
+        }
+
     def get_tuya_client(self) -> Any:
         """Get or initialize a TuyaGatewayClient configured for this account's region."""
         if self._tuya_client is not None:
             return self._tuya_client
-        from .tuya_cloud import TuyaGatewayClient
+        from .tuya_cloud import TuyaGatewayClient, resolve_tuya_region
 
-        # Map Tuya numeric region code ("33" -> "eu", "1" -> "us", "86" -> "cn") or account region
-        reg = "eu"
-        if self.tuya_creds and self.tuya_creds.region:
-            r = str(self.tuya_creds.region).lower()
-            if r in ("33", "eu"):
-                reg = "eu"
-            elif r in ("86", "cn"):
-                reg = "cn"
-            elif r in ("1", "us", "na"):
-                reg = "us"
-        elif self.region == "EU":
-            reg = "eu"
-        elif self.region in ("US", "NA"):
-            reg = "us"
-
+        reg = resolve_tuya_region(
+            tuya_region=self.tuya_creds.region if self.tuya_creds else None,
+            account_region=self.region,
+            default="eu",
+        )
         self._tuya_client = TuyaGatewayClient(region=reg)
         return self._tuya_client
 
     def update_tuya_session(self, session: Any, path: Optional[Path | str] = None) -> None:
         """Update and persist cached Tuya session credentials."""
-        if hasattr(session, "to_dict"):
-            sess_dict = session.to_dict()
-        elif hasattr(session, "sid") and hasattr(session, "ecode"):
-            sess_dict = {
-                "sid": str(session.sid),
-                "ecode": str(session.ecode),
-                "uid": str(getattr(session, "uid", "")),
-                "device_fingerprint": str(getattr(session, "device_fingerprint", "") or ("a" * 44)),
-            }
-        elif isinstance(session, dict):
-            sess_dict = dict(session)
-        else:
+        from .tuya_cloud import TuyaSession
+
+        coerced = TuyaSession.coerce(
+            session,
+            default_uid=self.tuya_creds.uid if self.tuya_creds else "",
+        )
+        if coerced is None:
             return
+        sess_dict = coerced.to_dict()
         self.tuya_session = sess_dict
-        target_path = normalize_config_path(path or self._config_path) if (path or self._config_path) else None
-        if target_path and target_path.exists():
-            try:
-                data = json.loads(target_path.read_text())
-                data["tuya_session"] = sess_dict
-                target_path.write_text(json.dumps(data, indent=2))
-                os.chmod(target_path, 0o600)
-                logger.debug("Persisted updated Tuya session to %s", target_path)
-            except Exception as e:
-                logger.warning("Failed to persist updated Tuya session to %s: %s", target_path, e)
+        raw_target = path or self._config_path
+        if raw_target:
+            target_path = normalize_config_path(raw_target)
+            if target_path.exists():
+                try:
+                    ConfigStore.update(target_path, {"tuya_session": sess_dict}, create=False)
+                    logger.debug("Persisted updated Tuya session to %s", target_path)
+                except Exception as e:
+                    logger.warning("Failed to persist updated Tuya session to %s: %s", target_path, e)
 
     def get_active_tuya_session(self, tuya_client: Optional[Any] = None) -> Any:
         """Return valid TuyaSession, reusing cached session or performing login if needed."""
@@ -494,6 +532,8 @@ class MomcozyCloudApi:
         if not self.tuya_creds or not self.tuya_creds.token:
             raise RuntimeError("No Tuya credentials available (UID or token missing). Please run './momcozy.py login'.")
 
+        from .tuya_cloud import is_tuya_session_expired_error
+
         tuya_client = self.get_tuya_client()
         session = self.get_active_tuya_session(tuya_client)
         home_id = self.tuya_home_id
@@ -503,7 +543,7 @@ class MomcozyCloudApi:
                 home_id = tuya_client.get_home_id(session)
                 self.tuya_home_id = home_id
             except Exception as exc:
-                if any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID")):
+                if is_tuya_session_expired_error(exc):
                     session_expired = True
                 else:
                     logger.warning("Could not determine Tuya home ID (checking shared devices): %s", exc)
@@ -524,7 +564,7 @@ class MomcozyCloudApi:
         try:
             devs = tuya_client.get_all_devices(session, home_id=home_id, known_device_ids=known_device_ids)
         except Exception as exc:
-            if not session_expired and any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID")):
+            if not session_expired and is_tuya_session_expired_error(exc):
                 logger.debug("Tuya session expired during get_all_devices, re-authenticating...")
                 session = tuya_client.login_with_uid(
                     country_code=self.tuya_creds.region,
@@ -564,12 +604,7 @@ class MomcozyCloudApi:
         results: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
 
-        saved_cfg: Dict[str, Any] = {}
-        if config_path and Path(config_path).exists():
-            try:
-                saved_cfg = json.loads(Path(config_path).read_text())
-            except Exception:
-                pass
+        saved_cfg: Dict[str, Any] = ConfigStore.read(config_path) if config_path else {}
 
         # 1. Query Momcozy devices
         momcozy_devs: List[Dict[str, Any]] = []
@@ -649,38 +684,43 @@ class MomcozyCloudApi:
         cfg_p = normalize_config_path(config_path) if config_path else None
         if cfg_p and cfg_p.exists() and results:
             try:
-                saved = json.loads(cfg_p.read_text())
-                primary_id = saved.get("device_id")
-                matched = None
-                if primary_id and primary_id in results:
-                    matched = results[primary_id]
-                elif len(results) == 1:
-                    matched = next(iter(results.values()))
-                    saved["device_id"] = matched["device_id"]
-                elif results:
-                    matched = next(
-                        (item for item in results.values() if item.get("local_key")),
-                        next(iter(results.values())),
-                    )
-                    if not primary_id:
+                def _apply_sync(saved: Dict[str, Any]) -> bool:
+                    primary_id = saved.get("device_id")
+                    matched = None
+                    if primary_id and primary_id in results:
+                        matched = results[primary_id]
+                    elif len(results) == 1:
+                        matched = next(iter(results.values()))
+                        if primary_id and len(str(primary_id)) == 36 and "-" in str(primary_id):
+                            saved.setdefault("client_install_id", primary_id)
                         saved["device_id"] = matched["device_id"]
+                    elif results:
+                        matched = next(
+                            (item for item in results.values() if item.get("local_key")),
+                            next(iter(results.values())),
+                        )
+                        if not primary_id or (len(str(primary_id)) == 36 and "-" in str(primary_id)):
+                            if primary_id:
+                                saved.setdefault("client_install_id", primary_id)
+                            saved["device_id"] = matched["device_id"]
 
-                if matched:
-                    if matched.get("local_key"):
-                        saved["local_key"] = matched["local_key"]
-                    if matched.get("name"):
-                        saved["camera_name"] = matched["name"]
-                    if matched.get("mac") and not saved.get("mac"):
-                        saved["mac"] = matched["mac"]
-                    if matched.get("ip") and self._is_private_lan_ip(matched["ip"]) and not saved.get("ip"):
-                        saved["ip"] = matched["ip"]
-                    if matched.get("dps"):
-                        saved["dps"] = matched["dps"]
+                    if matched:
+                        if matched.get("local_key"):
+                            saved["local_key"] = matched["local_key"]
+                        if matched.get("name"):
+                            saved["camera_name"] = matched["name"]
+                        if matched.get("mac") and not saved.get("mac"):
+                            saved["mac"] = matched["mac"]
+                        if matched.get("ip") and self._is_private_lan_ip(matched["ip"]) and not saved.get("ip"):
+                            saved["ip"] = matched["ip"]
+                        if matched.get("dps"):
+                            saved["dps"] = matched["dps"]
 
-                if self.tuya_home_id and isinstance(saved.get("tuya"), dict):
-                    saved["tuya"]["home_id"] = self.tuya_home_id
+                    if self.tuya_home_id and isinstance(saved.get("tuya"), dict):
+                        saved["tuya"]["home_id"] = self.tuya_home_id
+                    return True
 
-                cfg_p.write_text(json.dumps(saved, indent=2))
+                ConfigStore.mutate(cfg_p, _apply_sync, create=False)
                 logger.debug("Saved synchronized device info to %s", cfg_p)
             except Exception as exc:
                 logger.warning("Could not write synced device info to config: %s", exc)
@@ -746,49 +786,53 @@ class MomcozyCloudApi:
         }
 
     def save_session(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
-        """Save credentials to disk."""
+        """Save credentials to disk while preserving existing device keys and settings."""
         path = normalize_config_path(path)
-        existing: Dict[str, Any] = {}
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text())
-            except Exception:
-                pass
 
-        tuya_payload = None
-        if self.tuya_creds:
-            tuya_payload = {
-                "region": self.tuya_creds.region,
-                "uid": self.tuya_creds.uid,
-                "token": self.tuya_creds.token,
-            }
-            if self.tuya_home_id:
-                tuya_payload["home_id"] = self.tuya_home_id
+        def _apply_session(data: Dict[str, Any]) -> bool:
+            existing_tuya = data.get("tuya") if isinstance(data.get("tuya"), dict) else {}
+            tuya_payload = None
+            if self.tuya_creds:
+                tuya_payload = {
+                    "region": self.tuya_creds.region,
+                    "uid": self.tuya_creds.uid,
+                    "token": self.tuya_creds.token,
+                }
+                home_id = self.tuya_home_id
+                if not home_id and existing_tuya.get("uid") == self.tuya_creds.uid:
+                    home_id = existing_tuya.get("home_id")
+                if home_id:
+                    tuya_payload["home_id"] = home_id
 
-        payload = {
-            "email": self.email,
-            "token": self.token,
-            "refresh_token": self.refresh_token,
-            "user_uid": self.user_uid,
-            "device_id": self.device_id,
-            "country_code": self.country_code,
-            "country_name": self.country_name,
-            "region": self.region,
-            "tuya": tuya_payload,
-        }
-        tuya_sess = self.tuya_session or (
-            existing.get("tuya_session") if isinstance(existing.get("tuya_session"), dict) else None
-        )
-        if tuya_sess:
-            payload["tuya_session"] = tuya_sess
+            existing_dev_id = data.get("device_id")
+            self_is_uuid = bool(self.device_id and len(str(self.device_id)) == 36 and "-" in str(self.device_id))
+            existing_is_camera_id = bool(
+                existing_dev_id and not (len(str(existing_dev_id)) == 36 and "-" in str(existing_dev_id))
+            )
+            if existing_is_camera_id and self_is_uuid:
+                data["client_install_id"] = self.device_id
+                resolved_dev_id = existing_dev_id
+            else:
+                resolved_dev_id = self.device_id
 
-        for k in ("ip", "dps", "timelapse_sync_night_vision"):
-            if k in existing and k not in payload:
-                payload[k] = existing[k]
+            data.update(
+                {
+                    "email": self.email,
+                    "token": self.token,
+                    "refresh_token": self.refresh_token,
+                    "user_uid": self.user_uid,
+                    "device_id": resolved_dev_id,
+                    "country_code": self.country_code,
+                    "country_name": self.country_name,
+                    "region": self.region,
+                    "tuya": tuya_payload,
+                }
+            )
+            if self.tuya_session:
+                data["tuya_session"] = self.tuya_session
+            return True
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2))
-        os.chmod(path, 0o600)
+        ConfigStore.mutate(path, _apply_session, create=True)
         self._config_path = str(path)
         logger.info("Saved Momcozy session to %s", path)
 
@@ -798,8 +842,10 @@ class MomcozyCloudApi:
         path = normalize_config_path(path)
         if not path.exists():
             return None
+        data = ConfigStore.read(path)
+        if not data:
+            return None
         try:
-            data = json.loads(path.read_text())
             client = cls(
                 device_id=data.get("device_id"),
                 country_code=data.get("country_code", "US"),
@@ -812,7 +858,7 @@ class MomcozyCloudApi:
             client.user_uid = data.get("user_uid")
             client._config_path = str(path)
             tuya_data = data.get("tuya")
-            if tuya_data:
+            if isinstance(tuya_data, dict):
                 client.tuya_creds = TuyaCredentials(
                     region=tuya_data.get("region", "NA"),
                     uid=tuya_data.get("uid", ""),

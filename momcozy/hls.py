@@ -16,10 +16,13 @@ import re
 import select
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+from .hwaccel import detect_vaapi_device
 
 if TYPE_CHECKING:
     from .stream import VideoStreamer
@@ -48,7 +51,12 @@ class HlsTranscoder:
         vaapi_device: Optional[str] = None,
     ) -> None:
         self.streamer = streamer
-        self.output_dir = Path(output_dir or "/tmp/momcozy_hls")
+        self._owns_output_dir = output_dir is None
+        self.output_dir = (
+            Path(tempfile.mkdtemp(prefix="momcozy_hls_"))
+            if output_dir is None
+            else Path(output_dir)
+        )
         self.hls_time = hls_time
         self.hls_list_size = hls_list_size
         self.idle_timeout = idle_timeout
@@ -63,6 +71,7 @@ class HlsTranscoder:
         self._stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
         self._feed_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
+        self._stream_lease: Optional[Any] = None
         self._last_access = time.monotonic()
         self._lock = asyncio.Lock()
         self._using_vaapi = False
@@ -88,23 +97,7 @@ class HlsTranscoder:
 
     def _detect_vaapi_device(self) -> Optional[str]:
         """Detect available VA-API device path, or None if unavailable or disabled."""
-        if self.hwaccel in ("none", "cpu", "disabled", "false", "0"):
-            return None
-
-        # Check explicit device configuration
-        if self.vaapi_device:
-            if Path(self.vaapi_device).exists() or self.hwaccel in ("vaapi", "force"):
-                return self.vaapi_device
-
-        # Standard Linux DRM render nodes
-        for dev in ("/dev/dri/renderD128", "/dev/dri/card0"):
-            if Path(dev).exists():
-                return dev
-
-        if self.hwaccel in ("vaapi", "force"):
-            return "/dev/dri/renderD128"
-
-        return None
+        return detect_vaapi_device(hwaccel=self.hwaccel, vaapi_device=self.vaapi_device)
 
     def _build_cmd(
         self,
@@ -179,9 +172,6 @@ class HlsTranscoder:
         """Spawn FFmpeg process, attempting VA-API hardware acceleration first with software fallback."""
         vaapi_dev = self._detect_vaapi_device()
         env = os.environ.copy()
-        if "LIBVA_DRIVER_NAME" not in env:
-            # Intel Pentium G3220 (Haswell Gen 7.5) uses i965 driver
-            env["LIBVA_DRIVER_NAME"] = "i965"
 
         self._using_vaapi = False
         self._process = None
@@ -249,11 +239,18 @@ class HlsTranscoder:
                 logger.error("FFmpeg not found. Cannot start HLS transcoder.")
                 return False
 
+            acquire_fn = getattr(self.streamer, "acquire", None)
+            if callable(acquire_fn) and self._stream_lease is None:
+                self._stream_lease = acquire_fn()
+
             if not self.streamer.is_running:
                 logger.info("Starting VideoStreamer for HLS stream...")
                 await self.streamer.start()
 
-            self.output_dir.mkdir(parents=True, exist_ok=True)
+            if self._owns_output_dir and not self.output_dir.exists():
+                self.output_dir = Path(tempfile.mkdtemp(prefix="momcozy_hls_"))
+            else:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
             self._cleanup_files()
 
             playlist_path = self.output_dir / "stream.m3u8"
@@ -261,6 +258,7 @@ class HlsTranscoder:
 
             ok = await self._start_ffmpeg_process(playlist_path, segment_pattern)
             if not ok:
+                self._release_stream_lease()
                 return False
 
             self._running = True
@@ -282,6 +280,16 @@ class HlsTranscoder:
             self._idle_task = loop.create_task(self._idle_monitor_task())
 
             return True
+
+    def _release_stream_lease(self) -> None:
+        if self._stream_lease is not None:
+            release_fn = getattr(self.streamer, "release", None)
+            if callable(release_fn):
+                try:
+                    release_fn(self._stream_lease)
+                except Exception:
+                    pass
+            self._stream_lease = None
 
     def _writer_worker(self) -> None:
         """Worker thread pushing raw HEVC chunks into FFmpeg stdin pipe with non-blocking I/O."""
@@ -337,17 +345,30 @@ class HlsTranscoder:
                     return
 
     async def _feed_frames_task(self) -> None:
-        """Read raw HEVC chunks from VideoStreamer and enqueue for FFmpeg."""
+        """Read raw HEVC chunks from VideoStreamer and enqueue for FFmpeg with keyframe resync."""
+        need_keyframe = False
         try:
-            async for chunk, is_key in self.streamer.subscribe_hevc():
+            try:
+                stream_iter = self.streamer.subscribe_hevc(leased=False)
+            except TypeError:
+                stream_iter = self.streamer.subscribe_hevc()
+            async for chunk, is_key in stream_iter:
                 if not self._running:
                     break
-                try:
-                    if self._queue.full():
+                if need_keyframe:
+                    if not is_key:
+                        continue
+                    need_keyframe = False
+                if self._queue.full():
+                    while not self._queue.empty():
                         try:
                             self._queue.get_nowait()
                         except queue.Empty:
-                            pass
+                            break
+                    if not is_key:
+                        need_keyframe = True
+                        continue
+                try:
                     self._queue.put_nowait(chunk)
                 except Exception:
                     pass
@@ -370,67 +391,72 @@ class HlsTranscoder:
 
     async def stop(self) -> None:
         """Stop FFmpeg process and clean up temporary files without blocking event loop."""
-        self._running = False
-        self._using_vaapi = False
+        async with self._lock:
+            self._running = False
+            self._using_vaapi = False
 
-        if self._feed_task and not self._feed_task.done():
-            self._feed_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._feed_task
-        self._feed_task = None
+            curr_task = asyncio.current_task()
+            if self._feed_task and self._feed_task is not curr_task and not self._feed_task.done():
+                self._feed_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._feed_task
+            self._feed_task = None
 
-        if self._idle_task and not self._idle_task.done():
-            self._idle_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._idle_task
-        self._idle_task = None
+            if self._idle_task and self._idle_task is not curr_task and not self._idle_task.done():
+                self._idle_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._idle_task
+            self._idle_task = None
 
-        proc = self._process
-        self._process = None
+            proc = self._process
+            self._process = None
 
-        # Terminate FFmpeg process first to unblock pipes immediately
-        if proc:
+            # Terminate FFmpeg process first to unblock pipes immediately
+            if proc:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+                if proc.stdin:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+
+                if proc.stderr:
+                    try:
+                        proc.stderr.close()
+                    except Exception:
+                        pass
+
+                try:
+                    await asyncio.to_thread(proc.wait, timeout=2.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            # Signal writer thread to exit
             try:
-                proc.terminate()
+                self._queue.put_nowait(None)
             except Exception:
                 pass
 
-            if proc.stdin:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+            if self._writer_thread and self._writer_thread.is_alive():
+                await asyncio.to_thread(self._writer_thread.join, 1.0)
+            self._writer_thread = None
 
-            if proc.stderr:
-                try:
-                    proc.stderr.close()
-                except Exception:
-                    pass
+            if self._stderr_thread and self._stderr_thread.is_alive():
+                await asyncio.to_thread(self._stderr_thread.join, 1.0)
+            self._stderr_thread = None
 
-            try:
-                await asyncio.to_thread(proc.wait, timeout=2.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-        # Signal writer thread to exit
-        try:
-            self._queue.put_nowait(None)
-        except Exception:
-            pass
-
-        if self._writer_thread and self._writer_thread.is_alive():
-            await asyncio.to_thread(self._writer_thread.join, 1.0)
-        self._writer_thread = None
-
-        if self._stderr_thread and self._stderr_thread.is_alive():
-            await asyncio.to_thread(self._stderr_thread.join, 1.0)
-        self._stderr_thread = None
-
-        self._cleanup_files()
-        logger.info("HLS transcoder stopped and cleaned up.")
+            self._cleanup_files()
+            if self._owns_output_dir and self.output_dir.exists():
+                shutil.rmtree(self.output_dir, ignore_errors=True)
+            self._release_stream_lease()
+            logger.info("HLS transcoder stopped and cleaned up.")
 
     def _cleanup_files(self) -> None:
         """Remove leftover .m3u8 and .ts files."""
