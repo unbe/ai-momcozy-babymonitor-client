@@ -1,4 +1,4 @@
-FROM python:3.13-slim-trixie
+FROM python:3.15-slim-trixie
 
 # Install system dependencies required for OpenCV, PyAV (FFmpeg), VA-API hardware acceleration, and health checks.
 # Note: i965-va-driver-shaders (in non-free on amd64) provides the encoding shaders required for Intel Haswell Gen 7.5.
