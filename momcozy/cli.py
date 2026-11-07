@@ -172,16 +172,54 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
 
     import time as _time
 
+    from .tuya_cloud import TuyaSession
+    tuya_session_data = saved.get("tuya_session")
+    initial_tuya_session = TuyaSession.from_dict(tuya_session_data) if isinstance(tuya_session_data, dict) else None
+
     _dps_cache: dict = {
         "ts": 0.0,
         "dps": saved.get("dps") if isinstance(saved.get("dps"), dict) else {},
-        "session": None,
+        "session": initial_tuya_session,
         "client": None,
         "last_auth_attempt": 0.0,
         "auth_failure_count": 0,
         "auth_backoff": 15.0,
         "fatal_auth_error": False,
+        "streamer": None,
     }
+
+    def _save_tuya_session(session: Any) -> None:
+        if not config_path.exists():
+            return
+        if hasattr(session, "to_dict"):
+            sess_dict = session.to_dict()
+        elif hasattr(session, "sid") and hasattr(session, "ecode"):
+            sess_dict = {
+                "sid": str(session.sid),
+                "ecode": str(session.ecode),
+                "uid": str(getattr(session, "uid", tuya_uid or "")),
+                "device_fingerprint": str(getattr(session, "device_fingerprint", "a" * 44)),
+            }
+        elif isinstance(session, dict):
+            sess_dict = dict(session)
+        else:
+            return
+        ts_obj = TuyaSession.from_dict(sess_dict)
+        if ts_obj:
+            _dps_cache["session"] = ts_obj
+            if _dps_cache.get("streamer"):
+                try:
+                    _dps_cache["streamer"].update_session(ts_obj)
+                except Exception:
+                    pass
+        try:
+            cfg = json.loads(config_path.read_text())
+            cfg["tuya_session"] = sess_dict
+            config_path.write_text(json.dumps(cfg, indent=2))
+            os.chmod(config_path, 0o600)
+            logger.debug("Saved persistent Tuya session to %s", config_path)
+        except Exception as exc:
+            logger.warning("Could not persist Tuya session to config %s: %s", config_path, exc)
 
     def _is_rate_limit_error(exc: Exception) -> bool:
         err_str = str(exc)
@@ -269,18 +307,24 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     token=api_inst.tuya_creds.token,
                 )
                 _dps_cache["session"] = t_session
+                _save_tuya_session(t_session)
                 _record_tuya_auth_success()
             except Exception as exc:
                 _record_tuya_auth_failure(exc, now)
                 return _dps_cache["dps"]
 
+        session_expired = False
         try:
             info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
         except Exception as exc:
-            logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
-            info = None
+            if any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID", "TOKEN_INVALID", "USER_SESSION_HAS_EXPIRED", "PERMISSION_DENIED")):
+                logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
+                session_expired = True
+            else:
+                logger.warning("Tuya get_device_info error: %s", exc)
+                info = None
 
-        if info is None:
+        if session_expired:
             if not _can_attempt_tuya_auth(now):
                 return _dps_cache["dps"]
             _dps_cache["last_auth_attempt"] = now
@@ -291,6 +335,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     token=api_inst.tuya_creds.token,
                 )
                 _dps_cache["session"] = t_session
+                _save_tuya_session(t_session)
                 _record_tuya_auth_success()
                 info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
             except Exception as exc:
@@ -325,6 +370,7 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     token=api_inst.tuya_creds.token,
                 )
                 _dps_cache["session"] = t_session
+                _save_tuya_session(t_session)
                 _record_tuya_auth_success()
             except Exception as exc:
                 _record_tuya_auth_failure(exc, now)
@@ -332,23 +378,27 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         try:
             return t_client.publish_dps(t_session, dev_id, dps_dict)
         except Exception as exc:
-            logger.debug("Cloud publish_dps failed, refreshing session: %s", exc)
-            if not _can_attempt_tuya_auth(now):
-                return False
-            _dps_cache["last_auth_attempt"] = now
-            try:
-                t_session = t_client.login_with_uid(
-                    country_code=api_inst.tuya_creds.region,
-                    uid=api_inst.tuya_creds.uid,
-                    token=api_inst.tuya_creds.token,
-                )
-                _dps_cache["session"] = t_session
-                _record_tuya_auth_success()
-                return t_client.publish_dps(t_session, dev_id, dps_dict)
-            except Exception as auth_exc:
-                _record_tuya_auth_failure(auth_exc, now)
-                _dps_cache["session"] = None
-                return False
+            if any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID", "TOKEN_INVALID", "USER_SESSION_HAS_EXPIRED", "PERMISSION_DENIED")):
+                logger.debug("Cloud publish_dps session expired, refreshing session: %s", exc)
+                if not _can_attempt_tuya_auth(now):
+                    return False
+                _dps_cache["last_auth_attempt"] = now
+                try:
+                    t_session = t_client.login_with_uid(
+                        country_code=api_inst.tuya_creds.region,
+                        uid=api_inst.tuya_creds.uid,
+                        token=api_inst.tuya_creds.token,
+                    )
+                    _dps_cache["session"] = t_session
+                    _save_tuya_session(t_session)
+                    _record_tuya_auth_success()
+                    return t_client.publish_dps(t_session, dev_id, dps_dict)
+                except Exception as auth_exc:
+                    _record_tuya_auth_failure(auth_exc, now)
+                    _dps_cache["session"] = None
+                    return False
+            logger.warning("Cloud publish_dps error: %s", exc)
+            return False
 
     def _on_ip_discovered(new_ip: str) -> None:
         if config_path.exists():
@@ -375,7 +425,11 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         cloud_dp_publisher=_publish_cloud_dps if (tuya_uid and tuya_token) else None,
         initial_dps=saved.get("dps") if isinstance(saved.get("dps"), dict) else None,
         on_ip_discovered=_on_ip_discovered,
+        tuya_session=_dps_cache["session"],
+        save_tuya_session=_save_tuya_session,
     )
+    monitor._dps_cache = _dps_cache
+    return monitor
 
 
 def cmd_login(args: argparse.Namespace) -> None:
@@ -641,6 +695,8 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
         tuya_uid=monitor.stream_tuya_uid,
         tuya_token=monitor.stream_tuya_token,
         tuya_region=monitor.stream_tuya_region,
+        session=monitor.tuya_session,
+        on_session_updated=monitor.save_tuya_session,
     )
     print(f"Connecting to {monitor.device_id} to capture snapshot...")
     try:
@@ -666,6 +722,8 @@ def cmd_record(args: argparse.Namespace) -> None:
         tuya_uid=monitor.stream_tuya_uid,
         tuya_token=monitor.stream_tuya_token,
         tuya_region=monitor.stream_tuya_region,
+        session=monitor.tuya_session,
+        on_session_updated=monitor.save_tuya_session,
     )
     print(f"Recording {args.duration}s clip from {monitor.device_id} to {args.output}...")
     try:
@@ -705,7 +763,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
             tuya_token=monitor.stream_tuya_token,
             tuya_region=monitor.stream_tuya_region,
             idle_timeout=idle_timeout,
+            session=monitor.tuya_session,
+            on_session_updated=monitor.save_tuya_session,
         )
+        if hasattr(monitor, "_dps_cache") and isinstance(monitor._dps_cache, dict):
+            monitor._dps_cache["streamer"] = streamer
 
     ssl_context = None
     ssl_flag = getattr(args, "ssl", False) or bool(os.environ.get("MOMCOZY_SSL"))

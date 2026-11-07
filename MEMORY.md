@@ -209,11 +209,19 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * When `timelapse/` files (`slot_*.hevc` or `meta.json`) are restored, copied, or modified from the host filesystem while the server is running, `_sync_meta_if_changed()` automatically detects the changes on disk (tracking `meta.json` modification time and slot file presence) and re-evaluates slots without requiring a server restart.
     * If `meta.json` was omitted or contains 0-frame entries during restore, `_load_meta` and `get_status` automatically reconcile against actual `slot_*.hevc` files on disk, approximating frame counts from file sizes (`max(1, size // 35000)`) and computing valid slot durations.
     * `has_content` in `get_status()` aligns with `self.has_content` (verifying whether valid slot files exist on disk), ensuring UI buttons (like `[▶ Watch]` and `[🗑️ Erase]`) enable as expected.
-* **Tuya Cloud Authentication & Rate Limit Backoff:**
+* **Tuya Cloud Authentication, Rate Limit Backoff & Session Reuse:**
   * **Telemetry (`_fetch_cloud_dps`):**
     * When local LAN control is unreachable, status polling queries Tuya Cloud. Previously, failed auth retried every 15 seconds unconditionally, hammering Tuya's login endpoint.
     * Implemented backoff tracking in `_dps_cache`: on generic auth errors (`LOGIN_TOKEN_FAILED`, `PERMISSION_DENIED`), backoff escalates exponentially (30s -> 60s -> 300s -> 900s).
     * On `USER_SESSION_LIMIT` ("You have loged in too many times today"), backoff starts at 30 minutes (1800s) up to 2 hours (7200s) to allow Tuya's rate-limit window to reset without burning requests.
+    * Re-authentication is restricted strictly to true session expiration/invalidation errors (`USER_SESSION_INVALID`, `NOT_EXISTS_SESSION`, `SIGN_INVALID`, `TOKEN_INVALID`, `USER_SESSION_HAS_EXPIRED`, `PERMISSION_DENIED`), avoiding burn-down on generic network timeouts or device offline errors.
+  * **Persistent Session Reuse Across Streamer Lifecycles (`tuya_session` in `.momcozy.json`):**
+    * Tuya sessions (`sid`, `ecode`, `uid`, `device_fingerprint`) are unified across `TuyaSession` and `AccountSession`, serialized to JSON, and persisted directly in `.momcozy.json` (`"tuya_session"`).
+    * **Eliminating Login on 5-Minute Night Vision Sampling:** Previously, idle night vision checks woke up every 5 minutes and tore down `TuyaIpcP2pClient`, triggering a fresh `smartlife.m.user.uid.password.login` call ~288 times/day and rapidly hitting Tuya's account rate limit (`USER_SESSION_LIMIT`).
+    * `VideoStreamer` retains its `_account_session` across `start()` and `stop()` cycles and pre-populates `client._account` in `create_p2p_client`.
+    * When `client.async_stream_config()` runs, `client.async_account()` returns the cached `AccountSession` immediately, executing zero login HTTP requests during idle checks and viewer connections.
+    * Whenever Tuya returns session expiration, the client re-authenticates once, fires `on_session_updated`, and updates both in-memory cache and `.momcozy.json`.
+    * Shared cross-component synchronization ensures telemetry polls (`_fetch_cloud_dps`, `_publish_cloud_dps`) and the video streamer share the same valid session without redundant logins.
   * **Video Streamer (`VideoStreamer._stream_loop`):**
     * Reconnect backoff differentiates between transient network glitches (up to 120s) and authentication/rate-limit failures.
     * On `USER_SESSION_LIMIT`, backoff escalates to 1800s–7200s (30m–2h). On token rejection (`LOGIN_TOKEN_FAILED`), backoff scales up to 900s (15m).

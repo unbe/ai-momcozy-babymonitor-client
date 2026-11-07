@@ -770,6 +770,8 @@ def create_p2p_client(
     tuya_uid: Optional[str] = None,
     tuya_token: Optional[str] = None,
     tuya_region: Optional[str] = None,
+    session: Optional[Any] = None,
+    on_session_updated: Optional[Callable[[Any], None]] = None,
 ) -> Any:
     """Create a TuyaIpcP2pClient configured with Momcozy OEM gateway credentials."""
     _configure_tuya_p2p_sdk()
@@ -807,6 +809,7 @@ def create_p2p_client(
             )
 
         async def async_login(self, email_arg: str, password_arg: str, cc_arg: str) -> AccountSession:
+            acc: AccountSession
             if tuya_uid and tuya_token:
                 uid_cc = str(tuya_region or cc_arg)
                 try:
@@ -846,14 +849,40 @@ def create_p2p_client(
                 except TuyaIpcP2pGatewayError as exc:
                     raise TuyaIpcP2pAuthenticationError(f"Failed to log in with Tuya UID: {exc}") from exc
 
-                return AccountSession(
+                acc = AccountSession(
                     sid=require_str(account, "sid"),
                     ecode=require_str(account, "ecode"),
                     uid=require_str(account, "uid"),
                     device_fingerprint=self._device_fingerprint,
                 )
+            else:
+                acc = await super().async_login(email_arg, password_arg, cc_arg)
 
-            return await super().async_login(email_arg, password_arg, cc_arg)
+            if on_session_updated:
+                try:
+                    on_session_updated(acc)
+                except Exception as exc:
+                    logger.warning("on_session_updated callback error: %s", exc)
+            return acc
+
+    account_session: Optional[AccountSession] = None
+    if session is not None:
+        if isinstance(session, AccountSession):
+            account_session = session
+        elif hasattr(session, "sid") and hasattr(session, "ecode"):
+            account_session = AccountSession(
+                sid=str(session.sid),
+                ecode=str(session.ecode),
+                uid=str(getattr(session, "uid", tuya_uid or "")),
+                device_fingerprint=str(getattr(session, "device_fingerprint", "a" * 44)),
+            )
+        elif isinstance(session, dict) and session.get("sid") and session.get("ecode"):
+            account_session = AccountSession(
+                sid=str(session["sid"]),
+                ecode=str(session["ecode"]),
+                uid=str(session.get("uid", tuya_uid or "")),
+                device_fingerprint=str(session.get("device_fingerprint", "a" * 44)),
+            )
 
     client = TuyaIpcP2pClient(
         email=email or (tuya_uid or ""),
@@ -862,6 +891,8 @@ def create_p2p_client(
         region=region,
     )
     client._gateway = MomcozyGatewayClient(region=region)
+    if account_session is not None:
+        client._account = account_session
     return client
 
 
@@ -895,6 +926,8 @@ class VideoStreamer:
         tuya_token: Optional[str] = None,
         tuya_region: Optional[str] = None,
         idle_timeout: float = 300.0,
+        session: Optional[Any] = None,
+        on_session_updated: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
@@ -906,6 +939,8 @@ class VideoStreamer:
         self.tuya_token = tuya_token
         self.tuya_region = tuya_region
         self.idle_timeout = float(idle_timeout)
+        self._account_session: Optional[Any] = session
+        self._on_session_updated_cb: Optional[Callable[[Any], None]] = on_session_updated
 
         self._running = False
         self._connected = False
@@ -933,6 +968,19 @@ class VideoStreamer:
         self._leases: Set[_Lease] = set()
         self._stop_deadline: float = 0.0
         self._lock = asyncio.Lock()
+
+    def update_session(self, session: Any) -> None:
+        """Update cached Tuya session credentials held by this streamer."""
+        self._account_session = session
+
+    def _on_session_refreshed(self, new_session: Any) -> None:
+        """Handle session refresh from SDK and trigger persistence callback."""
+        self._account_session = new_session
+        if self._on_session_updated_cb:
+            try:
+                self._on_session_updated_cb(new_session)
+            except Exception as exc:
+                logger.warning("VideoStreamer on_session_updated callback error: %s", exc)
 
     @property
     def is_running(self) -> bool:
@@ -1238,6 +1286,8 @@ class VideoStreamer:
                     tuya_uid=self.tuya_uid,
                     tuya_token=self.tuya_token,
                     tuya_region=self.tuya_region,
+                    session=self._account_session,
+                    on_session_updated=self._on_session_refreshed,
                 ) as client:
                     stream = client.create_camera_stream(self.device_id, self.local_key)
                     stream._is_transcoding_needed = self.is_transcoding_needed

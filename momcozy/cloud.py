@@ -121,7 +121,9 @@ class MomcozyCloudApi:
         self.email: Optional[str] = None
         self.tuya_creds: Optional[TuyaCredentials] = None
         self.tuya_home_id: Optional[int] = None
+        self.tuya_session: Optional[Dict[str, str]] = None
         self._tuya_client: Optional[Any] = None
+        self._config_path: Optional[str] = None
 
     def _headers(self, need_auth: bool = True) -> Dict[str, str]:
         headers = {
@@ -380,6 +382,53 @@ class MomcozyCloudApi:
         self._tuya_client = TuyaGatewayClient(region=reg)
         return self._tuya_client
 
+    def update_tuya_session(self, session: Any, path: Optional[Path | str] = None) -> None:
+        """Update and persist cached Tuya session credentials."""
+        if hasattr(session, "to_dict"):
+            sess_dict = session.to_dict()
+        elif hasattr(session, "sid") and hasattr(session, "ecode"):
+            sess_dict = {
+                "sid": str(session.sid),
+                "ecode": str(session.ecode),
+                "uid": str(getattr(session, "uid", "")),
+                "device_fingerprint": str(getattr(session, "device_fingerprint", "") or ("a" * 44)),
+            }
+        elif isinstance(session, dict):
+            sess_dict = dict(session)
+        else:
+            return
+        self.tuya_session = sess_dict
+        target_path = normalize_config_path(path or self._config_path or DEFAULT_CONFIG_PATH)
+        if target_path.exists():
+            try:
+                data = json.loads(target_path.read_text())
+                data["tuya_session"] = sess_dict
+                target_path.write_text(json.dumps(data, indent=2))
+                os.chmod(target_path, 0o600)
+                logger.debug("Persisted updated Tuya session to %s", target_path)
+            except Exception as e:
+                logger.warning("Failed to persist updated Tuya session to %s: %s", target_path, e)
+
+    def get_active_tuya_session(self, tuya_client: Optional[Any] = None) -> Any:
+        """Return valid TuyaSession, reusing cached session or performing login if needed."""
+        from .tuya_cloud import TuyaSession
+        if self.tuya_session:
+            sess = TuyaSession.from_dict(self.tuya_session)
+            if sess:
+                return sess
+        if not self.tuya_creds or not self.tuya_creds.token:
+            self.get_tuya_credentials()
+        if not self.tuya_creds or not self.tuya_creds.token:
+            raise RuntimeError("No Tuya credentials available (UID or token missing)")
+        t_client = tuya_client or self.get_tuya_client()
+        session = t_client.login_with_uid(
+            country_code=self.tuya_creds.region,
+            uid=self.tuya_creds.uid,
+            token=self.tuya_creds.token,
+        )
+        self.update_tuya_session(session)
+        return session
+
     def add_tuya_device_share(
         self,
         tuya_dev_id: str,
@@ -400,11 +449,7 @@ class MomcozyCloudApi:
             raise RuntimeError("No Tuya credentials available for Tuya Home sharing")
 
         tuya_client = self.get_tuya_client()
-        session = tuya_client.login_with_uid(
-            country_code=self.tuya_creds.region,
-            uid=self.tuya_creds.uid,
-            token=self.tuya_creds.token,
-        )
+        session = self.get_active_tuya_session(tuya_client)
 
         active_home_id = home_id or self.tuya_home_id
         if not active_home_id:
@@ -450,20 +495,46 @@ class MomcozyCloudApi:
             raise RuntimeError("No Tuya credentials available (UID or token missing). Please run './momcozy.py login'.")
 
         tuya_client = self.get_tuya_client()
-        session = tuya_client.login_with_uid(
-            country_code=self.tuya_creds.region,
-            uid=self.tuya_creds.uid,
-            token=self.tuya_creds.token,
-        )
+        session = self.get_active_tuya_session(tuya_client)
         home_id = self.tuya_home_id
+        session_expired = False
         if not home_id:
             try:
                 home_id = tuya_client.get_home_id(session)
                 self.tuya_home_id = home_id
             except Exception as exc:
-                logger.warning("Could not determine Tuya home ID (checking shared devices): %s", exc)
+                if any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID")):
+                    session_expired = True
+                else:
+                    logger.warning("Could not determine Tuya home ID (checking shared devices): %s", exc)
 
-        devs = tuya_client.get_all_devices(session, home_id=home_id, known_device_ids=known_device_ids)
+        if session_expired:
+            session = tuya_client.login_with_uid(
+                country_code=self.tuya_creds.region,
+                uid=self.tuya_creds.uid,
+                token=self.tuya_creds.token,
+            )
+            self.update_tuya_session(session)
+            try:
+                home_id = tuya_client.get_home_id(session)
+                self.tuya_home_id = home_id
+            except Exception:
+                pass
+
+        try:
+            devs = tuya_client.get_all_devices(session, home_id=home_id, known_device_ids=known_device_ids)
+        except Exception as exc:
+            if not session_expired and any(k in str(exc) for k in ("USER_SESSION_INVALID", "NOT_EXISTS_SESSION", "SIGN_INVALID")):
+                logger.debug("Tuya session expired during get_all_devices, re-authenticating...")
+                session = tuya_client.login_with_uid(
+                    country_code=self.tuya_creds.region,
+                    uid=self.tuya_creds.uid,
+                    token=self.tuya_creds.token,
+                )
+                self.update_tuya_session(session)
+                devs = tuya_client.get_all_devices(session, home_id=home_id, known_device_ids=known_device_ids)
+            else:
+                raise
         for d in devs:
             if isinstance(d, dict) and d.get("homeId") and (d.get("localKey") or d.get("devKey")):
                 self.tuya_home_id = int(d["homeId"])
@@ -677,6 +748,13 @@ class MomcozyCloudApi:
     def save_session(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
         """Save credentials to disk."""
         path = normalize_config_path(path)
+        existing: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except Exception:
+                pass
+
         tuya_payload = None
         if self.tuya_creds:
             tuya_payload = {
@@ -698,9 +776,20 @@ class MomcozyCloudApi:
             "region": self.region,
             "tuya": tuya_payload,
         }
+        tuya_sess = self.tuya_session or (
+            existing.get("tuya_session") if isinstance(existing.get("tuya_session"), dict) else None
+        )
+        if tuya_sess:
+            payload["tuya_session"] = tuya_sess
+
+        for k in ("ip", "dps", "timelapse_sync_night_vision"):
+            if k in existing and k not in payload:
+                payload[k] = existing[k]
+
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2))
         os.chmod(path, 0o600)
+        self._config_path = str(path)
         logger.info("Saved Momcozy session to %s", path)
 
     @classmethod
@@ -730,6 +819,8 @@ class MomcozyCloudApi:
                     token=tuya_data.get("token", ""),
                 )
                 client.tuya_home_id = tuya_data.get("home_id")
+            if isinstance(data.get("tuya_session"), dict):
+                client.tuya_session = data["tuya_session"]
             return client
         except Exception as e:
             logger.warning("Failed to load session from %s: %s", path, e)

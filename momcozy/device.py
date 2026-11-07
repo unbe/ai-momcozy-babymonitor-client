@@ -146,12 +146,16 @@ class MomcozyMonitor:
         cloud_dp_publisher: Optional[Callable[[Dict[str, Any]], bool]] = None,
         initial_dps: Optional[Dict[str, Any]] = None,
         on_ip_discovered: Optional[Callable[[str], None]] = None,
+        tuya_session: Optional[Any] = None,
+        save_tuya_session: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self.device_id = device_id
         self.local_key = local_key
         self.ip = ip
         self.version = version
         self.on_ip_discovered = on_ip_discovered
+        self.tuya_session = tuya_session
+        self.save_tuya_session = save_tuya_session
 
         # Video stream account details
         self.stream_email = stream_account_email

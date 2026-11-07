@@ -3314,6 +3314,153 @@ class TestStreamOptimizations(unittest.TestCase):
         streamer._listeners.add(q_full)
         self.assertTrue(streamer.is_full_rate_needed())
 
+    def test_tuya_session_serialization(self):
+        """Verify TuyaSession to_dict and from_dict roundtrip."""
+        from momcozy.tuya_cloud import TuyaSession
+        sess = TuyaSession(sid="sid123", ecode="ecode456", uid="uid789", device_fingerprint="fp999")
+        d = sess.to_dict()
+        self.assertEqual(d["sid"], "sid123")
+        self.assertEqual(d["ecode"], "ecode456")
+        self.assertEqual(d["uid"], "uid789")
+        self.assertEqual(d["device_fingerprint"], "fp999")
+
+        restored = TuyaSession.from_dict(d)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.sid, "sid123")
+        self.assertEqual(restored.ecode, "ecode456")
+        self.assertEqual(restored.uid, "uid789")
+        self.assertEqual(restored.device_fingerprint, "fp999")
+
+        self.assertIsNone(TuyaSession.from_dict({}))
+        self.assertIsNone(TuyaSession.from_dict("invalid"))
+
+    def test_cloud_api_tuya_session_persistence(self):
+        """Verify MomcozyCloudApi saves, updates, and restores tuya_session."""
+        import tempfile
+        from pathlib import Path
+        from momcozy.cloud import MomcozyCloudApi
+        from momcozy.tuya_cloud import TuyaSession
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / ".momcozy.json"
+            api = MomcozyCloudApi()
+            api.email = "test@example.com"
+            api.token = "token123"
+            api.tuya_session = {"sid": "s1", "ecode": "e1", "uid": "u1", "device_fingerprint": "fp1"}
+            api.save_session(cfg_path)
+
+            loaded = MomcozyCloudApi.load_session(cfg_path)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.tuya_session, {"sid": "s1", "ecode": "e1", "uid": "u1", "device_fingerprint": "fp1"})
+
+            # Update session
+            new_sess = TuyaSession(sid="s2", ecode="e2", uid="u2", device_fingerprint="fp2")
+            loaded.update_tuya_session(new_sess, cfg_path)
+            self.assertEqual(loaded.tuya_session["sid"], "s2")
+
+            reloaded = MomcozyCloudApi.load_session(cfg_path)
+            self.assertEqual(reloaded.tuya_session["sid"], "s2")
+            self.assertEqual(reloaded.tuya_session["ecode"], "e2")
+
+    def test_cloud_api_get_active_tuya_session_reuse(self):
+        """Verify get_active_tuya_session reuses cached session without calling login_with_uid."""
+        from unittest.mock import MagicMock
+        from momcozy.cloud import MomcozyCloudApi, TuyaCredentials
+
+        api = MomcozyCloudApi()
+        api.tuya_creds = TuyaCredentials(region="33", uid="u1", token="t1")
+        mock_tclient = MagicMock()
+
+        # 1. With cached session
+        api.tuya_session = {"sid": "cached_s", "ecode": "cached_e", "uid": "u1", "device_fingerprint": "fp"}
+        sess = api.get_active_tuya_session(mock_tclient)
+        self.assertEqual(sess.sid, "cached_s")
+        mock_tclient.login_with_uid.assert_not_called()
+
+        # 2. Without cached session -> calls login_with_uid
+        api.tuya_session = None
+        from momcozy.tuya_cloud import TuyaSession
+        mock_tclient.login_with_uid.return_value = TuyaSession(sid="fresh_s", ecode="fresh_e", uid="u1")
+        fresh_sess = api.get_active_tuya_session(mock_tclient)
+        self.assertEqual(fresh_sess.sid, "fresh_s")
+        mock_tclient.login_with_uid.assert_called_once()
+        self.assertEqual(api.tuya_session["sid"], "fresh_s")
+
+    def test_create_p2p_client_session_reuse(self):
+        """Verify create_p2p_client pre-populates _account and async_account does not call gateway async_login."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from momcozy.stream import create_p2p_client
+        from tuya_ipc_p2p_sdk.models import AccountSession
+
+        cached = AccountSession(sid="cached_sid", ecode="cached_ecode", uid="cached_uid", device_fingerprint="fp1")
+        on_updated_mock = MagicMock()
+        client = create_p2p_client(
+            tuya_uid="uid1",
+            tuya_token="tok1",
+            session=cached,
+            on_session_updated=on_updated_mock,
+        )
+        self.assertIsNotNone(client._account)
+        self.assertEqual(client._account.sid, "cached_sid")
+
+        # async_account returns cached session without invoking gateway login
+        client._gateway.async_login = AsyncMock()
+        ret = asyncio.run(client.async_account())
+        self.assertEqual(ret.sid, "cached_sid")
+        client._gateway.async_login.assert_not_called()
+
+    def test_create_p2p_client_session_updated_callback(self):
+        """Verify on_session_updated callback is triggered when async_login executes."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from momcozy.stream import create_p2p_client
+        from tuya_ipc_p2p_sdk.models import AccountSession
+
+        updates = []
+        client = create_p2p_client(
+            tuya_uid="uid1",
+            tuya_token="tok1",
+            on_session_updated=lambda s: updates.append(s),
+        )
+        # Mock gateway call object for token and login
+        rsa_n = "165256793464329888032818564618034239832126231826359557430864748421597350661271117306907853262771889451067939668221674096394589474018194165346658182980871721103918278367187267249387469306294083054327209045854461486623500042046249911664454588355119414358044668319815236208994331675895149218003259947699886240389"
+        client._gateway._async_call_object = AsyncMock(side_effect=[
+            {"publicKey": rsa_n, "exponent": "65537", "token": "rsa_tok"},
+            {"sid": "new_sid", "ecode": "new_ecode", "uid": "uid1"},
+        ])
+        ret = asyncio.run(client.async_login())
+        self.assertEqual(ret.sid, "new_sid")
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].sid, "new_sid")
+
+    def test_video_streamer_account_session_persistence_across_starts(self):
+        """Verify VideoStreamer preserves _account_session across start/stop cycles."""
+        from momcozy.stream import VideoStreamer
+        from tuya_ipc_p2p_sdk.models import AccountSession
+
+        initial_session = AccountSession(sid="init_sid", ecode="init_ecode", uid="u1", device_fingerprint="fp")
+        updated_sessions = []
+        streamer = VideoStreamer(
+            device_id="dev1",
+            local_key="key1",
+            session=initial_session,
+            on_session_updated=lambda s: updated_sessions.append(s),
+        )
+        self.assertEqual(streamer._account_session.sid, "init_sid")
+
+        # Simulate session refresh
+        refreshed = AccountSession(sid="refr_sid", ecode="refr_ecode", uid="u1", device_fingerprint="fp")
+        streamer._on_session_refreshed(refreshed)
+        self.assertEqual(streamer._account_session.sid, "refr_sid")
+        self.assertEqual(len(updated_sessions), 1)
+        self.assertEqual(updated_sessions[0].sid, "refr_sid")
+
+        # update_session directly
+        manual = AccountSession(sid="man_sid", ecode="man_ecode", uid="u1", device_fingerprint="fp")
+        streamer.update_session(manual)
+        self.assertEqual(streamer._account_session.sid, "man_sid")
+
 
 if __name__ == "__main__":
     unittest.main()

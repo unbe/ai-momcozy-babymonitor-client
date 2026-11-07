@@ -158,6 +158,31 @@ class TuyaSession:
     uid: str
     device_fingerprint: str = DEFAULT_DEVICE_FINGERPRINT
 
+    def to_dict(self) -> Dict[str, str]:
+        """Convert session to JSON-serializable dictionary."""
+        return {
+            "sid": self.sid,
+            "ecode": self.ecode,
+            "uid": self.uid,
+            "device_fingerprint": self.device_fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional[TuyaSession]:
+        """Restore TuyaSession from dictionary if valid."""
+        if not isinstance(data, dict):
+            return None
+        sid = data.get("sid")
+        ecode = data.get("ecode")
+        if not sid or not ecode:
+            return None
+        return cls(
+            sid=str(sid),
+            ecode=str(ecode),
+            uid=str(data.get("uid", "")),
+            device_fingerprint=str(data.get("device_fingerprint") or DEFAULT_DEVICE_FINGERPRINT),
+        )
+
 
 class TuyaGatewayClient:
     """Synchronous Tuya Smart Home Gateway client for Momcozy OEM Tuya SDK."""
