@@ -633,8 +633,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div class="card">
         <h2>📸 Detection Snapshot <span class="badge" id="detect-badge">Event Log</span></h2>
         <div style="position:relative; width:100%; aspect-ratio:16/9; background:#1A202C; border-radius:8px; overflow:hidden; margin:8px 0 12px 0; display:flex; align-items:center; justify-content:center; box-shadow: inset 0 2px 4px rgba(0,0,0,0.3);">
-          <img id="detect-img" src="/detection_snapshot.jpg" alt="Latest Detection Snapshot" style="width:100%; height:100%; object-fit:contain; cursor:pointer;" onclick="viewFullDetectSnapshot()" title="Click to view full size">
-          <div id="detect-empty" style="display:none; color:#A0AEC0; font-size:0.85rem; text-align:center; padding:12px;">No detection event recorded yet</div>
+          <img id="detect-img" src="" alt="Latest Detection Snapshot" style="width:100%; height:100%; object-fit:contain; cursor:pointer; display:none;" onclick="viewFullDetectSnapshot()" title="Click to view full size">
+          <div id="detect-empty" style="color:#A0AEC0; font-size:0.85rem; text-align:center; padding:12px;">No detection event recorded yet</div>
         </div>
         <div class="control-row">
           <span>Trigger Event</span>
@@ -1435,10 +1435,29 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             fileEl.title = `${d.latest_event_bucket || 'cloud'}: ${d.latest_event_file}`;
           }
         }
-        if (d.detection_time && d.detection_time !== lastDetectTime) {
+        if d.detection_time && d.detection_time !== lastDetectTime {
           lastDetectTime = d.detection_time;
           const detectImg = document.getElementById('detect-img');
-          if (detectImg) detectImg.src = '/detection_snapshot.jpg?t=' + Date.now();
+          const detectEmpty = document.getElementById('detect-empty');
+          if (detectImg) {
+            detectImg.src = '/detection_snapshot.jpg?t=' + Date.now();
+            detectImg.style.display = 'block';
+          }
+          if (detectEmpty) detectEmpty.style.display = 'none';
+        } else if (!d.has_detection_snapshot && !lastDetectTime) {
+          const detectImg = document.getElementById('detect-img');
+          const detectEmpty = document.getElementById('detect-empty');
+          if (detectImg) detectImg.style.display = 'none';
+          if (detectEmpty) detectEmpty.style.display = 'block';
+        } else if (d.has_detection_snapshot && !lastDetectTime) {
+          lastDetectTime = d.detection_time || 1;
+          const detectImg = document.getElementById('detect-img');
+          const detectEmpty = document.getElementById('detect-empty');
+          if (detectImg) {
+            detectImg.src = '/detection_snapshot.jpg?t=' + Date.now();
+            detectImg.style.display = 'block';
+          }
+          if (detectEmpty) detectEmpty.style.display = 'none';
         }
         if (d.timelapse) {
           updateTimelapseUI(d.timelapse);
@@ -2837,8 +2856,12 @@ class WebServer:
         """Return the latest detection event snapshot JPEG."""
         if not self.streamer:
             return web.Response(status=503, text="Video streamer not configured")
+        # If no snapshot is cached and stream is not connected or running, do not block for 5s
+        if not self.streamer.latest_detection_snapshot and not self.streamer.latest_frame:
+            if not self.streamer.is_connected:
+                return web.Response(status=404, text="No detection snapshot available yet")
         try:
-            frame = await self.streamer.get_detection_snapshot(timeout_seconds=5)
+            frame = await self.streamer.get_detection_snapshot(timeout_seconds=3.0)
             if not frame:
                 return web.Response(status=404, text="No detection snapshot available yet")
             return web.Response(

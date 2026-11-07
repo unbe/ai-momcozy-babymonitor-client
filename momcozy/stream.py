@@ -1224,7 +1224,8 @@ class VideoStreamer:
 
     async def _stream_loop(self) -> None:
         """Internal loop fetching frames from the camera P2P stream."""
-        backoff = 2
+        backoff = 5.0
+        auth_failures = 0
         while self._running:
             try:
                 logger.info("Connecting to P2P video stream for %s...", self.device_id)
@@ -1271,7 +1272,8 @@ class VideoStreamer:
                     await stream.async_start()
                     logger.info("P2P stream initiated for %s. Awaiting media frames...", self.device_id)
                     self._last_error = None
-                    backoff = 2
+                    backoff = 5.0
+                    auth_failures = 0
 
                     async def audio_worker():
                         try:
@@ -1351,6 +1353,8 @@ class VideoStreamer:
 
                             self._connected = True
                             self._last_error = None
+                            backoff = 5.0
+                            auth_failures = 0
 
                             if is_key:
                                 self._latest_hevc_keyframe = chunk
@@ -1374,10 +1378,55 @@ class VideoStreamer:
                 break
             except Exception as e:
                 self._connected = False
-                self._last_error = str(e)
-                logger.error("P2P stream error for %s: %s. Reconnecting in %ss...", self.device_id, e, backoff)
+                err_str = str(e)
+                self._last_error = err_str
+
+                is_rate_limit = any(
+                    rl in err_str
+                    for rl in (
+                        "USER_SESSION_LIMIT",
+                        "You have loged in too many times today",
+                    )
+                )
+
+                is_fatal_auth = is_rate_limit or any(
+                    fatal in err_str
+                    for fatal in (
+                        "LOGIN_TOKEN_FAILED",
+                        "USER_SESSION_INVALID",
+                        "Incorrect user token",
+                        "PERMISSION_DENIED",
+                    )
+                )
+
+                if is_rate_limit:
+                    auth_failures += 1
+                    # Rate limit (USER_SESSION_LIMIT): retry after a much longer time (30 min to 2 hours)
+                    backoff = min(7200.0, max(1800.0, 1800.0 * (1.5 ** min(4, auth_failures - 1))))
+                    logger.error(
+                        "P2P stream rate limited by Tuya (USER_SESSION_LIMIT) for %s: %s (failure %d). Retrying after longer delay: %.0fs (%.1f min)...",
+                        self.device_id,
+                        e,
+                        auth_failures,
+                        backoff,
+                        backoff / 60.0,
+                    )
+                elif is_fatal_auth:
+                    auth_failures += 1
+                    # Aggressive backoff for authentication rejection: 30s -> 60s -> 300s -> 900s (15 min)
+                    backoff = min(900.0, max(30.0, 30.0 * (2.0 ** min(5, auth_failures - 1))))
+                    logger.error(
+                        "P2P stream authentication error for %s: %s (failure %d). Backing off for %.0fs before retrying...",
+                        self.device_id,
+                        e,
+                        auth_failures,
+                        backoff,
+                    )
+                else:
+                    logger.error("P2P stream error for %s: %s. Reconnecting in %.0fs...", self.device_id, e, backoff)
+                    backoff = min(120.0, backoff * 1.5)
+
                 await asyncio.sleep(backoff)
-                backoff = min(30, backoff * 1.5)
 
     async def subscribe(self) -> AsyncIterator[bytes]:
         """Subscribe to live frames."""

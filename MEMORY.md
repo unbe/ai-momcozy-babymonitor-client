@@ -209,6 +209,18 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * When `timelapse/` files (`slot_*.hevc` or `meta.json`) are restored, copied, or modified from the host filesystem while the server is running, `_sync_meta_if_changed()` automatically detects the changes on disk (tracking `meta.json` modification time and slot file presence) and re-evaluates slots without requiring a server restart.
     * If `meta.json` was omitted or contains 0-frame entries during restore, `_load_meta` and `get_status` automatically reconcile against actual `slot_*.hevc` files on disk, approximating frame counts from file sizes (`max(1, size // 35000)`) and computing valid slot durations.
     * `has_content` in `get_status()` aligns with `self.has_content` (verifying whether valid slot files exist on disk), ensuring UI buttons (like `[▶ Watch]` and `[🗑️ Erase]`) enable as expected.
+* **Tuya Cloud Authentication & Rate Limit Backoff:**
+  * **Telemetry (`_fetch_cloud_dps`):**
+    * When local LAN control is unreachable, status polling queries Tuya Cloud. Previously, failed auth retried every 15 seconds unconditionally, hammering Tuya's login endpoint.
+    * Implemented backoff tracking in `_dps_cache`: on generic auth errors (`LOGIN_TOKEN_FAILED`, `PERMISSION_DENIED`), backoff escalates exponentially (30s -> 60s -> 300s -> 900s).
+    * On `USER_SESSION_LIMIT` ("You have loged in too many times today"), backoff starts at 30 minutes (1800s) up to 2 hours (7200s) to allow Tuya's rate-limit window to reset without burning requests.
+  * **Video Streamer (`VideoStreamer._stream_loop`):**
+    * Reconnect backoff differentiates between transient network glitches (up to 120s) and authentication/rate-limit failures.
+    * On `USER_SESSION_LIMIT`, backoff escalates to 1800s–7200s (30m–2h). On token rejection (`LOGIN_TOKEN_FAILED`), backoff scales up to 900s (15m).
+  * **Detection Snapshot Loading (`/detection_snapshot.jpg`):**
+    * The dashboard avoids unconditionally requesting `/detection_snapshot.jpg` on cold initial load before `has_detection_snapshot` is reported.
+    * `handle_detection_snapshot` returns an immediate `404` when the stream is not connected and no snapshot/frame is cached, avoiding 5-second `504 Gateway Timeout` errors on cold dashboard loads.
+
 
 
 

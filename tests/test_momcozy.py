@@ -1077,6 +1077,9 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
 
         mock_monitor = MagicMock()
         mock_streamer = MagicMock()
+        mock_streamer.latest_detection_snapshot = None
+        mock_streamer.latest_frame = None
+        mock_streamer.is_connected = True
         mock_streamer.get_detection_snapshot = AsyncMock(return_value=b"FAKE_JPEG_BYTES")
 
         server = WebServer(monitor=mock_monitor, streamer=mock_streamer)
@@ -1086,6 +1089,11 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.content_type, "image/jpeg")
         self.assertEqual(resp.body, b"FAKE_JPEG_BYTES")
+
+        # When stream is disconnected and no frames are cached, return 404 immediately
+        mock_streamer.is_connected = False
+        resp_disconnected = await server.handle_detection_snapshot(req)
+        self.assertEqual(resp_disconnected.status, 404)
 
     async def test_video_streamer_detection_snapshot_capture(self):
         from momcozy.stream import VideoStreamer

@@ -172,7 +172,79 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
 
     import time as _time
 
-    _dps_cache: dict = {"ts": 0.0, "dps": saved.get("dps") if isinstance(saved.get("dps"), dict) else {}, "session": None, "client": None}
+    _dps_cache: dict = {
+        "ts": 0.0,
+        "dps": saved.get("dps") if isinstance(saved.get("dps"), dict) else {},
+        "session": None,
+        "client": None,
+        "last_auth_attempt": 0.0,
+        "auth_failure_count": 0,
+        "auth_backoff": 15.0,
+        "fatal_auth_error": False,
+    }
+
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        err_str = str(exc)
+        return any(
+            err in err_str
+            for err in (
+                "USER_SESSION_LIMIT",
+                "You have loged in too many times today",
+            )
+        )
+
+    def _is_fatal_tuya_auth_error(exc: Exception) -> bool:
+        err_str = str(exc)
+        return any(
+            err in err_str
+            for err in (
+                "LOGIN_TOKEN_FAILED",
+                "USER_SESSION_INVALID",
+                "Incorrect user token",
+                "PERMISSION_DENIED",
+            )
+        ) or _is_rate_limit_error(exc)
+
+    def _can_attempt_tuya_auth(now: float) -> bool:
+        return (now - _dps_cache["last_auth_attempt"]) >= _dps_cache["auth_backoff"]
+
+    def _record_tuya_auth_failure(exc: Exception, now: float) -> None:
+        _dps_cache["last_auth_attempt"] = now
+        _dps_cache["auth_failure_count"] += 1
+        if _is_rate_limit_error(exc):
+            _dps_cache["fatal_auth_error"] = True
+            # Rate limit (USER_SESSION_LIMIT): back off for 30 minutes, max 2 hours
+            _dps_cache["auth_backoff"] = min(7200.0, max(1800.0, _dps_cache["auth_backoff"] * 2.0))
+            logger.warning(
+                "Tuya Cloud rate limit hit (USER_SESSION_LIMIT): %s (attempt %d, retrying after longer delay: %.0fs / %.1fm)",
+                exc,
+                _dps_cache["auth_failure_count"],
+                _dps_cache["auth_backoff"],
+                _dps_cache["auth_backoff"] / 60.0,
+            )
+        elif _is_fatal_tuya_auth_error(exc):
+            _dps_cache["fatal_auth_error"] = True
+            # Invalid token / auth failure: 30s -> 60s -> 300s -> 900s (15 min)
+            _dps_cache["auth_backoff"] = min(900.0, max(30.0, _dps_cache["auth_backoff"] * 2.0))
+            logger.warning(
+                "Tuya Cloud auth rejected: %s (attempt %d, backing off for %.0fs)",
+                exc,
+                _dps_cache["auth_failure_count"],
+                _dps_cache["auth_backoff"],
+            )
+        else:
+            _dps_cache["auth_backoff"] = min(300.0, max(15.0, _dps_cache["auth_backoff"] * 1.5))
+            logger.debug(
+                "Tuya Cloud auth failed: %s (attempt %d, backing off for %.0fs)",
+                exc,
+                _dps_cache["auth_failure_count"],
+                _dps_cache["auth_backoff"],
+            )
+
+    def _record_tuya_auth_success() -> None:
+        _dps_cache["auth_failure_count"] = 0
+        _dps_cache["auth_backoff"] = 15.0
+        _dps_cache["fatal_auth_error"] = False
 
     def _fetch_cloud_dps() -> dict:
         now = _time.time()
@@ -187,19 +259,9 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         _dps_cache["client"] = t_client
         t_session = _dps_cache["session"]
         if t_session is None:
-            t_session = t_client.login_with_uid(
-                country_code=api_inst.tuya_creds.region,
-                uid=api_inst.tuya_creds.uid,
-                token=api_inst.tuya_creds.token,
-            )
-            _dps_cache["session"] = t_session
-        try:
-            info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
-        except Exception as exc:
-            logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
-            info = None
-
-        if info is None:
+            if not _can_attempt_tuya_auth(now):
+                return _dps_cache["dps"]
+            _dps_cache["last_auth_attempt"] = now
             try:
                 t_session = t_client.login_with_uid(
                     country_code=api_inst.tuya_creds.region,
@@ -207,9 +269,33 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
                     token=api_inst.tuya_creds.token,
                 )
                 _dps_cache["session"] = t_session
+                _record_tuya_auth_success()
+            except Exception as exc:
+                _record_tuya_auth_failure(exc, now)
+                return _dps_cache["dps"]
+
+        try:
+            info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+        except Exception as exc:
+            logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
+            info = None
+
+        if info is None:
+            if not _can_attempt_tuya_auth(now):
+                return _dps_cache["dps"]
+            _dps_cache["last_auth_attempt"] = now
+            try:
+                t_session = t_client.login_with_uid(
+                    country_code=api_inst.tuya_creds.region,
+                    uid=api_inst.tuya_creds.uid,
+                    token=api_inst.tuya_creds.token,
+                )
+                _dps_cache["session"] = t_session
+                _record_tuya_auth_success()
                 info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
             except Exception as exc:
-                logger.debug("Tuya session refresh failed: %s", exc)
+                _record_tuya_auth_failure(exc, now)
+                _dps_cache["session"] = None
                 info = None
 
         if isinstance(info, dict) and info.get("dps"):
@@ -223,27 +309,46 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
         api_inst = MomcozyCloudApi.load_session(config_path)
         if not api_inst or not api_inst.tuya_creds or not api_inst.tuya_creds.token:
             return False
+        now = _time.time()
+        if not _can_attempt_tuya_auth(now):
+            logger.warning("Tuya Cloud publish_dps skipped: currently in auth error backoff.")
+            return False
         t_client = _dps_cache["client"] or api_inst.get_tuya_client()
         _dps_cache["client"] = t_client
         t_session = _dps_cache["session"]
         if t_session is None:
-            t_session = t_client.login_with_uid(
-                country_code=api_inst.tuya_creds.region,
-                uid=api_inst.tuya_creds.uid,
-                token=api_inst.tuya_creds.token,
-            )
-            _dps_cache["session"] = t_session
+            _dps_cache["last_auth_attempt"] = now
+            try:
+                t_session = t_client.login_with_uid(
+                    country_code=api_inst.tuya_creds.region,
+                    uid=api_inst.tuya_creds.uid,
+                    token=api_inst.tuya_creds.token,
+                )
+                _dps_cache["session"] = t_session
+                _record_tuya_auth_success()
+            except Exception as exc:
+                _record_tuya_auth_failure(exc, now)
+                return False
         try:
             return t_client.publish_dps(t_session, dev_id, dps_dict)
         except Exception as exc:
             logger.debug("Cloud publish_dps failed, refreshing session: %s", exc)
-            t_session = t_client.login_with_uid(
-                country_code=api_inst.tuya_creds.region,
-                uid=api_inst.tuya_creds.uid,
-                token=api_inst.tuya_creds.token,
-            )
-            _dps_cache["session"] = t_session
-            return t_client.publish_dps(t_session, dev_id, dps_dict)
+            if not _can_attempt_tuya_auth(now):
+                return False
+            _dps_cache["last_auth_attempt"] = now
+            try:
+                t_session = t_client.login_with_uid(
+                    country_code=api_inst.tuya_creds.region,
+                    uid=api_inst.tuya_creds.uid,
+                    token=api_inst.tuya_creds.token,
+                )
+                _dps_cache["session"] = t_session
+                _record_tuya_auth_success()
+                return t_client.publish_dps(t_session, dev_id, dps_dict)
+            except Exception as auth_exc:
+                _record_tuya_auth_failure(auth_exc, now)
+                _dps_cache["session"] = None
+                return False
 
     def _on_ip_discovered(new_ip: str) -> None:
         if config_path.exists():
