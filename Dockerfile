@@ -1,10 +1,13 @@
 FROM python:3.15-slim-trixie
 
 # Install system dependencies required for OpenCV, PyAV (FFmpeg), VA-API hardware acceleration, and health checks.
-# Note: i965-va-driver-shaders (in non-free on amd64) provides the encoding shaders required for Intel Haswell Gen 7.5.
-RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
- || sed -i 's/main/main non-free/' /etc/apt/sources.list 2>/dev/null || true \
- && apt-get update && apt-get install -y --no-install-recommends \
+# Note: i965-va-driver-shaders (amd64 non-free) provides encoding shaders for Intel Haswell–Coffee Lake GPUs.
+RUN export DEBIAN_FRONTEND=noninteractive \
+ && sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && EXTRA_PKGS="" \
+ && if [ "$(dpkg --print-architecture)" = "amd64" ]; then EXTRA_PKGS="i965-va-driver-shaders"; fi \
+ && apt-get install -y --no-install-recommends \
     ffmpeg \
     va-driver-all \
     vainfo \
@@ -14,7 +17,7 @@ RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list
     ca-certificates \
     curl \
     openssl \
- && (apt-get install -y --no-install-recommends i965-va-driver-shaders || true) \
+    $EXTRA_PKGS \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
