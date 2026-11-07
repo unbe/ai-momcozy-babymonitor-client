@@ -398,8 +398,8 @@ class MomcozyCloudApi:
         else:
             return
         self.tuya_session = sess_dict
-        target_path = normalize_config_path(path or self._config_path or DEFAULT_CONFIG_PATH)
-        if target_path.exists():
+        target_path = normalize_config_path(path or self._config_path) if (path or self._config_path) else None
+        if target_path and target_path.exists():
             try:
                 data = json.loads(target_path.read_text())
                 data["tuya_session"] = sess_dict
