@@ -133,23 +133,35 @@ def format_bytes(bytes_count: int) -> str:
     return f"{bytes_count / (1024 * 1024 * 1024):.2f} GB"
 
 
-def extract_hevc_keyframe_luma(chunk: bytes, grid_size: int = 16) -> Optional[bytes]:
+def extract_hevc_keyframe_luma(
+    chunk: bytes,
+    grid_size: int = 16,
+    codec: Optional[Any] = None,
+) -> Optional[bytes]:
     """Extract a fast grid_size x grid_size grayscale luminance fingerprint from an HEVC keyframe.
 
-    Decodes a single keyframe using PyAV with thread_count=1 (sub-10ms).
+    Decodes a single keyframe using PyAV with thread_count=1 and skip_loop_filter='all'.
+    Reuses provided codec context when available to avoid repeated allocation overhead.
     Directly subsamples the Y plane without color conversions or software rescaling.
     """
     try:
         import av
 
-        codec = av.CodecContext.create("hevc", "r")
-        codec.thread_count = 1
+        if codec is None:
+            codec = av.CodecContext.create("hevc", "r")
+            codec.thread_count = 1
+            codec.options = {"skip_loop_filter": "all"}
         last_frame = None
         for packet in list(codec.parse(chunk)) + list(codec.parse(b"")):
             for frame in codec.decode(packet):
                 last_frame = frame
         for frame in codec.decode():
             last_frame = frame
+        if hasattr(codec, "flush_buffers"):
+            try:
+                codec.flush_buffers()
+            except Exception:
+                pass
         if not last_frame or not last_frame.planes:
             return None
 
@@ -584,7 +596,7 @@ class TimelapseRecorder:
         self,
         threshold: float = 3.5,
         coarse_step: int = 30,
-        min_window: int = 1,
+        min_window: int = 2,
         merge_gap_sec: Optional[float] = None,
         debounce_sec: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
@@ -655,15 +667,32 @@ class TimelapseRecorder:
             return self._events
 
         fp_cache: Dict[int, Optional[bytes]] = {}
+        stage_decodes = {"coarse": 0, "search": 0, "probe": 0}
+        current_stage = ["coarse"]
+
+        shared_codec = None
+        try:
+            import av
+
+            shared_codec = av.CodecContext.create("hevc", "r")
+            shared_codec.thread_count = 1
+            shared_codec.options = {"skip_loop_filter": "all"}
+        except Exception as exc:
+            logger.debug("Failed creating shared HEVC decoder context: %s", exc)
+            shared_codec = None
 
         def get_fp(idx: int) -> Optional[bytes]:
             if idx not in fp_cache:
+                stage_decodes[current_stage[0]] += 1
                 f_path, f_off, f_len, _ = indexed_frames[idx]
                 try:
                     with open(f_path, "rb") as f:
                         f.seek(f_off)
                         chunk = f.read(f_len)
-                    fp_cache[idx] = extract_hevc_keyframe_luma(chunk)
+                    try:
+                        fp_cache[idx] = extract_hevc_keyframe_luma(chunk, codec=shared_codec)
+                    except TypeError:
+                        fp_cache[idx] = extract_hevc_keyframe_luma(chunk)
                 except Exception:
                     fp_cache[idx] = None
             return fp_cache[idx]
@@ -694,6 +723,34 @@ class TimelapseRecorder:
                 elif diff_mr >= 0.0:
                     subdivide(mid, right, out_indices)
 
+        def find_first_change(left: int, right: int) -> int:
+            """Binary search for earliest frame in [left, right] where motion begins."""
+            base_fp = get_fp(left)
+            if base_fp is None:
+                return left
+            while right - left > eff_min_window:
+                mid = (left + right) // 2
+                fp_m = get_fp(mid)
+                if fp_m is not None and luma_fingerprint_diff(base_fp, fp_m) >= threshold:
+                    right = mid
+                else:
+                    left = mid
+            return left
+
+        def find_last_change(left: int, right: int) -> int:
+            """Binary search for latest frame in [left, right] where motion ends."""
+            end_fp = get_fp(right)
+            if end_fp is None:
+                return right
+            while right - left > eff_min_window:
+                mid = (left + right) // 2
+                fp_m = get_fp(mid)
+                if fp_m is not None and luma_fingerprint_diff(fp_m, end_fp) >= threshold:
+                    left = mid
+                else:
+                    right = mid
+            return right
+
         # Partition frames into contiguous recording segments so paused recording gaps
         # never fabricate artificial motion ranges across unrecorded wall-clock intervals.
         max_frame_gap_sec = max(30.0, self.sample_interval_sec * 15.0)
@@ -708,15 +765,56 @@ class TimelapseRecorder:
             segments.append((seg_start, total_frames - 1))
 
         for s_begin, s_end in segments:
-            seg_leaves: List[Tuple[int, int]] = []
+            current_stage[0] = "coarse"
+            coarse_windows: List[Tuple[int, int, bool]] = []
             for start in range(s_begin, s_end, coarse_step):
                 end = min(s_end, start + coarse_step)
                 fp_start = get_fp(start)
                 fp_end = get_fp(end)
                 if fp_start is None or fp_end is None:
                     continue
-                if luma_fingerprint_diff(fp_start, fp_end) >= threshold:
-                    subdivide(start, end, seg_leaves)
+                diff = luma_fingerprint_diff(fp_start, fp_end)
+                is_active = diff >= threshold
+                coarse_windows.append((start, end, is_active))
+
+            if not any(is_act for _, _, is_act in coarse_windows):
+                continue
+
+            quiet_windows = [(w_s, w_e) for w_s, w_e, is_act in coarse_windows if not is_act]
+
+            # Group contiguous active coarse windows into clusters (#1)
+            active_clusters: List[List[Tuple[int, int]]] = []
+            cur_cluster: List[Tuple[int, int]] = []
+            for start, end, is_act in coarse_windows:
+                if is_act:
+                    if not cur_cluster:
+                        cur_cluster.append((start, end))
+                    else:
+                        if cur_cluster[-1][1] == start:
+                            cur_cluster.append((start, end))
+                        else:
+                            active_clusters.append(cur_cluster)
+                            cur_cluster = [(start, end)]
+                else:
+                    if cur_cluster:
+                        active_clusters.append(cur_cluster)
+                        cur_cluster = []
+            if cur_cluster:
+                active_clusters.append(cur_cluster)
+
+            current_stage[0] = "search"
+            seg_leaves: List[Tuple[int, int]] = []
+            for cluster in active_clusters:
+                if len(cluster) == 1:
+                    w_s, w_e = cluster[0]
+                    subdivide(w_s, w_e, seg_leaves)
+                else:
+                    # Sustained motion run (#1): binary search only first and last window edges
+                    w_first = cluster[0]
+                    w_last = cluster[-1]
+                    onset = find_first_change(w_first[0], w_first[1])
+                    offset = find_last_change(w_last[0], w_last[1])
+                    seg_leaves.append((onset, max(onset, offset)))
 
             if not seg_leaves:
                 continue
@@ -731,44 +829,57 @@ class TimelapseRecorder:
 
             # Locally probe (1, 2, 4, 8 frames) around detected range boundaries within effective_gap
             # so sustained motion that partially returns near a coarse anchor is captured to its full extent.
+            current_stage[0] = "probe"
             for s_idx, e_idx in merged_idx:
+                # Quiet coarse window gating (#2): don't probe outward into verified quiet windows
+                min_probe_s = max([qw_e for qw_s, qw_e in quiet_windows if qw_e <= s_idx], default=s_begin)
+                max_probe_e = min([qw_s for qw_s, qw_e in quiet_windows if qw_s >= e_idx], default=s_end)
+
                 cur_s = s_idx
-                while cur_s > s_begin:
+                while cur_s > min_probe_s:
                     found_prev = False
                     for step in (1, 2, 4, 8):
                         cand = cur_s - step
-                        if cand < s_begin or (indexed_frames[cur_s][3] - indexed_frames[cand][3]) > effective_gap:
+                        if cand < min_probe_s or (indexed_frames[cur_s][3] - indexed_frames[cand][3]) > effective_gap:
                             break
                         fp_cand, fp_cur = get_fp(cand), get_fp(cur_s)
                         if fp_cand is not None and fp_cur is not None and luma_fingerprint_diff(fp_cand, fp_cur) >= threshold:
-                            best = cand
-                            for k in range(cand, cur_s):
-                                fp_a, fp_b = get_fp(k), get_fp(k + 1)
-                                if fp_a is not None and fp_b is not None and luma_fingerprint_diff(fp_a, fp_b) >= threshold:
-                                    best = k
-                                    break
-                            cur_s = best
+                            # Binary search edge between cand and cur_s (#3)
+                            low = cand
+                            high = cur_s
+                            while high - low > 1:
+                                mid = (low + high) // 2
+                                fp_m = get_fp(mid)
+                                if fp_m is not None and luma_fingerprint_diff(fp_cand, fp_m) >= threshold:
+                                    high = mid
+                                else:
+                                    low = mid
+                            cur_s = low
                             found_prev = True
                             break
                     if not found_prev:
                         break
 
                 cur_e = e_idx
-                while cur_e < s_end:
+                while cur_e < max_probe_e:
                     found_next = False
                     for step in (1, 2, 4, 8):
                         cand = cur_e + step
-                        if cand > s_end or (indexed_frames[cand][3] - indexed_frames[cur_e][3]) > effective_gap:
+                        if cand > max_probe_e or (indexed_frames[cand][3] - indexed_frames[cur_e][3]) > effective_gap:
                             break
                         fp_cur, fp_cand = get_fp(cur_e), get_fp(cand)
                         if fp_cur is not None and fp_cand is not None and luma_fingerprint_diff(fp_cur, fp_cand) >= threshold:
-                            best = cand
-                            for k in range(cand, cur_e, -1):
-                                fp_a, fp_b = get_fp(k - 1), get_fp(k)
-                                if fp_a is not None and fp_b is not None and luma_fingerprint_diff(fp_a, fp_b) >= threshold:
-                                    best = k
-                                    break
-                            cur_e = best
+                            # Binary search edge between cur_e and cand (#3)
+                            low = cur_e
+                            high = cand
+                            while high - low > 1:
+                                mid = (low + high) // 2
+                                fp_m = get_fp(mid)
+                                if fp_m is not None and luma_fingerprint_diff(fp_m, fp_cand) >= threshold:
+                                    low = mid
+                                else:
+                                    high = mid
+                            cur_e = high
                             found_next = True
                             break
                     if not found_next:
@@ -811,9 +922,12 @@ class TimelapseRecorder:
             self._save_meta()
             result_events = list(self._events)
         logger.info(
-            "Motion scan complete: indexed %d frames (decoded %d), detected %d motion ranges",
+            "Motion scan complete: indexed %d frames (decoded %d: %d coarse, %d search, %d probe), detected %d motion ranges",
             total_frames,
             len(fp_cache),
+            stage_decodes["coarse"],
+            stage_decodes["search"],
+            stage_decodes["probe"],
             len(scanned_ranges),
         )
         return result_events

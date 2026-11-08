@@ -391,6 +391,68 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(ranges), 2)
             self.assertGreater(ranges[0]["end_time"] - ranges[0]["time"], 45.0)
 
+    async def test_motion_scan_optimizations_clustering_gating_and_stage_breakdown(self):
+        """Verify optimizations #1, #2, #3, #5, #6, and #9 in detect_motion_events."""
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            recorder = TimelapseRecorder(
+                streamer=MagicMock(),
+                storage_dir=storage_dir,
+                sample_interval_sec=1.0,
+                fps=10,
+                speed_ratio=60,
+                motion_merge_gap_sec=30.0,
+            )
+
+            # 180 frames: coarse_step=30 => 6 coarse windows:
+            # [0, 30]: quiet
+            # [30, 60]: active onset
+            # [60, 90]: active interior
+            # [90, 120]: active interior
+            # [120, 150]: active offset
+            # [150, 180]: quiet
+            vps_marker = b"\x00\x00\x00\x01\x40\x01"
+            s0 = recorder.slot_path(0)
+            payload = b"".join(vps_marker + bytes([0, i]) + b"\x00" * 40 for i in range(180))
+            s0.write_bytes(payload)
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "duration": 180.0, "frames": 180, "bytes": len(payload)}
+
+            decoded_frames = []
+            codecs_received = []
+
+            def mock_luma(chunk, codec=None):
+                frame_idx = chunk[7]
+                decoded_frames.append(frame_idx)
+                codecs_received.append(codec)
+                # Sustained motion active from frame 45 to 135 with dynamic changes
+                if 45 <= frame_idx <= 135:
+                    return bytes([0x20 + (frame_idx * 3) % 200]) * 256
+                return b"\x10" * 256
+
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                with self.assertLogs("momcozy.timelapse", level="INFO") as log_ctx:
+                    events = recorder.detect_motion_events(coarse_step=30, min_window=2)
+
+            self.assertEqual(len(events), 1)
+            # Item #6: Codec context was created and passed to extract_hevc_keyframe_luma
+            self.assertTrue(any(c is not None for c in codecs_received))
+
+            # Item #1: Interior windows [60, 90] and [90, 120] should NOT have had interior decodes
+            # (e.g. frame 75, 105)
+            self.assertNotIn(75, decoded_frames)
+            self.assertNotIn(105, decoded_frames)
+
+            # Item #2: Outward probe should NOT enter quiet windows [0, 30] and [150, 180]
+            self.assertNotIn(15, decoded_frames)
+            self.assertNotIn(165, decoded_frames)
+
+            # Item #9: Stage breakdown logged
+            found_stage_log = any(
+                "Motion scan complete: indexed 180 frames (decoded" in m and "coarse" in m and "search" in m and "probe" in m
+                for m in log_ctx.output
+            )
+            self.assertTrue(found_stage_log, f"Log messages: {log_ctx.output}")
+
 
 class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
     async def test_recorder_sync_nv_state_and_session_append_vs_restart(self):
