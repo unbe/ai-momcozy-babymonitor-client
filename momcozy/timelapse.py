@@ -1314,6 +1314,7 @@ class TimelapseRecorder:
         codec: str = "hevc",
         ratio: Optional[int] = None,
         allow_cache_only: bool = False,
+        session_id: Optional[str] = None,
     ) -> Optional[Path]:
         """Concatenate ordered slots and remux to MP4 using stream-copy (zero transcoding).
 
@@ -1344,6 +1345,10 @@ class TimelapseRecorder:
         if cache_entry and cache_entry.get("path") and cache_entry["path"].exists():
             out_path = cache_entry["path"]
             created_at = float(cache_entry.get("created_at", 0.0))
+            cached_session = cache_entry.get("session_id")
+            # If the client is continuing an existing viewing session, never replace file mid-stream
+            if session_id and cached_session == session_id:
+                return out_path
             if allow_cache_only:
                 if (not self.is_recording and created_at >= latest_mtime) or (self.is_recording and (time.time() - created_at) < 300.0):
                     return out_path
@@ -1395,6 +1400,7 @@ class TimelapseRecorder:
                         "path": out_path,
                         "created_at": time.time(),
                         "mtime": latest_mtime,
+                        "session_id": session_id,
                     }
                     return out_path
                 return None

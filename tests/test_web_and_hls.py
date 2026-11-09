@@ -379,6 +379,11 @@ class TestWebServerAndCsrf(unittest.IsolatedAsyncioTestCase):
                 )
                 server.timelapse.export_mp4.assert_called_with(codec="hevc", ratio=None, allow_cache_only=True)
 
+                await server.handle_timelapse_video(
+                    make_mocked_request("GET", "/api/timelapse/video.mp4?t=1794260624019", headers={"Range": "bytes=0-"})
+                )
+                server.timelapse.export_mp4.assert_called_with(codec="hevc", ratio=None, allow_cache_only=False, session_id="1794260624019")
+
             resp_clear = await server.handle_timelapse_clear(make_mocked_request("POST", "/api/timelapse/clear"))
             self.assertEqual(resp_clear.status, 200)
             self.assertFalse(slot0.exists())

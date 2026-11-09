@@ -1062,6 +1062,7 @@ class WebServer:
         # For mid-stream scrub/seek requests (start byte > 0), do not regenerate MP4 mid-stream
         # to avoid replacing the file under the player's active demuxer.
         # Initial requests (Range: bytes=0- or no Range) must always allow fresh cache generation.
+        session_id = request.query.get("t")
         range_header = request.headers.get("Range", "")
         is_midstream_seek = False
         if not is_download and range_header.startswith("bytes="):
@@ -1072,12 +1073,16 @@ class WebServer:
             except (ValueError, IndexError):
                 pass
 
+        export_kwargs: Dict[str, Any] = {
+            "codec": codec,
+            "ratio": ratio,
+            "allow_cache_only": is_midstream_seek,
+        }
+        if session_id is not None:
+            export_kwargs["session_id"] = session_id
+
         try:
-            mp4_path = await self.timelapse.export_mp4(
-                codec=codec,
-                ratio=ratio,
-                allow_cache_only=is_midstream_seek,
-            )
+            mp4_path = await self.timelapse.export_mp4(**export_kwargs)
         except Exception as exc:
             logger.error("Error generating timelapse MP4: %s", exc)
             return web.Response(status=500, text=f"Error exporting timelapse: {exc}", content_type="text/plain")

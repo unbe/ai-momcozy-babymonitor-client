@@ -289,6 +289,16 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
                 await recorder.export_mp4(codec="h264", ratio=60, allow_cache_only=False)
                 self.assertEqual(call_count, 2)
 
+                # Matching session_id preserves cached export mid-stream even if TTL expired
+                recorder._exports_cache["h264_r60"]["created_at"] = time.time() - 100.0
+                recorder._exports_cache["h264_r60"]["session_id"] = "sess_42"
+                await recorder.export_mp4(codec="h264", ratio=60, allow_cache_only=False, session_id="sess_42")
+                self.assertEqual(call_count, 2)
+
+                # Different session_id regenerates export
+                await recorder.export_mp4(codec="h264", ratio=60, allow_cache_only=False, session_id="sess_99")
+                self.assertEqual(call_count, 3)
+
     def test_timelapse_motion_events_timeline_and_concurrent_thread_safety(self):
         with tempfile.TemporaryDirectory() as td:
             storage_dir = Path(td)

@@ -34,7 +34,13 @@ function updateDownloadLinks() {
   }
 }
 
+let stablePlayTimer = null;
+
 function loadPlayback(codec) {
+  if (stablePlayTimer) {
+    clearTimeout(stablePlayTimer);
+    stablePlayTimer = null;
+  }
   activeCodec = codec;
   recoveryAttempts = 0;
   initialPlaySucceeded = false;
@@ -55,10 +61,26 @@ video.onloadeddata = function() {
 video.onplaying = function() {
   loading.style.display = 'none';
   initialPlaySucceeded = true;
-  recoveryAttempts = 0;
+  // Reset recovery counter only after 3 seconds of sustained successful playback
+  if (stablePlayTimer) clearTimeout(stablePlayTimer);
+  stablePlayTimer = setTimeout(function() {
+    recoveryAttempts = 0;
+  }, 3000);
+};
+
+video.onpause = function() {
+  if (stablePlayTimer) {
+    clearTimeout(stablePlayTimer);
+    stablePlayTimer = null;
+  }
 };
 
 video.onerror = function(e) {
+  if (stablePlayTimer) {
+    clearTimeout(stablePlayTimer);
+    stablePlayTimer = null;
+  }
+
   const err = video.error;
   console.warn('[Timelapse Player] Video error with codec ' + activeCodec, err ? { code: err.code, message: err.message } : e);
 
@@ -67,14 +89,24 @@ video.onerror = function(e) {
     return;
   }
 
-  // If HEVC already successfully loaded metadata / played and recovery is within retry limits
-  if (initialPlaySucceeded && recoveryAttempts < 10) {
+  // Fatal decode (3) or unsupported format (4) error on HEVC: immediately fall back to H.264
+  // Never retry the same HEVC stream on decode/format errors as the bitstream will fail again
+  if (activeCodec === 'hevc' && !fallbackAttempted && err && (err.code === 3 || err.code === 4)) {
+    console.info('[Timelapse Player] HEVC decode/unsupported error (code ' + err.code + '), falling back to H.264...');
+    fallbackAttempted = true;
+    loadPlayback('h264');
+    return;
+  }
+
+  // Transient network error recovery: allow at most 10 retries without infinite loops
+  if (recoveryAttempts < 10) {
     recoveryAttempts++;
     console.info('[Timelapse Player] Recovering playback (attempt ' + recoveryAttempts + '/10)...');
     const dur = video.duration || 1.0;
     const cur = Math.max(0.05, Math.min(dur - 0.05, video.currentTime || 0.05));
     const onLoadedMeta = function() {
-      video.currentTime = cur;
+      // Seek slightly before error point to align with a preceding keyframe, or restart if near start
+      video.currentTime = cur > 1.0 ? cur - 0.5 : 0.05;
       video.play().catch(function() {});
     };
     video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
@@ -82,12 +114,15 @@ video.onerror = function(e) {
     return;
   }
 
+  // If retries exhausted and on HEVC, try H.264 fallback as last resort before giving up
   if (activeCodec === 'hevc' && !fallbackAttempted) {
-    console.info('[Timelapse Player] Retrying with H.264 fallback...');
+    console.info('[Timelapse Player] Retries exhausted with HEVC, falling back to H.264...');
     fallbackAttempted = true;
     loadPlayback('h264');
     return;
   }
+
+  // Both codecs failed or H.264 retries exhausted: show error box and stop
   loading.style.display = 'none';
   errorBox.style.display = 'flex';
 };
@@ -180,46 +215,82 @@ function renderTimelineMarkers() {
   });
 }
 
+function updatePlayheadVisual(sec) {
+  if (!video.duration) return;
+  const pct = Math.min(100, Math.max(0, (sec / video.duration) * 100));
+  const progress = document.getElementById('timeline-progress');
+  const thumb = document.getElementById('timeline-thumb');
+  const curEl = document.getElementById('current-time-text');
+  if (progress) progress.style.width = `${pct}%`;
+  if (thumb) thumb.style.left = `${pct}%`;
+  if (curEl) curEl.textContent = formatTimeSec(sec);
+}
+
+function getTargetSecFromEvent(e) {
+  const bar = document.getElementById('timeline-bar');
+  if (!bar || !video.duration) return 0;
+  const rect = bar.getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  return Math.max(0.05, Math.min(video.duration - 0.05, ratio * video.duration));
+}
+
 function seekToSec(sec) {
   if (video.duration) {
     const target = Math.max(0.05, Math.min(video.duration - 0.05, sec));
+    updatePlayheadVisual(target);
     video.currentTime = target;
     video.play().catch(() => {});
   }
 }
 
-function seekFromTimeline(e) {
-  const bar = document.getElementById('timeline-bar');
-  if (!bar || !video.duration) return;
-  const rect = bar.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  const target = Math.max(0.05, Math.min(video.duration - 0.05, ratio * video.duration));
-  video.currentTime = target;
-}
-
 const timelineWrapper = document.getElementById('timeline-wrapper');
 let isDraggingTimeline = false;
-let seekRaf = null;
+let dragSeekTimer = null;
+let lastDragTargetSec = null;
 
-function throttledTimelineSeek(e) {
-  if (seekRaf) cancelAnimationFrame(seekRaf);
-  seekRaf = requestAnimationFrame(() => {
-    seekFromTimeline(e);
-  });
+function applyDragSeek(targetSec) {
+  if (!video.duration) return;
+  if (typeof video.fastSeek === 'function') {
+    video.fastSeek(targetSec);
+  } else {
+    video.currentTime = targetSec;
+  }
 }
 
 if (timelineWrapper) {
   timelineWrapper.addEventListener('mousedown', (e) => {
     isDraggingTimeline = true;
-    throttledTimelineSeek(e);
+    lastDragTargetSec = getTargetSecFromEvent(e);
+    updatePlayheadVisual(lastDragTargetSec);
+    applyDragSeek(lastDragTargetSec);
   });
+
   window.addEventListener('mousemove', (e) => {
-    if (isDraggingTimeline) {
-      throttledTimelineSeek(e);
+    if (!isDraggingTimeline) return;
+    lastDragTargetSec = getTargetSecFromEvent(e);
+    updatePlayheadVisual(lastDragTargetSec);
+
+    if (!dragSeekTimer) {
+      dragSeekTimer = setTimeout(() => {
+        dragSeekTimer = null;
+        if (isDraggingTimeline && lastDragTargetSec !== null) {
+          applyDragSeek(lastDragTargetSec);
+        }
+      }, 150);
     }
   });
+
   window.addEventListener('mouseup', () => {
-    isDraggingTimeline = false;
+    if (isDraggingTimeline) {
+      isDraggingTimeline = false;
+      if (dragSeekTimer) {
+        clearTimeout(dragSeekTimer);
+        dragSeekTimer = null;
+      }
+      if (lastDragTargetSec !== null && video.duration) {
+        video.currentTime = lastDragTargetSec;
+      }
+    }
   });
 }
 
@@ -252,6 +323,7 @@ window.addEventListener('keydown', (e) => {
 });
 
 video.addEventListener('timeupdate', () => {
+  if (isDraggingTimeline) return;
   const curEl = document.getElementById('current-time-text');
   const durEl = document.getElementById('duration-time-text');
   const progress = document.getElementById('timeline-progress');
