@@ -235,6 +235,15 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * On generic auth errors (`LOGIN_TOKEN_FAILED`, `PERMISSION_DENIED`), backoff escalates exponentially (30s -> 60s -> 300s -> 900s).
     * On `USER_SESSION_LIMIT` ("You have loged in too many times today"), backoff starts at 30 minutes (1800s) up to 2 hours (7200s) to allow Tuya's rate-limit window to reset without burning requests.
     * Re-authentication is restricted strictly to true session expiration/invalidation errors (`USER_SESSION_INVALID`, `NOT_EXISTS_SESSION`, `SIGN_INVALID`, `TOKEN_INVALID`, `USER_SESSION_HAS_EXPIRED`, `PERMISSION_DENIED`), avoiding burn-down on generic network timeouts or device offline errors.
+  * **Sliding-Window Re-Authentication Cooldown & Multi-Session Protection:**
+    * **Concurrent Session Invalidation (Mobile App Conflict):** When official Momcozy/Tuya mobile apps or other processes log in, Tuya invalidates existing sessions with `USER_SESSION_INVALID`. Previously, `_fetch_cloud_dps` detected this and immediately invoked `get_or_login(force_refresh=True)`. Because `login_with_uid` succeeded, it reset `auth_backoff = 15.0`. This created an alternating ping-pong login war with the mobile app every 15 seconds, rapidly exhausting Tuya's daily login quota (`USER_SESSION_LIMIT`).
+    * **Sliding-Window Cooldown (`_recent_logins` in `TuyaSessionManager`):** `TuyaSessionManager` tracks successful logins within a 10-minute (600s) window. While a single re-login is permitted, consecutive re-logins within 10 minutes trigger progressive cooldowns:
+      - 2nd login in 10m: 60s cooldown.
+      - 3rd login in 10m: 300s (5m) cooldown.
+      - 4th+ login in 10m: 900s (15m) cooldown.
+      During cooldown, `can_attempt_auth()` returns `False`, and `force_refresh` aborts network requests, gracefully preserving cached telemetry instead of fighting conflicting sessions.
+    * **Disk Session Adoption (`record_login=False`):** `_fetch_cloud_dps` inspects `.momcozy.json` on disk before initiating network login. If another container/process updated `tuya_session["sid"]`, the daemon adopts it in-memory immediately without issuing a login request or incrementing the re-login quota.
+    * **DPS Polling Cadence & Negative Caching:** `_fetch_cloud_dps` cache TTL is set to 60.0s (up from 15.0s), and `_dps_cache["ts"] = now` is updated on all execution branches (including exceptions and throttled cooldowns) to eliminate loop spinning.
   * **Persistent Session Reuse Across Streamer Lifecycles (`tuya_session` in `.momcozy.json`):**
     * Tuya sessions (`sid`, `ecode`, `uid`, `device_fingerprint`) are unified across `TuyaSession` and `AccountSession`, serialized to JSON, and persisted directly in `.momcozy.json` (`"tuya_session"`).
     * **Eliminating Login on 5-Minute Night Vision Sampling:** Previously, idle night vision checks woke up every 5 minutes and tore down `TuyaIpcP2pClient`, triggering a fresh `smartlife.m.user.uid.password.login` call ~288 times/day and rapidly hitting Tuya's account rate limit (`USER_SESSION_LIMIT`).

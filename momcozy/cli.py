@@ -159,13 +159,26 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
 
     def _fetch_cloud_dps() -> dict:
         now = _time.time()
-        if _dps_cache["dps"] and (now - _dps_cache["ts"] < 15.0):
+        # Default cache TTL: 60 seconds (prevents aggressive polling of Tuya Cloud)
+        if _dps_cache["dps"] and (now - _dps_cache["ts"] < 60.0):
             return _dps_cache["dps"]
         if not config_path.exists():
             return _dps_cache["dps"]
         api_inst = MomcozyCloudApi.load_session(config_path)
         if not api_inst or not api_inst.tuya_creds or not api_inst.tuya_creds.token:
             return _dps_cache["dps"]
+
+        # Adopt updated session written to disk by another process or container without re-authenticating
+        if isinstance(api_inst.tuya_session, dict) and api_inst.tuya_session.get("sid"):
+            current_sid = session_mgr.session.sid if session_mgr.session else ""
+            if api_inst.tuya_session["sid"] != current_sid:
+                logger.info(
+                    "Adopting updated Tuya session from %s (sid=%s...)",
+                    config_path.name,
+                    api_inst.tuya_session["sid"][:8],
+                )
+                session_mgr.update_session(api_inst.tuya_session, persist=False, record_login=False)
+
         t_client = _dps_cache["client"] or api_inst.get_tuya_client()
         _dps_cache["client"] = t_client
         t_session = session_mgr.get_or_login(
@@ -175,6 +188,8 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             token=api_inst.tuya_creds.token,
         )
         if t_session is None:
+            # Re-auth in cooldown; update cache timestamp to prevent polling loop thrashing
+            _dps_cache["ts"] = now
             return _dps_cache["dps"]
 
         info = None
@@ -182,25 +197,32 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
         except Exception as exc:
             if is_tuya_session_expired_error(exc):
-                logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
-                t_session = session_mgr.get_or_login(
-                    t_client,
-                    country_code=api_inst.tuya_creds.region,
-                    uid=api_inst.tuya_creds.uid,
-                    token=api_inst.tuya_creds.token,
-                    force_refresh=True,
-                )
-                if t_session is not None:
-                    try:
-                        info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
-                    except Exception as retry_exc:
-                        logger.warning("Tuya get_device_info retry error: %s", retry_exc)
+                if session_mgr.can_attempt_auth():
+                    logger.debug("Tuya session expired during get_device_info (%s), refreshing session...", exc)
+                    t_session = session_mgr.get_or_login(
+                        t_client,
+                        country_code=api_inst.tuya_creds.region,
+                        uid=api_inst.tuya_creds.uid,
+                        token=api_inst.tuya_creds.token,
+                        force_refresh=True,
+                    )
+                    if t_session is not None:
+                        try:
+                            info = t_client.get_device_info(t_session, dev_id, home_id=api_inst.tuya_home_id)
+                        except Exception as retry_exc:
+                            logger.warning("Tuya get_device_info retry error: %s", retry_exc)
+                else:
+                    logger.warning(
+                        "Tuya session expired during get_device_info, but re-authentication is in cooldown (%.0fs). Retaining cached telemetry.",
+                        session_mgr.auth_backoff,
+                    )
             else:
                 logger.warning("Tuya get_device_info error: %s", exc)
 
+        # Always update cache timestamp regardless of success or failure to avoid hammering
+        _dps_cache["ts"] = now
         if isinstance(info, dict) and info.get("dps"):
             _dps_cache["dps"] = info["dps"]
-            _dps_cache["ts"] = now
         return _dps_cache["dps"]
 
     def _publish_cloud_dps(dps_dict: dict) -> bool:
@@ -226,20 +248,23 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
             return t_client.publish_dps(t_session, dev_id, dps_dict)
         except Exception as exc:
             if is_tuya_session_expired_error(exc):
-                logger.debug("Cloud publish_dps session expired, refreshing session: %s", exc)
-                t_session = session_mgr.get_or_login(
-                    t_client,
-                    country_code=api_inst.tuya_creds.region,
-                    uid=api_inst.tuya_creds.uid,
-                    token=api_inst.tuya_creds.token,
-                    force_refresh=True,
-                )
-                if t_session is not None:
-                    try:
-                        return t_client.publish_dps(t_session, dev_id, dps_dict)
-                    except Exception as retry_exc:
-                        logger.warning("Cloud publish_dps retry error: %s", retry_exc)
-                        return False
+                if session_mgr.can_attempt_auth():
+                    logger.debug("Cloud publish_dps session expired, refreshing session: %s", exc)
+                    t_session = session_mgr.get_or_login(
+                        t_client,
+                        country_code=api_inst.tuya_creds.region,
+                        uid=api_inst.tuya_creds.uid,
+                        token=api_inst.tuya_creds.token,
+                        force_refresh=True,
+                    )
+                    if t_session is not None:
+                        try:
+                            return t_client.publish_dps(t_session, dev_id, dps_dict)
+                        except Exception as retry_exc:
+                            logger.warning("Cloud publish_dps retry error: %s", retry_exc)
+                            return False
+                else:
+                    logger.warning("Cloud publish_dps skipped session refresh: auth in cooldown.")
                 return False
             logger.warning("Cloud publish_dps error: %s", exc)
             return False

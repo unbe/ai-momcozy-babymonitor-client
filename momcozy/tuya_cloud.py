@@ -327,6 +327,7 @@ class TuyaSessionManager:
         self.auth_failure_count: int = 0
         self.auth_backoff: float = 15.0
         self.fatal_auth_error: bool = False
+        self._recent_logins: List[float] = []
 
     def add_listener(self, listener: Callable[[TuyaSession], None]) -> None:
         """Register a callback notified whenever the active TuyaSession is updated."""
@@ -342,12 +343,42 @@ class TuyaSessionManager:
                 return True
             return (ts - self.last_auth_attempt) >= self.auth_backoff
 
-    def record_auth_success(self) -> None:
-        """Reset authentication failure counters after a successful login."""
+    def record_auth_success(self, now: Optional[float] = None) -> None:
+        """Record successful login, track recent login frequency, and calculate cooldown."""
+        ts = time.time() if now is None else now
         with self._lock:
             self.auth_failure_count = 0
-            self.auth_backoff = 15.0
             self.fatal_auth_error = False
+            self.last_auth_attempt = ts
+            self._recent_logins.append(ts)
+            cutoff = ts - 600.0
+            self._recent_logins = [t for t in self._recent_logins if t >= cutoff]
+            recent_count = len(self._recent_logins)
+            if recent_count >= 4:
+                self.auth_backoff = 900.0  # 15 min
+                logger.warning(
+                    "Tuya session repeatedly invalidated (%d logins in last 10m). "
+                    "Backing off re-authentication for %.0fs to prevent Tuya account ban.",
+                    recent_count,
+                    self.auth_backoff,
+                )
+            elif recent_count >= 3:
+                self.auth_backoff = 300.0  # 5 min
+                logger.warning(
+                    "Tuya session repeatedly invalidated (%d logins in last 10m). "
+                    "Backing off re-authentication for %.0fs to prevent Tuya account ban.",
+                    recent_count,
+                    self.auth_backoff,
+                )
+            elif recent_count >= 2:
+                self.auth_backoff = 60.0  # 1 min
+                logger.info(
+                    "Tuya session re-authenticated (%d logins in last 10m). Cooldown set to %.0fs.",
+                    recent_count,
+                    self.auth_backoff,
+                )
+            else:
+                self.auth_backoff = 15.0
 
     def record_auth_failure(self, exc: Exception, now: Optional[float] = None) -> None:
         """Record an authentication failure and escalate backoff appropriately."""
@@ -384,14 +415,20 @@ class TuyaSessionManager:
                     self.auth_backoff,
                 )
 
-    def update_session(self, session: Any, *, persist: bool = True) -> Optional[TuyaSession]:
+    def update_session(
+        self, session: Any, *, persist: bool = True, record_login: bool = True
+    ) -> Optional[TuyaSession]:
         """Update cached session, reset backoff, persist if configured, and notify listeners."""
         coerced = TuyaSession.coerce(session, default_uid=self.default_uid)
         if coerced is None:
             return None
         with self._lock:
             self.session = coerced
-            self.record_auth_success()
+            if record_login:
+                self.record_auth_success()
+            else:
+                self.auth_failure_count = 0
+                self.fatal_auth_error = False
             listeners = list(self._listeners)
             persist_cb = self._persist_cb if persist else None
 
@@ -423,6 +460,12 @@ class TuyaSessionManager:
                 return self.session
             now = time.time()
             if not self.can_attempt_auth(now):
+                rem = max(0.0, self.auth_backoff - (now - self.last_auth_attempt))
+                logger.debug(
+                    "Tuya get_or_login skipped (auth in cooldown, %.1fs remaining, backoff=%.0fs)",
+                    rem,
+                    self.auth_backoff,
+                )
                 return None
             self.last_auth_attempt = now
 
@@ -439,7 +482,7 @@ class TuyaSessionManager:
                     self.session = None
             return None
 
-        return self.update_session(fresh, persist=True)
+        return self.update_session(fresh, persist=True, record_login=True)
 
 
 class TuyaGatewayClient:

@@ -405,7 +405,49 @@ class TestTuyaSessionManager(unittest.TestCase):
         self.assertEqual(persisted, ["relogin_s"])
         self.assertEqual(listeners, ["relogin_s"])
 
-        # 3. Rate-limit error triggers exponential backoff so subsequent calls skip network login storm
+        # 3. Rapid consecutive re-logins within 10 minutes trigger sliding-window cooldowns
+        mgr_throttle = TuyaSessionManager(default_uid="u1")
+        th_client = MagicMock()
+        th_client.login_with_uid.side_effect = [
+            TuyaSession(sid="s1", ecode="e1", uid="u1"),
+            TuyaSession(sid="s2", ecode="e2", uid="u1"),
+            TuyaSession(sid="s3", ecode="e3", uid="u1"),
+            TuyaSession(sid="s4", ecode="e4", uid="u1"),
+        ]
+
+        # 1st login -> backoff defaults to 15s
+        res1 = mgr_throttle.get_or_login(th_client, "33", "u1", "tok", force_refresh=True)
+        self.assertEqual(res1.sid, "s1")
+        self.assertEqual(mgr_throttle.auth_backoff, 15.0)
+
+        # 2nd login in window -> cooldown escalates to 60s
+        mgr_throttle.last_auth_attempt = 0.0  # simulate cooldown elapsed
+        res2 = mgr_throttle.get_or_login(th_client, "33", "u1", "tok", force_refresh=True)
+        self.assertEqual(res2.sid, "s2")
+        self.assertEqual(mgr_throttle.auth_backoff, 60.0)
+
+        # 3rd login in window -> cooldown escalates to 300s (5 min)
+        mgr_throttle.last_auth_attempt = 0.0
+        res3 = mgr_throttle.get_or_login(th_client, "33", "u1", "tok", force_refresh=True)
+        self.assertEqual(res3.sid, "s3")
+        self.assertEqual(mgr_throttle.auth_backoff, 300.0)
+
+        # 4th login in window -> cooldown escalates to 900s (15 min)
+        mgr_throttle.last_auth_attempt = 0.0
+        res4 = mgr_throttle.get_or_login(th_client, "33", "u1", "tok", force_refresh=True)
+        self.assertEqual(res4.sid, "s4")
+        self.assertEqual(mgr_throttle.auth_backoff, 900.0)
+
+        # While within cooldown, further force_refresh calls return None without network hit
+        res_throttled = mgr_throttle.get_or_login(th_client, "33", "u1", "tok", force_refresh=True)
+        self.assertIsNone(res_throttled)
+        self.assertEqual(th_client.login_with_uid.call_count, 4)
+
+        # Adopting session with record_login=False does not increase login count
+        mgr_throttle.update_session({"sid": "disk_s", "ecode": "disk_e", "uid": "u1"}, record_login=False)
+        self.assertEqual(len(mgr_throttle._recent_logins), 4)
+
+        # 4. Rate-limit error triggers exponential backoff so subsequent calls skip network login storm
         mgr_rl = TuyaSessionManager(default_uid="u1")
         rl_client = MagicMock()
         rl_client.login_with_uid.side_effect = RuntimeError("USER_SESSION_LIMIT")
