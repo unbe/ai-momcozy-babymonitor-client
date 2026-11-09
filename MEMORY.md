@@ -243,7 +243,7 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
       - 4th+ login in 10m: 900s (15m) cooldown.
       During cooldown, `can_attempt_auth()` returns `False`, and `force_refresh` aborts network requests, gracefully preserving cached telemetry instead of fighting conflicting sessions.
     * **Disk Session Adoption (`record_login=False`):** `_fetch_cloud_dps` inspects `.momcozy.json` on disk before initiating network login. If another container/process updated `tuya_session["sid"]`, the daemon adopts it in-memory immediately without issuing a login request or incrementing the re-login quota.
-    * **DPS Polling Cadence & Negative Caching:** `_fetch_cloud_dps` cache TTL is set to 60.0s (up from 15.0s), and `_dps_cache["ts"] = now` is updated on all execution branches (including exceptions and throttled cooldowns) to eliminate loop spinning.
+    * **DPS Polling Cadence & Negative Caching:** `_fetch_cloud_dps` cache TTL is set to 20.0s, and `_dps_cache["ts"] = now` is updated on all execution branches (including exceptions and throttled cooldowns) to eliminate loop spinning.
   * **Persistent Session Reuse Across Streamer Lifecycles (`tuya_session` in `.momcozy.json`):**
     * Tuya sessions (`sid`, `ecode`, `uid`, `device_fingerprint`) are unified across `TuyaSession` and `AccountSession`, serialized to JSON, and persisted directly in `.momcozy.json` (`"tuya_session"`).
     * **Eliminating Login on 5-Minute Night Vision Sampling:** Previously, idle night vision checks woke up every 5 minutes and tore down `TuyaIpcP2pClient`, triggering a fresh `smartlife.m.user.uid.password.login` call ~288 times/day and rapidly hitting Tuya's account rate limit (`USER_SESSION_LIMIT`).

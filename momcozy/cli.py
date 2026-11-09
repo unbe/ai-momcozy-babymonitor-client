@@ -159,8 +159,8 @@ def _get_configured_device(args: argparse.Namespace) -> MomcozyMonitor:
 
     def _fetch_cloud_dps() -> dict:
         now = _time.time()
-        # Default cache TTL: 60 seconds (prevents aggressive polling of Tuya Cloud)
-        if _dps_cache["dps"] and (now - _dps_cache["ts"] < 60.0):
+        # Default cache TTL: 20 seconds
+        if _dps_cache["dps"] and (now - _dps_cache["ts"] < 20.0):
             return _dps_cache["dps"]
         if not config_path.exists():
             return _dps_cache["dps"]
