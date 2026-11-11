@@ -613,6 +613,118 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(slot_id == 0 for slot_id, _ in decoded_chunks))
             self.assertTrue(any(slot_id == 1 for slot_id, _ in decoded_chunks))
 
+    async def test_premux_slots_on_rotation_and_closed_slot_caching(self):
+        """Verify pre-muxing slots on rotation, fast concat, and closed-slot export caching."""
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            mock_streamer = MagicMock()
+            mock_streamer.is_running = True
+            recorder = TimelapseRecorder(
+                streamer=mock_streamer,
+                storage_dir=storage_dir,
+                total_slots=4,
+                slot_duration_sec=600.0,
+                speed_ratio=60,
+            )
+
+            # Generate real valid HEVC bitstream for slot 0
+            s0 = recorder.slot_path(0)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=15",
+                    "-c:v", "libx265", "-f", "hevc", str(s0),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "frames": 15, "duration": 1.0, "bytes": s0.stat().st_size}
+
+            # 1. Test _sync_premux_slot
+            mp4_0 = recorder.slot_mp4_path(0)
+            self.assertFalse(mp4_0.exists())
+            self.assertTrue(recorder._sync_premux_slot(0))
+            self.assertTrue(mp4_0.exists())
+            self.assertGreater(mp4_0.stat().st_size, 100)
+
+            # Re-running _sync_premux_slot hits mtime cache without running ffmpeg
+            with patch("subprocess.run") as mock_subproc:
+                self.assertTrue(recorder._sync_premux_slot(0))
+                mock_subproc.assert_not_called()
+
+            # 2. Test _rotate_slot clears stale mp4 for overwritten slot and pre-muxes closed slot
+            # Pre-create a stale mp4 for slot 1
+            mp4_1 = recorder.slot_mp4_path(1)
+            mp4_1.write_bytes(b"stale_mp4")
+            self.assertTrue(mp4_1.exists())
+
+            recorder._current_slot = 0
+            recorder._rotate_slot()
+            self.assertEqual(recorder._current_slot, 1)
+            self.assertFalse(mp4_1.exists())  # stale slot 1 mp4 deleted
+            await asyncio.sleep(0.1)  # wait for bg rotate prep to finish
+
+            # 3. Test closed-slot vs active slot partitioning during active recording
+            recorder._running = True
+            recorder._record_task = MagicMock()
+            recorder._record_task.done.return_value = False
+            s1 = recorder.slot_path(1)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=15",
+                    "-c:v", "libx265", "-f", "hevc", str(s1),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            recorder._slots_meta["1"] = {"mtime": 2000.0, "frames": 15, "duration": 1.0, "bytes": s1.stat().st_size}
+
+            # Normal playback request (include_active=False): uses closed slots (slot 0)
+            recorder._exports_cache.clear()
+            recorder._in_flight_exports.clear()
+            with patch.object(recorder, "_generate_mp4", wraps=recorder._generate_mp4) as spy_gen:
+                mp4_export = await recorder.export_mp4(codec="hevc", ratio=60, include_active=False)
+                self.assertIsNotNone(mp4_export)
+                self.assertTrue(mp4_export.exists())
+                spy_gen.assert_called_once()
+                slots_passed = spy_gen.call_args[0][0]
+                self.assertEqual([s[0] for s in slots_passed], [0])  # Slot 1 excluded
+
+                # Immediate follow-up call: returns cached export without re-generating!
+                spy_gen.reset_mock()
+                mp4_export2 = await recorder.export_mp4(codec="hevc", ratio=60, include_active=False)
+                self.assertEqual(mp4_export, mp4_export2)
+                spy_gen.assert_not_called()
+
+                # Explicit download request (include_active=True): includes active slot 1
+                spy_gen.reset_mock()
+                mp4_download = await recorder.export_mp4(codec="hevc", ratio=60, include_active=True)
+                self.assertIsNotNone(mp4_download)
+                spy_gen.assert_called_once()
+                slots_download = spy_gen.call_args[0][0]
+                self.assertEqual([s[0] for s in slots_download], [0, 1])  # Slot 1 included
+
+            # 4. Test _generate_mp4 selects pre-muxed mp4 for concat
+            captured_list = None
+            orig_run = subprocess.run
+
+            def capture_ffmpeg(cmd, *args, **kwargs):
+                nonlocal captured_list
+                if "-f" in cmd and "concat" in cmd:
+                    list_idx = cmd.index("-i") + 1
+                    captured_list = Path(cmd[list_idx]).read_text()
+                return orig_run(cmd, *args, **kwargs)
+
+            with patch("subprocess.run", side_effect=capture_ffmpeg):
+                recorder._exports_cache.clear()
+                await recorder.export_mp4(codec="hevc", ratio=60, include_active=True)
+                self.assertIsNotNone(captured_list)
+                self.assertIn("slot_00.mp4", captured_list)
+
+            # 5. Test clear removes both .hevc and .mp4 files
+            recorder.clear()
+            self.assertFalse(s0.exists())
+            self.assertFalse(mp4_0.exists())
+
 
 class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
     async def test_recorder_sync_nv_state_and_session_append_vs_restart(self):

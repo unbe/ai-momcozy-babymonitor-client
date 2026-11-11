@@ -1082,6 +1082,8 @@ class WebServer:
         }
         if session_id is not None:
             export_kwargs["session_id"] = session_id
+        if is_download:
+            export_kwargs["include_active"] = True
 
         try:
             mp4_path = await self.timelapse.export_mp4(**export_kwargs)

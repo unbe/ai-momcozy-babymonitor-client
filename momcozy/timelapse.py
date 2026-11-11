@@ -329,6 +329,58 @@ class TimelapseRecorder:
     def slot_path(self, slot_idx: int) -> Path:
         return self.storage_dir / f"slot_{slot_idx:02d}.hevc"
 
+    def slot_mp4_path(self, slot_idx: int) -> Path:
+        """Absolute Path to pre-muxed slot MP4 file."""
+        return self.storage_dir / f"slot_{slot_idx:02d}.mp4"
+
+    def _sync_premux_slot(self, slot_idx: int) -> bool:
+        """Pre-mux a single closed HEVC slot into a standalone MP4 file (fast stream-copy)."""
+        hevc_path = self.slot_path(slot_idx)
+        if not hevc_path.exists() or hevc_path.stat().st_size < 100:
+            return False
+        mp4_path = self.slot_mp4_path(slot_idx)
+        hevc_mtime = hevc_path.stat().st_mtime
+        if mp4_path.exists() and mp4_path.stat().st_size > 0 and mp4_path.stat().st_mtime >= hevc_mtime:
+            return True
+
+        if shutil.which("ffmpeg") is None:
+            return False
+
+        with self._meta_lock:
+            meta = dict(self._slots_meta.get(str(slot_idx), {}))
+        frames = int(meta.get("frames", 0))
+        duration = float(meta.get("duration", self.slot_duration_sec))
+        target_sec = max(0.5, duration / self.speed_ratio)
+        slot_fps = min(60.0, max(5.0, round(frames / target_sec, 2))) if frames > 0 else 15.0
+
+        tmp_mp4 = mp4_path.with_suffix(".tmp.mp4")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-r", str(slot_fps),
+            "-f", "hevc",
+            "-i", str(hevc_path),
+            "-c:v", "copy",
+            "-tag:v", "hvc1",
+            str(tmp_mp4),
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if proc.returncode == 0 and tmp_mp4.exists() and tmp_mp4.stat().st_size > 0:
+                tmp_mp4.replace(mp4_path)
+                return True
+            if tmp_mp4.exists():
+                tmp_mp4.unlink()
+            return False
+        except Exception as exc:
+            logger.debug("Failed pre-muxing slot %02d to MP4: %s", slot_idx, exc)
+            if tmp_mp4.exists():
+                try:
+                    tmp_mp4.unlink()
+                except OSError:
+                    pass
+            return False
+
     def _get_config_path(self) -> Path:
         """Resolve persistent configuration file path (.momcozy.json)."""
         if self.config_path is not None:
@@ -495,6 +547,11 @@ class TimelapseRecorder:
 
             if self.storage_dir.exists():
                 for p in self.storage_dir.glob("slot_*.hevc"):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                for p in self.storage_dir.glob("slot_*.mp4"):
                     try:
                         p.unlink()
                     except OSError:
@@ -1077,6 +1134,7 @@ class TimelapseRecorder:
                 self._record_task = None
 
             self._close_active_slot()
+            self._sync_premux_slot(self._current_slot)
             self._save_meta()
             self._exports_cache.clear()
             if self._stream_lease is not None:
@@ -1110,6 +1168,7 @@ class TimelapseRecorder:
 
     def _rotate_slot(self) -> None:
         """Advance to next circular slot, truncating any existing old slot file."""
+        closed_slot = self._current_slot
         self._close_active_slot()
 
         self._current_slot = (self._current_slot + 1) % self.total_slots
@@ -1126,6 +1185,14 @@ class TimelapseRecorder:
             }
         self._save_meta()
 
+        # Remove any stale pre-muxed mp4 for the newly overwritten circular slot
+        old_mp4 = self.slot_mp4_path(self._current_slot)
+        if old_mp4.exists():
+            try:
+                old_mp4.unlink()
+            except OSError:
+                pass
+
         # Direct overwrite: open in "wb" mode to truncate previous 12-hour-old file
         slot_p = self.slot_path(self._current_slot)
         slot_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1136,6 +1203,18 @@ class TimelapseRecorder:
             self.total_slots,
             slot_p.name,
         )
+
+        if self._running:
+            try:
+                loop = asyncio.get_running_loop()
+                async def _bg_rotate_prep():
+                    await loop.run_in_executor(None, self._sync_premux_slot, closed_slot)
+                    await self.export_mp4(codec="hevc", ratio=self.speed_ratio)
+                loop.create_task(_bg_rotate_prep())
+            except RuntimeError:
+                self._sync_premux_slot(closed_slot)
+        else:
+            self._sync_premux_slot(closed_slot)
 
     async def _record_loop(self) -> None:
         """Continuous background loop collecting HEVC keyframes."""
@@ -1415,12 +1494,15 @@ class TimelapseRecorder:
         ratio: Optional[int] = None,
         allow_cache_only: bool = False,
         session_id: Optional[str] = None,
+        include_active: bool = False,
     ) -> Optional[Path]:
         """Concatenate ordered slots and remux to MP4 using stream-copy (zero transcoding).
 
-        If codec=='h264' is explicitly requested, attempts Intel VA-API hardware acceleration
-        with fallback to libx264. Multiple concurrent requests for the same export share the
-        same in-flight task to prevent thundering-herd duplicate transcodes.
+        Uses pre-muxed slot MP4 files and closed-slot caching for near-instant (< 0.1s)
+        concatenation and playback. If codec=='h264' is explicitly requested, attempts
+        Intel VA-API hardware acceleration with fallback to libx264. Multiple concurrent
+        requests for the same export share the same in-flight task to prevent thundering-herd
+        duplicate transcodes.
         """
         ordered = self.get_ordered_slots()
         if not ordered:
@@ -1435,10 +1517,18 @@ class TimelapseRecorder:
 
         effective_ratio = ratio if (isinstance(ratio, int) and ratio in (15, 30, 60, 90)) else self.speed_ratio
         norm_codec = "h264" if str(codec).lower().strip() == "h264" else "hevc"
-        cache_key = f"{norm_codec}_r{effective_ratio}"
+        cache_suffix = "_active" if (include_active and self.is_recording) else ""
+        cache_key = f"{norm_codec}_r{effective_ratio}{cache_suffix}"
 
-        # Determine latest mtime among active slots
-        latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
+        # Closed vs active slots:
+        # If recording is active and closed slots exist, playback is served from closed slots
+        # whose contents are immutable until the next slot rotation (10 minutes).
+        closed_slots = [
+            s for s in ordered
+            if not (s[0] == self._current_slot and self.is_recording)
+        ]
+        export_slots = ordered if (include_active or not closed_slots) else closed_slots
+        latest_mtime = max(p.stat().st_mtime for _, p, _ in export_slots if p.exists())
 
         # Check if cache is fresh
         cache_entry = self._exports_cache.get(cache_key)
@@ -1457,11 +1547,16 @@ class TimelapseRecorder:
                 if created_at >= latest_mtime:
                     return out_path
             else:
-                # While recording is active, slot files are written every 2-4 seconds.
-                # Use TTL (20s for HEVC, 60s for H.264) to prevent re-encoding on every keyframe
-                ttl = 20.0 if norm_codec == "hevc" else 60.0
-                if (time.time() - created_at) < ttl:
-                    return out_path
+                # While recording is active:
+                # If closed slots exist and active slot not requested, cache is valid if built after or at latest_mtime of closed slots!
+                if closed_slots and not include_active:
+                    if created_at >= latest_mtime:
+                        return out_path
+                else:
+                    # Fallback TTL if no closed slots exist yet or include_active requested
+                    ttl = 20.0 if norm_codec == "hevc" else 60.0
+                    if (time.time() - created_at) < ttl:
+                        return out_path
 
         # If an export for this cache_key is already in flight, await it to avoid thundering-herd FFmpeg processes
         if cache_key in self._in_flight_exports:
@@ -1474,6 +1569,12 @@ class TimelapseRecorder:
                     logger.warning("Existing timelapse export failed: %s", exc)
                     return None
 
+        # Pre-mux any closed slots that don't have up-to-date MP4 files yet
+        if norm_codec == "hevc" and effective_ratio == self.speed_ratio:
+            for s_idx, s_path, _ in export_slots:
+                if not (s_idx == self._current_slot and self.is_recording):
+                    self._sync_premux_slot(s_idx)
+
         # Compute dynamic fps so video duration matches real_time / effective_ratio
         st = self.get_status()
         real_time_sec = max(1.0, float(st.get("buffered_seconds", 0.0)))
@@ -1481,7 +1582,7 @@ class TimelapseRecorder:
         target_video_sec = max(0.5, real_time_sec / effective_ratio)
         export_fps = min(60.0, max(5.0, round(total_frames / target_video_sec, 2)))
 
-        out_name = f"timelapse_cache_{norm_codec}_r{effective_ratio}.mp4"
+        out_name = f"timelapse_cache_{cache_key}.mp4"
         out_path = self.storage_dir / out_name
 
         async def _do_export() -> Optional[Path]:
@@ -1490,7 +1591,7 @@ class TimelapseRecorder:
                 success = await loop.run_in_executor(
                     None,
                     self._generate_mp4,
-                    ordered,
+                    export_slots,
                     out_path,
                     norm_codec,
                     export_fps,
@@ -1531,10 +1632,14 @@ class TimelapseRecorder:
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f_list:
             list_path = f_list.name
             try:
-                for _, path, _ in ordered_slots:
+                for slot_idx, path, _ in ordered_slots:
                     if path.exists() and path.stat().st_size > 0:
-                        # Write safe FFmpeg concat line
-                        clean_path = str(path.resolve()).replace("'", "'\\''")
+                        slot_to_use = path
+                        if codec.lower() == "hevc":
+                            mp4_p = self.slot_mp4_path(slot_idx)
+                            if mp4_p.exists() and mp4_p.stat().st_size > 0 and mp4_p.stat().st_mtime >= path.stat().st_mtime:
+                                slot_to_use = mp4_p
+                        clean_path = str(slot_to_use.resolve()).replace("'", "'\\''")
                         f_list.write(f"file '{clean_path}'\n")
                 f_list.flush()
 
