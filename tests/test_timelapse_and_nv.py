@@ -510,6 +510,109 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(found_stage_log, f"Log messages: {log_ctx.output}")
 
+    async def test_slot_level_motion_scan_caching_and_invalidation(self):
+        """Verify per-slot motion scan caching, cache hits, persistence, and invalidation."""
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            recorder = TimelapseRecorder(
+                streamer=MagicMock(),
+                storage_dir=storage_dir,
+                sample_interval_sec=2.0,
+                fps=10,
+                speed_ratio=60,
+                motion_merge_gap_sec=30.0,
+            )
+
+            vps_marker = b"\x00\x00\x00\x01\x40\x01"
+            # Slot 0: 60 frames with motion between 20 and 40
+            s0 = recorder.slot_path(0)
+            p0 = b"".join(vps_marker + bytes([0, i]) + b"\x00" * 40 for i in range(60))
+            s0.write_bytes(p0)
+            recorder._slots_meta["0"] = {"mtime": 1000.0, "duration": 120.0, "frames": 60, "bytes": len(p0)}
+
+            # Slot 1: 60 frames with no motion
+            s1 = recorder.slot_path(1)
+            p1 = b"".join(vps_marker + bytes([1, i]) + b"\x00" * 40 for i in range(60))
+            s1.write_bytes(p1)
+            recorder._slots_meta["1"] = {"mtime": 2000.0, "duration": 120.0, "frames": 60, "bytes": len(p1)}
+            recorder._save_meta()
+
+            decoded_chunks = []
+
+            def mock_luma(chunk, codec=None):
+                slot_id, frame_idx = chunk[6], chunk[7]
+                decoded_chunks.append((slot_id, frame_idx))
+                if slot_id == 0 and 20 <= frame_idx <= 40:
+                    return bytes([0x20 + (frame_idx * 5) % 150]) * 256
+                return b"\x10" * 256
+
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                with self.assertLogs("momcozy.timelapse", level="INFO") as log_ctx1:
+                    ev1 = recorder.detect_motion_events(coarse_step=15, min_window=2)
+
+            self.assertEqual(len(ev1), 1)
+            self.assertGreater(len(decoded_chunks), 0)
+            # Metadata now stores scan_intervals for both slots
+            self.assertIn("scan_intervals", recorder._slots_meta["0"])
+            self.assertIn("scan_intervals", recorder._slots_meta["1"])
+            self.assertEqual(len(recorder._slots_meta["1"]["scan_intervals"]), 0)  # quiet slot
+            self.assertGreater(len(recorder._slots_meta["0"]["scan_intervals"]), 0)
+
+            # Second scan without changes: 100% cache hit, 0 new decodes
+            decoded_chunks.clear()
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                # Reset scan mtime check to trigger detect_motion_events
+                recorder._last_motion_scan_mtime = 0.0
+                with self.assertLogs("momcozy.timelapse", level="INFO") as log_ctx2:
+                    ev2 = recorder.detect_motion_events(coarse_step=15, min_window=2)
+
+            self.assertEqual(len(ev2), 1)
+            self.assertEqual(len(decoded_chunks), 0)  # Zero keyframes decoded!
+            self.assertTrue(any("2 slots cached" in m for m in log_ctx2.output))
+
+            # Test persistence across reload: meta.json preserves scan_intervals
+            recorder2 = TimelapseRecorder(
+                streamer=MagicMock(),
+                storage_dir=storage_dir,
+                sample_interval_sec=2.0,
+                fps=10,
+                speed_ratio=60,
+                motion_merge_gap_sec=30.0,
+            )
+            self.assertIn("scan_intervals", recorder2._slots_meta["0"])
+            decoded_chunks.clear()
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                ev_reloaded = recorder2.detect_motion_events(coarse_step=15, min_window=2)
+            self.assertEqual(len(ev_reloaded), 1)
+            self.assertEqual(len(decoded_chunks), 0)
+
+            # Invalidate slot 1 by rewriting with motion
+            p1_mod = b"".join(vps_marker + bytes([1, i]) + b"\x00" * 40 for i in range(70))
+            s1.write_bytes(p1_mod)
+            # Update meta for slot 1
+            recorder._slots_meta["1"]["bytes"] = len(p1_mod)
+            recorder._slots_meta["1"]["frames"] = 70
+            recorder._slots_meta["1"]["mtime"] = 2500.0
+            recorder._last_motion_scan_mtime = 0.0
+
+            decoded_chunks.clear()
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                with self.assertLogs("momcozy.timelapse", level="INFO") as log_ctx3:
+                    ev3 = recorder.detect_motion_events(coarse_step=15, min_window=2)
+
+            self.assertEqual(len(ev3), 1)
+            # Slot 0 hit cache (not decoded), only modified slot 1 was decoded!
+            self.assertTrue(all(slot_id == 1 for slot_id, _ in decoded_chunks))
+            self.assertTrue(any("1 slots cached" in m for m in log_ctx3.output))
+
+            # Test force=True: all slots re-scanned even if valid cache exists
+            decoded_chunks.clear()
+            recorder._last_motion_scan_mtime = 0.0
+            with patch("momcozy.timelapse.extract_hevc_keyframe_luma", side_effect=mock_luma):
+                recorder.detect_motion_events(coarse_step=15, min_window=2, force=True)
+            self.assertTrue(any(slot_id == 0 for slot_id, _ in decoded_chunks))
+            self.assertTrue(any(slot_id == 1 for slot_id, _ in decoded_chunks))
+
 
 class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
     async def test_recorder_sync_nv_state_and_session_append_vs_restart(self):

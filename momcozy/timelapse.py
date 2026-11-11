@@ -592,117 +592,42 @@ class TimelapseRecorder:
         ordered = self.get_ordered_slots()
         return bool(ordered and any(p.exists() and p.stat().st_size > 0 for _, p, _ in ordered))
 
-    def detect_motion_events(
+    def _scan_frames_for_motion_intervals(
         self,
-        threshold: float = 3.5,
-        coarse_step: int = 30,
-        min_window: int = 2,
-        merge_gap_sec: Optional[float] = None,
-        debounce_sec: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
-        """Run adaptive binary search motion detection across recorded timelapse slots on playback.
-
-        Operates on-demand during playback (zero CPU overhead during recording).
-        Leverages state-difference invariance: if Frame(A) ≈ Frame(B), no motion occurred
-        in interval [A, B] and the entire block is skipped in O(1).
-        Intervals with diff >= threshold are recursively subdivided down to min_window to
-        identify active motion intervals [start_time, end_time], and nearby intervals within
-        merge_gap_sec are merged into cohesive motion ranges.
-        Uses localized block luma differences so movements occupying ~1/10th of the frame
-        are detected reliably without dilution from a static background.
-        """
-        ordered = self.get_ordered_slots()
-        if not ordered:
-            return self._events
-
-        latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
-        if self._last_motion_scan_mtime >= latest_mtime:
-            return self._events
-
-        effective_gap = float(
-            merge_gap_sec
-            if merge_gap_sec is not None
-            else (debounce_sec if debounce_sec is not None else self.motion_merge_gap_sec)
-        )
-
-        vps_marker = b"\x00\x00\x00\x01\x40\x01"
-        indexed_frames: List[Tuple[Path, int, int, float]] = []
-
-        for slot_idx, path, meta in ordered:
-            if not path.exists() or path.stat().st_size < 100:
-                continue
-            file_size = path.stat().st_size
-            if slot_idx == self._current_slot and self.is_recording:
-                duration = min(self.slot_duration_sec, max(0.0, time.monotonic() - self._slot_start_monotonic))
-                slot_end = time.time()
-            else:
-                duration = float(meta.get("duration", self.slot_duration_sec))
-                slot_end = float(meta.get("mtime", path.stat().st_mtime))
-            slot_start = slot_end - duration
-
-            try:
-                with open(path, "rb") as f:
-                    import mmap
-
-                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                    offsets = []
-                    pos = 0
-                    while True:
-                        pos = mm.find(vps_marker, pos)
-                        if pos == -1:
-                            break
-                        offsets.append(pos)
-                        pos += 6
-                    mm.close()
-
-                num_kf = len(offsets)
-                if num_kf == 0:
-                    continue
-
-                for i, off in enumerate(offsets):
-                    length = (offsets[i + 1] - off) if (i + 1 < num_kf) else (file_size - off)
-                    frame_ts = slot_start + (i / max(1, num_kf - 1)) * duration
-                    indexed_frames.append((path, off, length, frame_ts))
-            except Exception as exc:
-                logger.debug("Failed indexing keyframes in %s: %s", path, exc)
-
-        total_frames = len(indexed_frames)
+        slot_frames: List[Tuple[Path, int, int, float]],
+        threshold: float,
+        coarse_step: int,
+        eff_min_window: int,
+        effective_gap: float,
+        shared_codec: Any,
+        fp_cache: Dict[Tuple[str, int], Optional[bytes]],
+        stage_decodes: Dict[str, int],
+    ) -> List[Tuple[float, float]]:
+        """Adaptive binary search motion scan across keyframes within a single slot or segment."""
+        total_frames = len(slot_frames)
         if total_frames < 2:
-            return self._events
+            return []
 
-        fp_cache: Dict[int, Optional[bytes]] = {}
-        stage_decodes = {"coarse": 0, "search": 0, "probe": 0}
         current_stage = ["coarse"]
 
-        shared_codec = None
-        try:
-            import av
-
-            shared_codec = av.CodecContext.create("hevc", "r")
-            shared_codec.thread_count = 1
-            shared_codec.options = {"skip_loop_filter": "all"}
-        except Exception as exc:
-            logger.debug("Failed creating shared HEVC decoder context: %s", exc)
-            shared_codec = None
-
         def get_fp(idx: int) -> Optional[bytes]:
-            if idx not in fp_cache:
+            f_path, f_off, f_len, _ = slot_frames[idx]
+            cache_key = (str(f_path), f_off)
+            if cache_key not in fp_cache:
                 stage_decodes[current_stage[0]] += 1
-                f_path, f_off, f_len, _ = indexed_frames[idx]
                 try:
                     with open(f_path, "rb") as f:
                         f.seek(f_off)
                         chunk = f.read(f_len)
                     try:
-                        fp_cache[idx] = extract_hevc_keyframe_luma(chunk, codec=shared_codec)
+                        fp_cache[cache_key] = extract_hevc_keyframe_luma(chunk, codec=shared_codec)
                     except TypeError:
-                        fp_cache[idx] = extract_hevc_keyframe_luma(chunk)
+                        fp_cache[cache_key] = extract_hevc_keyframe_luma(chunk)
                 except Exception:
-                    fp_cache[idx] = None
-            return fp_cache[idx]
+                    fp_cache[cache_key] = None
+            return fp_cache[cache_key]
 
         raw_intervals: List[Tuple[float, float]] = []
-        eff_min_window = max(1, int(min_window))
 
         def subdivide(left: int, right: int, out_indices: List[Tuple[int, int]]) -> None:
             if right - left <= eff_min_window:
@@ -721,7 +646,6 @@ class TimelapseRecorder:
             if right_active:
                 subdivide(mid, right, out_indices)
             if not left_active and not right_active:
-                # Gradual drift across mid where diff(left, right) >= threshold but each half < threshold
                 if diff_lm >= diff_mr and diff_lm >= 0.0:
                     subdivide(left, mid, out_indices)
                 elif diff_mr >= 0.0:
@@ -755,13 +679,11 @@ class TimelapseRecorder:
                     right = mid
             return right
 
-        # Partition frames into contiguous recording segments so paused recording gaps
-        # never fabricate artificial motion ranges across unrecorded wall-clock intervals.
         max_frame_gap_sec = max(30.0, self.sample_interval_sec * 15.0)
         segments: List[Tuple[int, int]] = []
         seg_start = 0
         for idx in range(1, total_frames):
-            if indexed_frames[idx][3] - indexed_frames[idx - 1][3] > max_frame_gap_sec:
+            if slot_frames[idx][3] - slot_frames[idx - 1][3] > max_frame_gap_sec:
                 if idx - 1 > seg_start:
                     segments.append((seg_start, idx - 1))
                 seg_start = idx
@@ -786,7 +708,6 @@ class TimelapseRecorder:
 
             quiet_windows = [(w_s, w_e) for w_s, w_e, is_act in coarse_windows if not is_act]
 
-            # Group contiguous active coarse windows into clusters (#1)
             active_clusters: List[List[Tuple[int, int]]] = []
             cur_cluster: List[Tuple[int, int]] = []
             for start, end, is_act in coarse_windows:
@@ -813,7 +734,6 @@ class TimelapseRecorder:
                     w_s, w_e = cluster[0]
                     subdivide(w_s, w_e, seg_leaves)
                 else:
-                    # Sustained motion run (#1): binary search only first and last window edges
                     w_first = cluster[0]
                     w_last = cluster[-1]
                     onset = find_first_change(w_first[0], w_first[1])
@@ -826,16 +746,13 @@ class TimelapseRecorder:
             seg_leaves.sort()
             merged_idx: List[List[int]] = []
             for l_idx, r_idx in seg_leaves:
-                if not merged_idx or (indexed_frames[l_idx][3] - indexed_frames[merged_idx[-1][1]][3]) > effective_gap:
+                if not merged_idx or (slot_frames[l_idx][3] - slot_frames[merged_idx[-1][1]][3]) > effective_gap:
                     merged_idx.append([l_idx, r_idx])
                 else:
                     merged_idx[-1][1] = max(merged_idx[-1][1], r_idx)
 
-            # Locally probe (1, 2, 4, 8 frames) around detected range boundaries within effective_gap
-            # so sustained motion that partially returns near a coarse anchor is captured to its full extent.
             current_stage[0] = "probe"
             for s_idx, e_idx in merged_idx:
-                # Quiet coarse window gating (#2): don't probe outward into verified quiet windows
                 min_probe_s = max([qw_e for qw_s, qw_e in quiet_windows if qw_e <= s_idx], default=s_begin)
                 max_probe_e = min([qw_s for qw_s, qw_e in quiet_windows if qw_s >= e_idx], default=s_end)
 
@@ -844,11 +761,10 @@ class TimelapseRecorder:
                     found_prev = False
                     for step in (1, 2, 4, 8):
                         cand = cur_s - step
-                        if cand < min_probe_s or (indexed_frames[cur_s][3] - indexed_frames[cand][3]) > effective_gap:
+                        if cand < min_probe_s or (slot_frames[cur_s][3] - slot_frames[cand][3]) > effective_gap:
                             break
                         fp_cand, fp_cur = get_fp(cand), get_fp(cur_s)
                         if fp_cand is not None and fp_cur is not None and luma_fingerprint_diff(fp_cand, fp_cur) >= threshold:
-                            # Binary search edge between cand and cur_s (#3)
                             low = cand
                             high = cur_s
                             while high - low > 1:
@@ -869,11 +785,10 @@ class TimelapseRecorder:
                     found_next = False
                     for step in (1, 2, 4, 8):
                         cand = cur_e + step
-                        if cand > max_probe_e or (indexed_frames[cand][3] - indexed_frames[cur_e][3]) > effective_gap:
+                        if cand > max_probe_e or (slot_frames[cand][3] - slot_frames[cur_e][3]) > effective_gap:
                             break
                         fp_cur, fp_cand = get_fp(cur_e), get_fp(cand)
                         if fp_cur is not None and fp_cand is not None and luma_fingerprint_diff(fp_cur, fp_cand) >= threshold:
-                            # Binary search edge between cur_e and cand (#3)
                             low = cur_e
                             high = cand
                             while high - low > 1:
@@ -889,9 +804,165 @@ class TimelapseRecorder:
                     if not found_next:
                         break
 
-                t_start = indexed_frames[cur_s][3]
-                t_end = indexed_frames[cur_e][3]
+                t_start = slot_frames[cur_s][3]
+                t_end = slot_frames[cur_e][3]
                 raw_intervals.append((t_start, max(t_start, t_end)))
+
+        return raw_intervals
+
+    def detect_motion_events(
+        self,
+        threshold: float = 3.5,
+        coarse_step: int = 30,
+        min_window: int = 2,
+        merge_gap_sec: Optional[float] = None,
+        debounce_sec: Optional[float] = None,
+        force: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Run adaptive binary search motion detection across recorded timelapse slots on playback.
+
+        Operates on-demand during playback (zero CPU overhead during recording).
+        Leverages state-difference invariance: if Frame(A) ≈ Frame(B), no motion occurred
+        in interval [A, B] and the entire block is skipped in O(1).
+        Intervals with diff >= threshold are recursively subdivided down to min_window to
+        identify active motion intervals [start_time, end_time], and nearby intervals within
+        merge_gap_sec are merged into cohesive motion ranges.
+        Uses localized block luma differences so movements occupying ~1/10th of the frame
+        are detected reliably without dilution from a static background.
+        Caches scanned intervals per closed slot to avoid re-reading or re-decoding immutable slots.
+        """
+        ordered = self.get_ordered_slots()
+        if not ordered:
+            return self._events
+
+        latest_mtime = max(p.stat().st_mtime for _, p, _ in ordered if p.exists())
+        if not force and self._last_motion_scan_mtime >= latest_mtime:
+            return self._events
+
+        effective_gap = float(
+            merge_gap_sec
+            if merge_gap_sec is not None
+            else (debounce_sec if debounce_sec is not None else self.motion_merge_gap_sec)
+        )
+        eff_min_window = max(1, int(min_window))
+
+        shared_codec = None
+        try:
+            import av
+
+            shared_codec = av.CodecContext.create("hevc", "r")
+            shared_codec.thread_count = 1
+            shared_codec.options = {"skip_loop_filter": "all"}
+        except Exception as exc:
+            logger.debug("Failed creating shared HEVC decoder context: %s", exc)
+            shared_codec = None
+
+        vps_marker = b"\x00\x00\x00\x01\x40\x01"
+        fp_cache = {}
+        stage_decodes = {"coarse": 0, "search": 0, "probe": 0}
+
+        raw_intervals = []
+        total_frames = 0
+        cached_slots_count = 0
+        meta_dirty = False
+
+        earliest_slot_start = None
+        latest_slot_end = None
+
+        for slot_idx, path, meta in ordered:
+            if not path.exists() or path.stat().st_size < 100:
+                continue
+            st = path.stat()
+            file_size = st.st_size
+            file_mtime = st.st_mtime
+
+            is_active = (slot_idx == self._current_slot and self.is_recording)
+            if is_active:
+                duration = min(self.slot_duration_sec, max(0.0, time.monotonic() - self._slot_start_monotonic))
+                slot_end = time.time()
+            else:
+                duration = float(meta.get("duration", self.slot_duration_sec))
+                slot_end = float(meta.get("mtime", file_mtime))
+            slot_start = slot_end - duration
+
+            if earliest_slot_start is None or slot_start < earliest_slot_start:
+                earliest_slot_start = slot_start
+            if latest_slot_end is None or slot_end > latest_slot_end:
+                latest_slot_end = slot_end
+
+            cached_ivs = meta.get("scan_intervals")
+            if (
+                not force
+                and not is_active
+                and cached_ivs is not None
+                and meta.get("scan_bytes") == file_size
+                and meta.get("scan_mtime") == file_mtime
+                and meta.get("scan_thresh") == threshold
+            ):
+                for s, e in cached_ivs:
+                    raw_intervals.append((float(s), float(e)))
+                cached_slots_count += 1
+                total_frames += int(meta.get("frames", 0))
+                continue
+
+            try:
+                with open(path, "rb") as f:
+                    import mmap
+
+                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    offsets = []
+                    pos = 0
+                    while True:
+                        pos = mm.find(vps_marker, pos)
+                        if pos == -1:
+                            break
+                        offsets.append(pos)
+                        pos += 6
+                    mm.close()
+
+                num_kf = len(offsets)
+                if num_kf == 0:
+                    continue
+
+                slot_frames = []
+                for i, off in enumerate(offsets):
+                    length = (offsets[i + 1] - off) if (i + 1 < num_kf) else (file_size - off)
+                    frame_ts = slot_start + (i / max(1, num_kf - 1)) * duration
+                    slot_frames.append((path, off, length, frame_ts))
+
+                total_frames += num_kf
+
+                if num_kf >= 2:
+                    slot_ivs = self._scan_frames_for_motion_intervals(
+                        slot_frames,
+                        threshold=threshold,
+                        coarse_step=coarse_step,
+                        eff_min_window=eff_min_window,
+                        effective_gap=effective_gap,
+                        shared_codec=shared_codec,
+                        fp_cache=fp_cache,
+                        stage_decodes=stage_decodes,
+                    )
+                else:
+                    slot_ivs = []
+
+                raw_intervals.extend(slot_ivs)
+
+                if not is_active:
+                    with self._meta_lock:
+                        s_key = str(slot_idx)
+                        cur = dict(self._slots_meta.get(s_key, meta))
+                        cur["scan_intervals"] = [[round(s, 2), round(e, 2)] for s, e in slot_ivs]
+                        cur["scan_bytes"] = file_size
+                        cur["scan_mtime"] = file_mtime
+                        cur["scan_thresh"] = threshold
+                        self._slots_meta[s_key] = cur
+                        meta_dirty = True
+            except Exception as exc:
+                logger.debug("Failed scanning keyframes in %s: %s", path, exc)
+
+        if total_frames < 2 and not raw_intervals:
+            return self._events
 
         scanned_ranges = merge_motion_ranges(
             [
@@ -907,10 +978,10 @@ class TimelapseRecorder:
             merge_gap_sec=effective_gap,
         )
 
-        # Retain non-scan (hardware/manual) events within the retention window and merge with fresh scan ranges
-        latest_frame_ts = indexed_frames[-1][3]
         with self._meta_lock:
-            cutoff = min(self._retention_cutoff(latest_frame_ts), indexed_frames[0][3] - 5.0)
+            latest_frame_ts = latest_slot_end if latest_slot_end is not None else time.time()
+            earliest_frame_ts = earliest_slot_start if earliest_slot_start is not None else (latest_frame_ts - 3600.0)
+            cutoff = min(self._retention_cutoff(latest_frame_ts), earliest_frame_ts - 5.0)
             retained_external = [
                 ev
                 for ev in self._events
@@ -923,16 +994,20 @@ class TimelapseRecorder:
 
             self._events = merged
             self._last_motion_scan_mtime = latest_mtime
-            self._save_meta()
+            if meta_dirty or self._events:
+                self._save_meta()
             result_events = list(self._events)
+
+        cache_note = f" ({cached_slots_count} slots cached)" if cached_slots_count > 0 else ""
         logger.info(
-            "Motion scan complete: indexed %d frames (decoded %d: %d coarse, %d search, %d probe), detected %d motion ranges",
+            "Motion scan complete: indexed %d frames (decoded %d: %d coarse, %d search, %d probe), detected %d motion ranges%s",
             total_frames,
             len(fp_cache),
             stage_decodes["coarse"],
             stage_decodes["search"],
             stage_decodes["probe"],
             len(scanned_ranges),
+            cache_note,
         )
         return result_events
 
@@ -941,7 +1016,10 @@ class TimelapseRecorder:
         loop = asyncio.get_running_loop()
         if force:
             self._last_motion_scan_mtime = 0.0
-        return await loop.run_in_executor(None, self.detect_motion_events)
+        return await loop.run_in_executor(
+            None,
+            lambda: self.detect_motion_events(force=force),
+        )
 
     async def start(self, fresh: bool = False, session_type: str = "manual") -> None:
         """Start recording the circular timelapse.

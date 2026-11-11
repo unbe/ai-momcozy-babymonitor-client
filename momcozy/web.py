@@ -1001,10 +1001,12 @@ class WebServer:
         if not self.timelapse:
             return web.json_response({})
         scan_param = request.query.get("scan")
-        should_scan = scan_param == "1" or (not self.timelapse._events and self.timelapse.has_content)
+        force_param = request.query.get("force")
+        force_scan = force_param == "1" or scan_param == "force"
+        should_scan = scan_param in ("1", "force") or force_scan or (not self.timelapse._events and self.timelapse.has_content)
         if should_scan:
             try:
-                await self.timelapse.scan_motion_events()
+                await self.timelapse.scan_motion_events(force=force_scan)
             except Exception as exc:
                 logger.debug("Motion scan error: %s", exc)
         return web.json_response(self._get_timelapse_status())
