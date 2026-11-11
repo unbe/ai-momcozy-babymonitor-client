@@ -341,6 +341,53 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
             meta_on_disk = json.loads(recorder.meta_file.read_text())
             self.assertEqual(len(meta_on_disk["events"]), 22)
 
+    def test_circular_wrapped_buffer_active_slot_ordering_and_events(self):
+        """Ensure full ring buffer (e.g. 72 slots) with active recording in the middle
+        places active slot at the end of ordered slots and never drops motion events."""
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            recorder = TimelapseRecorder(
+                streamer=MagicMock(),
+                storage_dir=storage_dir,
+                total_slots=72,
+                slot_duration_sec=600.0,
+                speed_ratio=60,
+            )
+            now = time.time()
+            # Slots 35..71 have mtimes from previous 12h cycle
+            for i in range(35, 72):
+                recorder.slot_path(i).write_bytes(b"x" * 1000)
+                recorder._slots_meta[str(i)] = {"mtime": now - (72 - (i - 35)) * 600.0, "duration": 600.0, "frames": 100}
+            # Slots 0..34 have mtimes from current cycle
+            for i in range(0, 35):
+                recorder.slot_path(i).write_bytes(b"x" * 1000)
+                recorder._slots_meta[str(i)] = {"mtime": now - (35 - i) * 600.0, "duration": 600.0, "frames": 100}
+
+            # Slot 35 is currently recording
+            recorder._current_slot = 35
+            recorder._running = True
+            recorder._record_task = MagicMock()
+            recorder._record_task.done.return_value = False
+            recorder._slot_start_monotonic = time.monotonic() - 60.0
+            recorder._slot_start_wall = now - 60.0
+
+            ordered = recorder.get_ordered_slots()
+            self.assertEqual(len(ordered), 72)
+            # Oldest slot should be 36, newest active slot should be 35 at the end
+            self.assertEqual(ordered[0][0], 36)
+            self.assertEqual(ordered[-1][0], 35)
+
+            # Events recorded during the 12-hour buffer must NOT be filtered out
+            recorder._events = [
+                {"time": now - 15000.0, "end_time": now - 14900.0, "type": "motion", "label": "Motion Alert 1"},
+                {"time": now - 5000.0, "end_time": now - 4900.0, "type": "motion", "label": "Motion Alert 2"},
+            ]
+            st = recorder.get_status()
+            self.assertEqual(len(st["events"]), 2)
+            self.assertEqual(st["motion_events_count"], 2)
+            self.assertEqual(st["events"][0]["label"], "Motion Alert 1")
+            self.assertEqual(st["events"][1]["label"], "Motion Alert 2")
+
     async def test_timelapse_playback_motion_detection_and_sustained_ranges(self):
         fp_a = b"\x10" * 256
         fp_b = b"\x10" * 256

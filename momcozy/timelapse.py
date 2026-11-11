@@ -632,8 +632,12 @@ class TimelapseRecorder:
             if not path.exists() or path.stat().st_size < 100:
                 continue
             file_size = path.stat().st_size
-            duration = float(meta.get("duration", self.slot_duration_sec))
-            slot_end = float(meta.get("mtime", path.stat().st_mtime))
+            if slot_idx == self._current_slot and self.is_recording:
+                duration = min(self.slot_duration_sec, max(0.0, time.monotonic() - self._slot_start_monotonic))
+                slot_end = time.time()
+            else:
+                duration = float(meta.get("duration", self.slot_duration_sec))
+                slot_end = float(meta.get("mtime", path.stat().st_mtime))
             slot_start = slot_end - duration
 
             try:
@@ -1035,6 +1039,13 @@ class TimelapseRecorder:
         self._bytes_in_slot = 0
         self._slot_start_monotonic = time.monotonic()
         self._slot_start_wall = time.time()
+        with self._meta_lock:
+            self._slots_meta[str(self._current_slot)] = {
+                "mtime": self._slot_start_wall,
+                "duration": 0.0,
+                "frames": 0,
+                "bytes": 0,
+            }
         self._save_meta()
 
         # Direct overwrite: open in "wb" mode to truncate previous 12-hour-old file
@@ -1070,6 +1081,14 @@ class TimelapseRecorder:
             self._frames_in_slot = 0
             self._bytes_in_slot = 0
             self._slot_start_monotonic = time.monotonic()
+            self._slot_start_wall = time.time()
+            with self._meta_lock:
+                self._slots_meta[str(self._current_slot)] = {
+                    "mtime": self._slot_start_wall,
+                    "duration": 0.0,
+                    "frames": 0,
+                    "bytes": 0,
+                }
 
         self._active_file = open(slot_p, mode)
         self._slot_start_wall = time.time()
@@ -1173,7 +1192,10 @@ class TimelapseRecorder:
                     sz = p.stat().st_size
                     if sz > 0:
                         meta = slots_snapshot.get(str(i), {})
-                        mtime = meta.get("mtime") or p.stat().st_mtime
+                        if i == self._current_slot and self.is_recording:
+                            mtime = time.time()
+                        else:
+                            mtime = float(meta.get("mtime") or p.stat().st_mtime)
                         valid_slots.append((i, p, mtime, meta))
                 except OSError:
                     pass
@@ -1236,8 +1258,8 @@ class TimelapseRecorder:
                     cum_dur += s_dur
                 return min(cum_dur, total_real_time_sec)
 
-            earliest_slot_start = slot_spans[0][0]
-            latest_slot_end = slot_spans[-1][1]
+            earliest_slot_start = min(s[0] for s in slot_spans)
+            latest_slot_end = max(s[1] for s in slot_spans)
 
             with self._meta_lock:
                 events_snapshot = list(self._events)
