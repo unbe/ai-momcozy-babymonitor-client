@@ -210,9 +210,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
     * In `video.onerror`, fatal decode errors (`err.code === 3`) and unsupported format errors (`err.code === 4`) on HEVC immediately fall back to H.264 (`loadPlayback('h264')`) without retrying broken HEVC bitstreams.
     * For transient network errors, retries are capped at 10. `onplaying` only resets `recoveryAttempts = 0` after 3 seconds of sustained successful playback via a debounced `stablePlayTimer` (cleared on pause, error, or load), preventing momentary playback ticks from resetting the retry counter into an infinite reload loop.
     * Network error recovery seeks slightly before the error point (`cur - 0.5`) to land on a preceding keyframe rather than re-triggering the same damaged boundary.
-  * **Responsive Decoupled Scrubber Dragging:**
-    * Visual playhead indicators (`timeline-progress`, `timeline-thumb`, `current-time-text`) update synchronously at 60fps on `mousemove` without waiting for the video decoder.
-    * Media element seeking is throttled to 150ms intervals during drag (using `video.fastSeek` when available), and an exact seek is applied on `mouseup`, eliminating connection saturation and demuxer race conditions.
+  * **Responsive Decoupled Scrubber Dragging & Seek Handlers:**
+    * Visual playhead indicators (`timeline-progress`, `timeline-thumb`, `current-time-text`) update synchronously at 60fps on `mousemove`/`touchmove` without waiting for the video decoder.
+    * Media element seeking is throttled to 150ms intervals during drag (using `video.fastSeek` when available), and an exact seek is applied on `mouseup`/`touchend`, eliminating connection saturation and demuxer race conditions.
+    * `seekFromTimeline(e)` and `window.seekFromTimeline` are exposed globally to handle click seeks on `<div class="timeline-bar" onclick="seekFromTimeline(event)">` and support touch events (`e.touches[0].clientX`), preventing `ReferenceError: seekFromTimeline is not defined`.
     * The `loop` attribute was removed from `<video id="timelapse-video">` to prevent unwanted auto-restart loops.
   * **HEVC Stream-Copy Timestamp Generation & No-BSF Remux:**
     * Concat of raw Annex B HEVC keyframe streams (`slot_*.hevc`) without container timestamps previously attempted using the FFmpeg bitstream filter `-bsf:v setts=pts=N/(TB*fps):dts=N/(TB*fps)`.

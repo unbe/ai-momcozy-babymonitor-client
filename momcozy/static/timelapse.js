@@ -230,7 +230,8 @@ function getTargetSecFromEvent(e) {
   const bar = document.getElementById('timeline-bar');
   if (!bar || !video.duration) return 0;
   const rect = bar.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const clientX = (e && e.touches && e.touches.length > 0) ? e.touches[0].clientX : (e ? e.clientX : 0);
+  const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
   return Math.max(0.05, Math.min(video.duration - 0.05, ratio * video.duration));
 }
 
@@ -242,6 +243,14 @@ function seekToSec(sec) {
     video.play().catch(() => {});
   }
 }
+
+function seekFromTimeline(e) {
+  if (!e || !video.duration) return;
+  const targetSec = getTargetSecFromEvent(e);
+  updatePlayheadVisual(targetSec);
+  video.currentTime = targetSec;
+}
+window.seekFromTimeline = seekFromTimeline;
 
 const timelineWrapper = document.getElementById('timeline-wrapper');
 let isDraggingTimeline = false;
@@ -281,6 +290,41 @@ if (timelineWrapper) {
   });
 
   window.addEventListener('mouseup', () => {
+    if (isDraggingTimeline) {
+      isDraggingTimeline = false;
+      if (dragSeekTimer) {
+        clearTimeout(dragSeekTimer);
+        dragSeekTimer = null;
+      }
+      if (lastDragTargetSec !== null && video.duration) {
+        video.currentTime = lastDragTargetSec;
+      }
+    }
+  });
+
+  timelineWrapper.addEventListener('touchstart', (e) => {
+    isDraggingTimeline = true;
+    lastDragTargetSec = getTargetSecFromEvent(e);
+    updatePlayheadVisual(lastDragTargetSec);
+    applyDragSeek(lastDragTargetSec);
+  }, { passive: true });
+
+  window.addEventListener('touchmove', (e) => {
+    if (!isDraggingTimeline) return;
+    lastDragTargetSec = getTargetSecFromEvent(e);
+    updatePlayheadVisual(lastDragTargetSec);
+
+    if (!dragSeekTimer) {
+      dragSeekTimer = setTimeout(() => {
+        dragSeekTimer = null;
+        if (isDraggingTimeline && lastDragTargetSec !== null) {
+          applyDragSeek(lastDragTargetSec);
+        }
+      }, 150);
+    }
+  }, { passive: true });
+
+  window.addEventListener('touchend', () => {
     if (isDraggingTimeline) {
       isDraggingTimeline = false;
       if (dragSeekTimer) {

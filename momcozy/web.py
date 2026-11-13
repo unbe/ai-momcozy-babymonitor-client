@@ -1108,7 +1108,11 @@ class WebServer:
 
     async def handle_timelapse_page(self, request: web.Request) -> web.Response:
         """Serve the standalone timelapse player page."""
-        return web.Response(text=HTML_TIMELAPSE_PLAYER, content_type="text/html")
+        return web.Response(
+            text=HTML_TIMELAPSE_PLAYER,
+            content_type="text/html",
+            headers={"Cache-Control": "no-cache"},
+        )
 
     def _set_night_vision_sync(self, enabled: bool) -> None:
         """Enable/disable night vision sync, restarting the automation from a clean slate."""

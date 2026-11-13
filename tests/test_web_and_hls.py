@@ -390,8 +390,16 @@ class TestWebServerAndCsrf(unittest.IsolatedAsyncioTestCase):
 
             resp_page = await server.handle_timelapse_page(make_mocked_request("GET", "/timelapse"))
             self.assertEqual(resp_page.status, 200)
+            self.assertEqual(resp_page.headers.get("Cache-Control"), "no-cache")
             self.assertIn("player-ratio-badge", resp_page.text)
             self.assertIn("timeline-markers", resp_page.text)
+            self.assertIn("seekFromTimeline(event)", resp_page.text)
+
+            req_js = make_mocked_request("GET", "/static/timelapse.js", match_info={"filename": "timelapse.js"})
+            resp_js = await server.handle_static(req_js)
+            self.assertEqual(resp_js.status, 200)
+            self.assertIn("function seekFromTimeline", resp_js.body.decode("utf-8"))
+            self.assertIn("window.seekFromTimeline = seekFromTimeline", resp_js.body.decode("utf-8"))
 
 
 class TestHlsTranscoder(unittest.IsolatedAsyncioTestCase):
