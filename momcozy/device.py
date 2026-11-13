@@ -172,14 +172,30 @@ class MomcozyMonitor:
         self._cached_dps: Dict[str, Any] = dict(initial_dps) if initial_dps else {}
         self._lan_tcp_unavailable: bool = False
         self._lan_status_unsupported: bool = False
+        self._last_lan_probe_mono: float = 0.0
         self._lock = threading.RLock()
 
         self._device: Optional[tinytuya.Device] = None
         self.control_diagnostic: str = ""
         self._init_local_device(probe_lan=probe_lan)
 
-    def test_local_lan_connection(self, allow_rediscovery: bool = True) -> bool:
+    def _create_tinytuya_device(self, ip: str) -> tinytuya.Device:
+        """Create a configured tinytuya Device instance for local TCP control."""
+        dev = tinytuya.Device(
+            dev_id=self.device_id,
+            address=ip,
+            local_key=self.local_key,
+            version=self.version,
+        )
+        dev.set_socketPersistent(True)
+        dev.set_socketTimeout(1.0)
+        dev.set_socketRetryLimit(1)
+        return dev
+
+    def test_local_lan_connection(self, allow_rediscovery: bool = True, quiet_if_unchanged: bool = False) -> bool:
         """Test direct TCP connection to port 6668 on the camera IP."""
+        self._last_lan_probe_mono = time.monotonic()
+        was_unavailable = self._lan_tcp_unavailable
         if not self.ip:
             if allow_rediscovery and self.device_id:
                 discovered_ip = self.discover_local_ip()
@@ -190,7 +206,8 @@ class MomcozyMonitor:
                 "Specify 'ip' in .momcozy.json or set MOMCOZY_IP environment variable."
             )
             return False
-        logger.info("Checking local LAN connection to camera at %s:6668...", self.ip)
+        if not (quiet_if_unchanged and was_unavailable):
+            logger.info("Checking local LAN connection to camera at %s:6668...", self.ip)
         try:
             with socket.create_connection((self.ip, 6668), timeout=1.5):
                 self._lan_tcp_unavailable = False
@@ -200,11 +217,12 @@ class MomcozyMonitor:
         except Exception as exc:
             if allow_rediscovery and self.device_id:
                 old_ip = self.ip
-                logger.info(
-                    "Camera not reachable at %s:6668 (%s). Scanning local network via UDP broadcast...",
-                    old_ip,
-                    exc,
-                )
+                if not (quiet_if_unchanged and was_unavailable):
+                    logger.warning(
+                        "Camera not reachable at %s:6668 (%s). Scanning local network via UDP broadcast...",
+                        old_ip,
+                        exc,
+                    )
                 discovered_ip = self.discover_local_ip()
                 if discovered_ip and discovered_ip != old_ip:
                     logger.info("Camera rediscovered at new IP %s. Retesting connection...", discovered_ip)
@@ -216,29 +234,47 @@ class MomcozyMonitor:
                 f"Local LAN TCP port 6668 unreachable on {self.ip} ({exc}). "
                 "Device control will fall back to Tuya Cloud Gateway."
             )
-            logger.warning(
-                "Local LAN connection to %s:6668 failed (%s). "
-                "Device control will fall back to Tuya Cloud Gateway.",
-                self.ip,
-                exc,
-            )
+            if not (quiet_if_unchanged and was_unavailable):
+                logger.warning(
+                    "Local LAN connection to %s:6668 failed (%s). "
+                    "Device control will fall back to Tuya Cloud Gateway.",
+                    self.ip,
+                    exc,
+                )
             return False
+
+    def check_local_lan_health(self, rediscover_interval: float = 300.0) -> bool:
+        """Periodic LAN health check for serve mode: detect IP changes and trigger rediscovery."""
+        if not self.local_key:
+            return False
+        if self.ip and not self._lan_tcp_unavailable:
+            try:
+                with socket.create_connection((self.ip, 6668), timeout=1.5):
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "Camera at %s:6668 is no longer reachable (%s). Scanning local network to rediscover IP...",
+                    self.ip,
+                    exc,
+                )
+                self._lan_tcp_unavailable = True
+                self.control_diagnostic = (
+                    f"Local LAN TCP port 6668 unreachable on {self.ip} ({exc}). Scanning for new IP..."
+                )
+                return self.test_local_lan_connection(allow_rediscovery=True)
+
+        now = time.monotonic()
+        if now - self._last_lan_probe_mono >= rediscover_interval:
+            return self.test_local_lan_connection(allow_rediscovery=True, quiet_if_unchanged=True)
+        return False
 
     def _init_local_device(self, probe_lan: bool = True) -> None:
         if self.ip:
-            self._device = tinytuya.Device(
-                dev_id=self.device_id,
-                address=self.ip,
-                local_key=self.local_key,
-                version=self.version,
-            )
-            self._device.set_socketPersistent(True)
-            self._device.set_socketTimeout(1.0)
+            self._device = self._create_tinytuya_device(self.ip)
             if probe_lan:
                 self.test_local_lan_connection()
             else:
                 self._lan_tcp_unavailable = True
-                self.control_diagnostic = f"Local LAN probe pending for {self.ip}:6668"
                 self.control_diagnostic = f"Local LAN probe pending for {self.ip}:6668"
         else:
             self.control_diagnostic = (
@@ -265,14 +301,7 @@ class MomcozyMonitor:
         """Update monitor IP address."""
         self.ip = ip
         if self.ip:
-            self._device = tinytuya.Device(
-                dev_id=self.device_id,
-                address=self.ip,
-                local_key=self.local_key,
-                version=self.version,
-            )
-            self._device.set_socketPersistent(True)
-            self._device.set_socketTimeout(1.0)
+            self._device = self._create_tinytuya_device(self.ip)
             if test_connection:
                 self.test_local_lan_connection(allow_rediscovery=False)
 
@@ -473,22 +502,58 @@ class MomcozyMonitor:
         status = self.get_status()
         return status.temperature_c, status.temperature_f
 
+    @staticmethod
+    def _extract_lan_error(res: Any) -> Optional[str]:
+        """Return error message if tinytuya returned a network/protocol error dict."""
+        if isinstance(res, dict) and ("Error" in res or "Err" in res):
+            return str(res.get("Error") or f"Err {res.get('Err')}")
+        return None
+
+    def _handle_lan_command_failure(self, err_detail: str) -> bool:
+        """Log LAN failure, update diagnostic state, and attempt IP rediscovery."""
+        logger.warning(
+            "Local LAN command failed on %s:6668 (%s). Attempting IP rediscovery...",
+            self.ip,
+            err_detail,
+        )
+        self._lan_tcp_unavailable = True
+        self.control_diagnostic = (
+            f"Local LAN TCP port 6668 unreachable on {self.ip} ({err_detail})."
+        )
+        return self.test_local_lan_connection(allow_rediscovery=True)
+
+    def _send_lan_command(
+        self,
+        action: Callable[[tinytuya.Device], Any],
+    ) -> Tuple[bool, Any, Optional[Exception]]:
+        """Execute a Local LAN command, triggering IP rediscovery and one retry on failure."""
+        if not (self.ip and not self._lan_tcp_unavailable):
+            return False, None, None
+        for attempt in range(2):
+            err_detail: Optional[Exception] = None
+            try:
+                with self._lock:
+                    dev = self._ensure_device()
+                    res = action(dev)
+                lan_err = self._extract_lan_error(res)
+                if lan_err is None:
+                    return True, res, None
+                err_detail = RuntimeError(lan_err)
+            except Exception as exc:
+                err_detail = exc
+            if attempt == 0 and self._handle_lan_command_failure(str(err_detail)):
+                continue
+            return False, None, err_detail
+        return False, None, None
+
     def set_dp(self, dp_id: int | DP, value: Any) -> Dict[str, Any]:
         """Send a single DataPoint command to the camera."""
         dp_key = int(dp_id)
         logger.debug("Setting DP %s = %r", dp_key, value)
-        last_error = None
-
-        if self.ip and not self._lan_tcp_unavailable:
-            try:
-                with self._lock:
-                    dev = self._ensure_device()
-                    res = dev.set_value(dp_key, value)
-                    self._cached_dps[str(dp_key)] = value
-                    return res or {"dps": {str(dp_key): value}}
-            except Exception as exc:
-                logger.warning("Local LAN set_dp failed for DP %s: %s", dp_key, exc)
-                last_error = exc
+        ok_lan, res, last_error = self._send_lan_command(lambda dev: dev.set_value(dp_key, value))
+        if ok_lan:
+            self._cached_dps[str(dp_key)] = value
+            return res or {"dps": {str(dp_key): value}}
 
         if self.cloud_dp_publisher:
             try:
@@ -507,18 +572,10 @@ class MomcozyMonitor:
     def set_dps(self, dps_dict: Dict[int | DP | str, Any]) -> Dict[str, Any]:
         """Send multiple DataPoints in a single packet."""
         formatted = {str(int(k)): v for k, v in dps_dict.items()}
-        last_error = None
-
-        if self.ip and not self._lan_tcp_unavailable:
-            try:
-                with self._lock:
-                    dev = self._ensure_device()
-                    res = dev.set_multiple_values(formatted)
-                    self._cached_dps.update(formatted)
-                    return res or {"dps": formatted}
-            except Exception as exc:
-                logger.warning("Local LAN set_dps failed: %s", exc)
-                last_error = exc
+        ok_lan, res, last_error = self._send_lan_command(lambda dev: dev.set_multiple_values(formatted))
+        if ok_lan:
+            self._cached_dps.update(formatted)
+            return res or {"dps": formatted}
 
         if self.cloud_dp_publisher:
             try:

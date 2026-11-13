@@ -67,9 +67,10 @@ Provides device control (PTZ, sensors, night vision, lullabies, privacy mode), l
 * **Deferred LAN Probe on `serve` Startup (`probe_lan=False`):**
   * During `momcozy.py serve`, `MomcozyMonitor` initializes with `probe_lan=False` and `WebServer.run()` binds HTTP/HTTPS TCP ports *before* launching `VideoStreamer` and a background `asyncio.to_thread(monitor.test_local_lan_connection)` task. This guarantees `/health` and dashboard pages respond immediately even when the camera IP is offline or being rediscovered via UDP broadcast.
   * `WebServer.get_local_lan_ip()` caches the outbound interface IP with a 60-second TTL instead of opening a UDP socket on every `/api/status` request.
-* **Auto-Rediscovery on IP Change (DHCP):**
-  * When a camera's IP changes (e.g. DHCP lease renewal), connection attempts to the stale IP fail with `ConnectionRefusedError` or timeout.
-  * `test_local_lan_connection(allow_rediscovery=True)` detects this failure and automatically triggers an in-band UDP broadcast scan using `tinytuya.deviceScan(False, 3)` matching the camera's `device_id` / `gwId`.
+* **Auto-Rediscovery on IP Change (DHCP) & Runtime Health Checks:**
+  * When a camera's IP changes (e.g. DHCP lease renewal), connection attempts to the stale IP fail with `ConnectionRefusedError` or timeout, or `tinytuya.Device.set_value()` / `set_multiple_values()` returns an error dict (`{"Error": "Network Error: Unable to Connect", "Err": "901"}`) rather than raising.
+  * `MomcozyMonitor._send_lan_command()` checks both raised exceptions and `tinytuya` error dicts (`_extract_lan_error`), logs a warning about the unreachable old IP, marks `_lan_tcp_unavailable = True` / updates `control_diagnostic`, calls `test_local_lan_connection(allow_rediscovery=True)`, and retries once on the newly discovered IP before falling back to Tuya Cloud.
+  * `WebServer._background_monitor_loop()` calls `monitor.check_local_lan_health()` every 60s (even when timelapse/NV sync are idle): while LAN is active it performs a silent 1.5s TCP connect check on port 6668, immediately logging a warning and triggering UDP broadcast rediscovery (`tinytuya.deviceScan`) if the old IP stops responding; while unavailable, retries are rate-limited (`rediscover_interval=300s`) without log spam.
   * When rediscovered at a new IP, `MomcozyMonitor` updates its address, fires `on_ip_discovered(new_ip)` to persist the new IP via `ConfigStore`, and reconnects via Local LAN.
 
 ### 7. 12-Hour Circular Disk-Backed Timelapse Buffer

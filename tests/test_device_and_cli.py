@@ -196,6 +196,114 @@ class TestMomcozyMonitorControl(unittest.TestCase):
             self.assertTrue(monitor._lan_tcp_unavailable)
             self.assertIn("pending", monitor.control_diagnostic.lower())
 
+    def test_set_dp_error_dict_triggers_rediscovery_and_retry(self):
+        discovered = []
+        cloud_calls = []
+        dead_ips = {"10.11.2.12"}
+
+        def mock_conn(addr, timeout=1.5):
+            host, _ = addr
+            if host in dead_ips:
+                raise ConnectionRefusedError("[Errno 111] Connection refused")
+            mock_sock = MagicMock()
+            mock_sock.__enter__.return_value = mock_sock
+            mock_sock.__exit__.return_value = False
+            return mock_sock
+
+        fake_scan = {"10.11.2.186": {"ip": "10.11.2.186", "gwId": "bfb3260f33c5cdc22arfhh"}}
+
+        class FakeTuyaDev:
+            def __init__(self, dev_id, address, local_key, version):
+                self.address = address
+
+            def set_socketPersistent(self, v): pass
+            def set_socketTimeout(self, v): pass
+            def set_socketRetryLimit(self, v): pass
+
+            def set_value(self, dp_key, value):
+                if self.address in dead_ips:
+                    return {"Error": "Network Error: Unable to Connect", "Err": "901", "Payload": None}
+                return {"dps": {str(dp_key): value}}
+
+        with patch("socket.create_connection", side_effect=mock_conn), \
+             patch("tinytuya.Device", side_effect=lambda dev_id, address, local_key, version: FakeTuyaDev(dev_id, address, local_key, version)), \
+             patch("tinytuya.deviceScan", return_value=fake_scan):
+            dead_ips.clear()  # initially 10.11.2.12 is reachable
+            monitor = MomcozyMonitor(
+                device_id="bfb3260f33c5cdc22arfhh",
+                local_key="key1",
+                ip="10.11.2.12",
+                cloud_dp_publisher=lambda d: cloud_calls.append(d) or True,
+                on_ip_discovered=lambda ip: discovered.append(ip),
+            )
+            self.assertFalse(monitor._lan_tcp_unavailable)
+
+            # Camera moves from 10.11.2.12 -> 10.11.2.186
+            dead_ips.add("10.11.2.12")
+            with self.assertLogs("momcozy.device", level="WARNING") as log_ctx:
+                res = monitor.set_dp(101, True)
+            self.assertEqual(res, {"dps": {"101": True}})
+            self.assertEqual(monitor.ip, "10.11.2.186")
+            self.assertEqual(discovered, ["10.11.2.186"])
+            self.assertEqual(cloud_calls, [])
+            self.assertTrue(any("10.11.2.12:6668" in m for m in log_ctx.output))
+
+            # If BOTH old and new IPs fail, falls back to cloud and marks LAN unavailable
+            dead_ips.add("10.11.2.186")
+            with self.assertLogs("momcozy.device", level="WARNING") as log_ctx2:
+                res2 = monitor.set_dp(101, False)
+            self.assertEqual(res2, {"dps": {"101": False}, "cloud": True})
+            self.assertEqual(len(cloud_calls), 1)
+            self.assertTrue(monitor._lan_tcp_unavailable)
+            self.assertIn("10.11.2.186:6668 unreachable", monitor.control_transport)
+            self.assertTrue(any("10.11.2.186:6668" in m for m in log_ctx2.output))
+
+    def test_check_local_lan_health_detects_ip_change_and_logs(self):
+        discovered = []
+        dead_ips = set()
+
+        def mock_conn(addr, timeout=1.5):
+            host, _ = addr
+            if host in dead_ips:
+                raise TimeoutError("timed out")
+            mock_sock = MagicMock()
+            mock_sock.__enter__.return_value = mock_sock
+            mock_sock.__exit__.return_value = False
+            return mock_sock
+
+        fake_scan = {"10.11.2.200": {"ip": "10.11.2.200", "gwId": "bfb3260f33c5cdc22arfhh"}}
+
+        with patch("socket.create_connection", side_effect=mock_conn), \
+             patch("tinytuya.deviceScan", return_value=fake_scan) as mock_scan:
+            monitor = MomcozyMonitor(
+                device_id="bfb3260f33c5cdc22arfhh",
+                local_key="key1",
+                ip="10.11.2.12",
+                on_ip_discovered=lambda ip: discovered.append(ip),
+            )
+            self.assertTrue(monitor.check_local_lan_health())
+            mock_scan.assert_not_called()
+
+            # Camera IP changes while serve is running
+            dead_ips.add("10.11.2.12")
+            with self.assertLogs("momcozy.device", level="WARNING") as log_ctx:
+                self.assertTrue(monitor.check_local_lan_health())
+            self.assertEqual(monitor.ip, "10.11.2.200")
+            self.assertEqual(discovered, ["10.11.2.200"])
+            self.assertEqual(monitor.control_mode, "local_lan")
+            self.assertTrue(any("10.11.2.12:6668 is no longer reachable" in m for m in log_ctx.output))
+
+            # If rediscovery fails, marks unavailable and respects rediscover_interval
+            dead_ips.add("10.11.2.200")
+            mock_scan.return_value = {}
+            with self.assertLogs("momcozy.device", level="WARNING"):
+                self.assertFalse(monitor.check_local_lan_health())
+            self.assertTrue(monitor._lan_tcp_unavailable)
+            self.assertIn("10.11.2.200:6668 unreachable", monitor.control_transport)
+            prev_calls = mock_scan.call_count
+            self.assertFalse(monitor.check_local_lan_health(rediscover_interval=300.0))
+            self.assertEqual(mock_scan.call_count, prev_calls)
+
 
 class TestCliAndConfiguration(unittest.TestCase):
     def test_parser_subcommands_and_removed_aliases(self):

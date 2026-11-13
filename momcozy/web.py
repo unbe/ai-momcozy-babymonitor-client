@@ -206,6 +206,8 @@ class WebServer:
         self.nv = NightVisionAutomation()
         self._nv_lease: Optional[Any] = None  # stream lease held during the darkness countdown
         self._last_nv_check: float = float("-inf")
+        self._last_lan_check: float = 0.0
+        self._lan_probe_task: Optional[asyncio.Task[Any]] = None
         self.app = web.Application(middlewares=[self._csrf_middleware])
         self._setup_routes()
 
@@ -1216,16 +1218,35 @@ class WebServer:
         else:
             await self._advance_night_vision(now, status)
 
+    async def _maybe_check_lan_health(self, now_mono: float) -> None:
+        """Periodically verify Local LAN reachability and rediscover changed camera IPs."""
+        if not self.monitor or not getattr(self.monitor, "local_key", None):
+            return
+        if not callable(getattr(self.monitor, "check_local_lan_health", None)):
+            return
+        if now_mono - self._last_lan_check < 60.0:
+            return
+        if self._lan_probe_task is not None and not self._lan_probe_task.done():
+            return
+        self._last_lan_check = now_mono
+        try:
+            await asyncio.to_thread(self.monitor.check_local_lan_health)
+        except Exception as exc:
+            logger.debug("Periodic LAN health check error: %s", exc)
+
     async def _background_monitor_loop(self) -> None:
         """Server-side background loop managing:
         1. Night Vision timelapse automation (see momcozy.nightvision).
         2. Hardware motion event logging while recording.
+        3. Periodic Local LAN reachability & IP rediscovery.
         Runs entirely server-side without requiring any connected clients.
         """
         last_ev_time = 0.0
         while True:
             try:
                 await asyncio.sleep(self._monitor_tick_delay())
+                now_mono = time.monotonic()
+                await self._maybe_check_lan_health(now_mono)
                 if not self.monitor or not self.timelapse:
                     continue
 
@@ -1235,8 +1256,6 @@ class WebServer:
                     self.nv.reset_timers()
                     self._sync_countdown_lease()
                     continue
-
-                now_mono = time.monotonic()
                 # Query device telemetry
                 try:
                     status = await asyncio.to_thread(self.monitor.get_status)
@@ -1300,9 +1319,11 @@ class WebServer:
             and getattr(self.monitor, "_lan_tcp_unavailable", False)
             and callable(getattr(self.monitor, "test_local_lan_connection", None))
         ):
+            self._last_lan_check = time.monotonic()
             lan_probe_task = asyncio.create_task(
                 asyncio.to_thread(self.monitor.test_local_lan_connection, True)
             )
+            self._lan_probe_task = lan_probe_task
 
         bg_task = asyncio.create_task(self._background_monitor_loop())
         try:

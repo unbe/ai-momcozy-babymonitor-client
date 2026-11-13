@@ -400,6 +400,23 @@ class TestWebServerAndCsrf(unittest.IsolatedAsyncioTestCase):
             self.assertIn("function seekFromTimeline", resp_js.body.decode("utf-8"))
             self.assertIn("window.seekFromTimeline = seekFromTimeline", resp_js.body.decode("utf-8"))
 
+    async def test_periodic_lan_health_check(self):
+        mock_monitor = MagicMock()
+        mock_monitor.local_key = "local_key_123"
+        mock_monitor.check_local_lan_health.return_value = True
+        server = WebServer(monitor=mock_monitor, streamer=None)
+
+        await server._maybe_check_lan_health(100.0)
+        mock_monitor.check_local_lan_health.assert_called_once()
+
+        # Within 60s interval: skipped
+        await server._maybe_check_lan_health(130.0)
+        mock_monitor.check_local_lan_health.assert_called_once()
+
+        # After 60s interval: runs again
+        await server._maybe_check_lan_health(161.0)
+        self.assertEqual(mock_monitor.check_local_lan_health.call_count, 2)
+
 
 class TestHlsTranscoder(unittest.IsolatedAsyncioTestCase):
     async def test_hls_default_mkdtemp_directory_and_cleanup_on_stop(self):
