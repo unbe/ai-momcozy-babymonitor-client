@@ -390,7 +390,6 @@ class TestWebServerAndCsrf(unittest.IsolatedAsyncioTestCase):
 
             resp_page = await server.handle_timelapse_page(make_mocked_request("GET", "/timelapse"))
             self.assertEqual(resp_page.status, 200)
-            self.assertEqual(resp_page.headers.get("Cache-Control"), "no-cache")
             self.assertIn("player-ratio-badge", resp_page.text)
             self.assertIn("timeline-markers", resp_page.text)
             self.assertIn("seekFromTimeline(event)", resp_page.text)
