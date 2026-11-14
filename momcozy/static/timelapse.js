@@ -302,6 +302,16 @@ if (timelineWrapper) {
     }
   });
 
+  window.addEventListener('blur', () => {
+    if (isDraggingTimeline) {
+      isDraggingTimeline = false;
+      if (dragSeekTimer) {
+        clearTimeout(dragSeekTimer);
+        dragSeekTimer = null;
+      }
+    }
+  });
+
   timelineWrapper.addEventListener('touchstart', (e) => {
     isDraggingTimeline = true;
     lastDragTargetSec = getTargetSecFromEvent(e);

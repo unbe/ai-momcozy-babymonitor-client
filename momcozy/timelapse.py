@@ -338,16 +338,21 @@ class TimelapseRecorder:
         hevc_path = self.slot_path(slot_idx)
         if not hevc_path.exists() or hevc_path.stat().st_size < 100:
             return False
+        with self._meta_lock:
+            meta = dict(self._slots_meta.get(str(slot_idx), {}))
         mp4_path = self.slot_mp4_path(slot_idx)
         hevc_mtime = hevc_path.stat().st_mtime
-        if mp4_path.exists() and mp4_path.stat().st_size > 0 and mp4_path.stat().st_mtime >= hevc_mtime:
+        if (
+            mp4_path.exists()
+            and mp4_path.stat().st_size > 0
+            and mp4_path.stat().st_mtime >= hevc_mtime
+            and meta.get("premux_timescale") == 90000
+        ):
             return True
 
         if shutil.which("ffmpeg") is None:
             return False
 
-        with self._meta_lock:
-            meta = dict(self._slots_meta.get(str(slot_idx), {}))
         frames = int(meta.get("frames", 0))
         duration = float(meta.get("duration", self.slot_duration_sec))
         target_sec = max(0.5, duration / self.speed_ratio)
@@ -362,12 +367,16 @@ class TimelapseRecorder:
             "-i", str(hevc_path),
             "-c:v", "copy",
             "-tag:v", "hvc1",
+            "-video_track_timescale", "90000",
             str(tmp_mp4),
         ]
         try:
             proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             if proc.returncode == 0 and tmp_mp4.exists() and tmp_mp4.stat().st_size > 0:
                 tmp_mp4.replace(mp4_path)
+                with self._meta_lock:
+                    slot_entry = self._slots_meta.setdefault(str(slot_idx), {})
+                    slot_entry["premux_timescale"] = 90000
                 return True
             if tmp_mp4.exists():
                 tmp_mp4.unlink()
@@ -474,6 +483,19 @@ class TimelapseRecorder:
                 cur_mtime = float(self._slots_meta.get(str(self._current_slot), {}).get("mtime", 0.0))
                 if not meta_loaded or newest_mtime > cur_mtime:
                     self._current_slot = newest_slot
+
+            # Invalidate stale cached MP4s if any pre-muxed slot lacks the uniform 90k timescale.
+            has_legacy_premux = any(
+                self.slot_mp4_path(idx).exists()
+                and self._slots_meta.get(str(idx), {}).get("premux_timescale") != 90000
+                for idx in range(self.total_slots)
+            )
+            if has_legacy_premux:
+                for cache_file in self.storage_dir.glob("timelapse_cache_*.mp4*"):
+                    try:
+                        cache_file.unlink()
+                    except OSError:
+                        pass
 
     def _save_meta(self) -> None:
         """Persist metadata to meta.json atomically under _meta_lock."""
@@ -1571,9 +1593,15 @@ class TimelapseRecorder:
 
         # Pre-mux any closed slots that don't have up-to-date MP4 files yet
         if norm_codec == "hevc" and effective_ratio == self.speed_ratio:
+            synced_any = False
             for s_idx, s_path, _ in export_slots:
                 if not (s_idx == self._current_slot and self.is_recording):
-                    self._sync_premux_slot(s_idx)
+                    with self._meta_lock:
+                        prev_ts = self._slots_meta.get(str(s_idx), {}).get("premux_timescale")
+                    if self._sync_premux_slot(s_idx) and prev_ts != 90000:
+                        synced_any = True
+            if synced_any:
+                self._save_meta()
 
         # Compute dynamic fps so video duration matches real_time / effective_ratio
         st = self.get_status()
@@ -1629,18 +1657,30 @@ class TimelapseRecorder:
             logger.error("FFmpeg not found. Cannot export timelapse MP4.")
             return False
 
+        non_empty_slots = [
+            (slot_idx, path)
+            for slot_idx, path, _ in ordered_slots
+            if path.exists() and path.stat().st_size > 0
+        ]
+        use_premux_mp4 = False
+        if codec.lower() == "hevc" and non_empty_slots:
+            with self._meta_lock:
+                meta_snapshot = {str(idx): dict(self._slots_meta.get(str(idx), {})) for idx, _ in non_empty_slots}
+            use_premux_mp4 = all(
+                self.slot_mp4_path(idx).exists()
+                and self.slot_mp4_path(idx).stat().st_size > 0
+                and self.slot_mp4_path(idx).stat().st_mtime >= path.stat().st_mtime
+                and meta_snapshot.get(str(idx), {}).get("premux_timescale") == 90000
+                for idx, path in non_empty_slots
+            )
+
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f_list:
             list_path = f_list.name
             try:
-                for slot_idx, path, _ in ordered_slots:
-                    if path.exists() and path.stat().st_size > 0:
-                        slot_to_use = path
-                        if codec.lower() == "hevc":
-                            mp4_p = self.slot_mp4_path(slot_idx)
-                            if mp4_p.exists() and mp4_p.stat().st_size > 0 and mp4_p.stat().st_mtime >= path.stat().st_mtime:
-                                slot_to_use = mp4_p
-                        clean_path = str(slot_to_use.resolve()).replace("'", "'\\''")
-                        f_list.write(f"file '{clean_path}'\n")
+                for slot_idx, path in non_empty_slots:
+                    slot_to_use = self.slot_mp4_path(slot_idx) if use_premux_mp4 else path
+                    clean_path = str(slot_to_use.resolve()).replace("'", "'\\''")
+                    f_list.write(f"file '{clean_path}'\n")
                 f_list.flush()
 
                 tmp_out = output_file.with_suffix(".tmp.mp4")

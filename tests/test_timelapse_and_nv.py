@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -703,7 +704,8 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
                 slots_download = spy_gen.call_args[0][0]
                 self.assertEqual([s[0] for s in slots_download], [0, 1])  # Slot 1 included
 
-            # 4. Test _generate_mp4 selects pre-muxed mp4 for concat
+            # 4. Test _generate_mp4 selects pre-muxed mp4 for closed-only concat,
+            #    and avoids mixing .mp4 + .hevc when include_active=True has an un-muxed active slot
             captured_list = None
             orig_run = subprocess.run
 
@@ -716,14 +718,87 @@ class TestTimelapseRecorderCore(unittest.IsolatedAsyncioTestCase):
 
             with patch("subprocess.run", side_effect=capture_ffmpeg):
                 recorder._exports_cache.clear()
-                await recorder.export_mp4(codec="hevc", ratio=60, include_active=True)
+                await recorder.export_mp4(codec="hevc", ratio=60, include_active=False)
                 self.assertIsNotNone(captured_list)
                 self.assertIn("slot_00.mp4", captured_list)
+
+                captured_list = None
+                recorder._exports_cache.clear()
+                await recorder.export_mp4(codec="hevc", ratio=60, include_active=True)
+                self.assertIsNotNone(captured_list)
+                self.assertIn("slot_00.hevc", captured_list)
+                self.assertIn("slot_01.hevc", captured_list)
+                self.assertNotIn("slot_00.mp4", captured_list)
 
             # 5. Test clear removes both .hevc and .mp4 files
             recorder.clear()
             self.assertFalse(s0.exists())
             self.assertFalse(mp4_0.exists())
+
+    async def test_premux_uniform_timescale_no_concat_freeze(self):
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            self.skipTest("ffmpeg/ffprobe required for timescale concat verification")
+
+        with tempfile.TemporaryDirectory() as td:
+            storage_dir = Path(td)
+            # Create two real valid HEVC bitstreams with different durations/frame counts
+            # so _sync_premux_slot calculates different per-slot fps (e.g. 15.0 vs 16.0).
+            hevc0 = storage_dir / "slot_00.hevc"
+            hevc1 = storage_dir / "slot_01.hevc"
+            for idx, (out_hevc, num_frames) in enumerate([(hevc0, 150), (hevc1, 161)]):
+                proc = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=15",
+                        "-frames:v", str(num_frames), "-c:v", "libx265", "-x265-params", "log-level=error",
+                        "-f", "hevc", str(out_hevc),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            recorder = TimelapseRecorder(
+                streamer=MagicMock(),
+                storage_dir=storage_dir,
+                slot_duration_sec=600.0,
+                speed_ratio=60.0,
+            )
+            now = time.time()
+            with recorder._meta_lock:
+                recorder._slots_meta["0"] = {"frames": 150, "duration": 600.0, "mtime": now - 20}
+                recorder._slots_meta["1"] = {"frames": 161, "duration": 600.0, "mtime": now - 10}
+                recorder._current_slot = 2
+                recorder._save_meta()
+
+            self.assertTrue(recorder._sync_premux_slot(0))
+            self.assertTrue(recorder._sync_premux_slot(1))
+            self.assertEqual(recorder._slots_meta["0"].get("premux_timescale"), 90000)
+            self.assertEqual(recorder._slots_meta["1"].get("premux_timescale"), 90000)
+
+            for slot_mp4 in (recorder.slot_mp4_path(0), recorder.slot_mp4_path(1)):
+                probe_tb = subprocess.run(
+                    [
+                        "ffprobe", "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=time_base", "-of", "csv=p=0", str(slot_mp4),
+                    ],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertEqual(probe_tb.stdout.strip(), "1/90000")
+
+            exported = await recorder.export_mp4(codec="hevc", ratio=60, include_active=False)
+            self.assertIsNotNone(exported)
+            probe_pkts = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "packet=duration_time", "-of", "csv=p=0", str(exported),
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            durations = [float(line.strip()) for line in probe_pkts.stdout.splitlines() if line.strip()]
+            self.assertEqual(len(durations), 311)
+            bad_durations = [d for d in durations if d > 0.2]
+            self.assertEqual(bad_durations, [], f"Found timestamp freeze durations: {bad_durations}")
 
 
 class TestTimelapseNightVisionSync(unittest.IsolatedAsyncioTestCase):
